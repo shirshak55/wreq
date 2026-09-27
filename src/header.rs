@@ -4,6 +4,8 @@
 //! number of types used for interacting with `HeaderMap`. These types allow representing both
 //! HTTP/1 and HTTP/2 headers.
 
+use std::collections::HashMap;
+
 use bytes::Bytes;
 pub use http::header::*;
 use wreq_proto::ext::OnPreserveHeaderCallback;
@@ -30,8 +32,11 @@ pub trait IntoHeaderCaseName: sealed::Sealed {
 /// in the request or response, but also maintains the insertion order of headers. This makes
 /// it suitable for use cases where the order of headers matters, such as HTTP/1.x message
 /// serialization, proxying, or reproducing requests/responses exactly as received.
+///
+/// Besides the spellings grouped by name, it records the sequence of inserted names, so a
+/// repeated header interleaved with others (`A`, `B`, `A`) keeps its position on the wire.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct OrigHeaderMap(HeaderMap<HeaderCaseName>);
+pub struct OrigHeaderMap(HeaderMap<HeaderCaseName>, Vec<HeaderName>);
 
 // ===== impl OrigHeaderMap =====
 
@@ -39,13 +44,13 @@ impl OrigHeaderMap {
     /// Creates a new, empty [`OrigHeaderMap`].
     #[inline]
     pub fn new() -> Self {
-        Self(HeaderMap::default())
+        Self(HeaderMap::default(), Vec::new())
     }
 
     /// Creates an empty [`OrigHeaderMap`] with the specified capacity.
     #[inline]
     pub fn with_capacity(size: usize) -> Self {
-        Self(HeaderMap::with_capacity(size))
+        Self(HeaderMap::with_capacity(size), Vec::with_capacity(size))
     }
 
     /// Insert a new header name into the collection.
@@ -65,15 +70,24 @@ impl OrigHeaderMap {
         let header_case_name = orig.into_header_case_name();
         match &header_case_name.inner {
             Repr::Cased(bytes) => HeaderName::from_bytes(bytes)
-                .map(|header_name| self.0.append(header_name, header_case_name))
+                .map(|header_name| {
+                    self.1.push(header_name.clone());
+                    self.0.append(header_name, header_case_name)
+                })
                 .unwrap_or(false),
-            Repr::Standard(header_name) => self.0.append(header_name.clone(), header_case_name),
+            Repr::Standard(header_name) => {
+                self.1.push(header_name.clone());
+                self.0.append(header_name.clone(), header_case_name)
+            }
         }
     }
 
     /// Extends the map with all entries from another [`OrigHeaderMap`], preserving order.
     #[inline]
     pub fn extend(&mut self, iter: OrigHeaderMap) {
+        // `HeaderMap::extend` replaces the spellings of names `iter` carries.
+        self.1.retain(|name| !iter.0.contains_key(name));
+        self.1.extend(iter.1);
         self.0.extend(iter.0);
     }
 
@@ -140,12 +154,39 @@ impl OnPreserveHeaderCallback for OrigHeaderMap {
         headers: &mut HeaderMap,
         dst: &mut dyn FnMut(&dyn AsRef<[u8]>, &http::HeaderValue),
     ) {
-        // First, sort headers according to the order defined in this map
-        for (name, case_name) in self.iter() {
-            for value in headers.get_all(name) {
+        // First, emit headers in the recorded order: each recorded spelling takes the next
+        // value of its name, so a repeated header interleaved with others keeps its position,
+        // and a name's last recorded spelling takes any values left over.
+        let last: HashMap<&HeaderName, usize> = self
+            .1
+            .iter()
+            .enumerate()
+            .map(|(i, name)| (name, i))
+            .collect();
+        let mut spellings: HashMap<&HeaderName, _> = self
+            .0
+            .keys()
+            .map(|name| (name, self.0.get_all(name).into_iter()))
+            .collect();
+        let mut values: HashMap<&HeaderName, _> = self
+            .0
+            .keys()
+            .map(|name| (name, headers.get_all(name).into_iter()))
+            .collect();
+        for (i, name) in self.1.iter().enumerate() {
+            let (Some(case_name), Some(values)) = (
+                spellings.get_mut(name).and_then(Iterator::next),
+                values.get_mut(name),
+            ) else {
+                continue;
+            };
+            if last[name] == i {
+                values.for_each(|value| dst(case_name, value));
+            } else if let Some(value) = values.next() {
                 dst(case_name, value);
             }
-
+        }
+        for name in self.0.keys() {
             headers.remove(name);
         }
 
