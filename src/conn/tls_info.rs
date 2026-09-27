@@ -1,7 +1,9 @@
+use std::sync::Arc;
+
 use bytes::Bytes;
 use tokio_btls::SslStream;
 
-use crate::tls::{TlsInfo, conn::MaybeHttpsStream};
+use crate::tls::{TlsConnectionUse, TlsInfo, conn::MaybeHttpsStream};
 
 /// A trait for extracting TLS information from a connection.
 pub trait TlsInfoFactory {
@@ -14,6 +16,12 @@ pub trait TlsInfoFactory {
 fn extract_tls_info<S>(ssl_stream: &SslStream<S>) -> TlsInfo {
     let ssl = ssl_stream.ssl();
     TlsInfo {
+        version: ssl.version_str(),
+        cipher: ssl
+            .current_cipher()
+            .map(|cipher| cipher.standard_name().unwrap_or_else(|| cipher.name())),
+        alpn_protocol: ssl.selected_alpn_protocol().map(Bytes::copy_from_slice),
+        connection: Arc::new(TlsConnectionUse::default()),
         peer_certificate: ssl
             .peer_certificate()
             .and_then(|cert| cert.to_der().ok())

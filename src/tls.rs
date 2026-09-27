@@ -22,9 +22,49 @@ use compress::CertificateCompressor;
 pub struct TlsInfo {
     pub(crate) peer_certificate: Option<Bytes>,
     pub(crate) peer_certificate_chain: Option<Vec<Bytes>>,
+    pub(crate) version: &'static str,
+    pub(crate) cipher: Option<&'static str>,
+    pub(crate) alpn_protocol: Option<Bytes>,
+    pub(crate) connection: std::sync::Arc<TlsConnectionUse>,
+}
+
+/// The connection a [`TlsInfo`] was taken from, shared by every response it carries.
+#[derive(Debug, Default)]
+pub(crate) struct TlsConnectionUse {
+    id: std::sync::OnceLock<u64>,
+    responses: std::sync::atomic::AtomicU64,
 }
 
 impl TlsInfo {
+    /// The negotiated protocol version, e.g. `TLSv1.3`.
+    pub fn version(&self) -> &str {
+        self.version
+    }
+
+    /// The negotiated cipher suite, by its standard (RFC) name when it has one.
+    pub fn cipher(&self) -> Option<&str> {
+        self.cipher
+    }
+
+    /// The protocol selected through ALPN, if any.
+    pub fn alpn_protocol(&self) -> Option<&[u8]> {
+        self.alpn_protocol.as_deref()
+    }
+
+    /// An id for the TLS connection this response arrived on, the same for every response
+    /// it carries: `assign` provides it for the connection's first caller.
+    pub fn connection_id(&self, assign: impl FnOnce() -> u64) -> u64 {
+        *self.connection.id.get_or_init(assign)
+    }
+
+    /// Counts one response carried by this connection and returns how many it carried
+    /// before, so the first response on a fresh connection reads `0`.
+    pub fn count_response(&self) -> u64 {
+        self.connection
+            .responses
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    }
+
     /// Get the DER encoded leaf certificate of the peer.
     pub fn peer_certificate(&self) -> Option<&[u8]> {
         self.peer_certificate.as_deref()
