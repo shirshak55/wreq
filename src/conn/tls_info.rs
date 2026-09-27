@@ -22,6 +22,10 @@ fn extract_tls_info<S>(ssl_stream: &SslStream<S>) -> TlsInfo {
             .map(|cipher| cipher.standard_name().unwrap_or_else(|| cipher.name())),
         alpn_protocol: ssl.selected_alpn_protocol().map(Bytes::copy_from_slice),
         connection: Arc::new(TlsConnectionUse::default()),
+        client_hello: crate::tls::conn::client_hello_index()
+            .ok()
+            .and_then(|index| ssl.ex_data(index))
+            .cloned(),
         peer_certificate: ssl
             .peer_certificate()
             .and_then(|cert| cert.to_der().ok())

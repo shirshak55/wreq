@@ -41,6 +41,49 @@ fn key_index() -> Result<Index<Ssl, Key>, ErrorStack> {
     IDX.clone()
 }
 
+/// Where each connection keeps the first ClientHello it sent (see [`record_client_hello`]).
+pub(crate) fn client_hello_index() -> Result<Index<Ssl, bytes::Bytes>, ErrorStack> {
+    static IDX: LazyLock<Result<Index<Ssl, bytes::Bytes>, ErrorStack>> =
+        LazyLock::new(Ssl::new_ex_index);
+    IDX.clone()
+}
+
+/// BoringSSL message callback keeping the first ClientHello handshake message a
+/// connection sends, so its `TlsInfo` carries the exact bytes this connection offered.
+#[allow(unsafe_code)]
+unsafe extern "C" fn record_client_hello(
+    is_write: std::os::raw::c_int,
+    _version: std::os::raw::c_int,
+    content_type: std::os::raw::c_int,
+    buf: *const std::os::raw::c_void,
+    len: usize,
+    ssl: *mut btls_sys::SSL,
+    _arg: *mut std::os::raw::c_void,
+) {
+    const HANDSHAKE: std::os::raw::c_int = 22;
+    const CLIENT_HELLO: u8 = 1;
+    if is_write == 0 || content_type != HANDSHAKE || buf.is_null() || len == 0 || ssl.is_null() {
+        return;
+    }
+    // SAFETY: BoringSSL passes a live `SSL` and a message buffer of `len` bytes that stay
+    // valid for the duration of the callback.
+    let (message, ssl) = unsafe {
+        (
+            std::slice::from_raw_parts(buf.cast::<u8>(), len),
+            <btls::ssl::SslRef as foreign_types::ForeignTypeRef>::from_ptr_mut(ssl),
+        )
+    };
+    if message[0] != CLIENT_HELLO {
+        return;
+    }
+    let Ok(index) = client_hello_index() else {
+        return;
+    };
+    if ssl.ex_data(index).is_none() {
+        ssl.set_ex_data(index, bytes::Bytes::copy_from_slice(message));
+    }
+}
+
 /// Settings for [`TlsConnector`]
 #[derive(Clone)]
 pub struct HandshakeSettings {
@@ -424,6 +467,13 @@ impl TlsConnectorBuilder {
             connector
                 .set_extension_permutation(extension_permutation)
                 .map_err(Error::tls)?;
+        }
+
+        // Keep each connection's ClientHello for its `TlsInfo`.
+        // SAFETY: `connector` owns a live `SSL_CTX`; the callback is a plain function.
+        #[allow(unsafe_code)]
+        unsafe {
+            btls_sys::SSL_CTX_set_msg_callback(connector.as_ptr(), Some(record_client_hello));
         }
 
         // Set TLS keylog handler.

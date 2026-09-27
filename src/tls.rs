@@ -26,6 +26,7 @@ pub struct TlsInfo {
     pub(crate) cipher: Option<&'static str>,
     pub(crate) alpn_protocol: Option<Bytes>,
     pub(crate) connection: std::sync::Arc<TlsConnectionUse>,
+    pub(crate) client_hello: Option<Bytes>,
 }
 
 /// The connection a [`TlsInfo`] was taken from, shared by every response it carries.
@@ -49,6 +50,12 @@ impl TlsInfo {
     /// The protocol selected through ALPN, if any.
     pub fn alpn_protocol(&self) -> Option<&[u8]> {
         self.alpn_protocol.as_deref()
+    }
+
+    /// The ClientHello handshake message (type, length and body, without the record
+    /// header) this connection sent first.
+    pub fn client_hello(&self) -> Option<&[u8]> {
+        self.client_hello.as_deref()
     }
 
     /// An id for the TLS connection this response arrived on, the same for every response
