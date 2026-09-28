@@ -245,14 +245,41 @@ where
 }
 
 impl<T: AsyncRead + AsyncWrite + Unpin> AsyncRead for TlsConn<T> {
-    #[inline]
+    /// Reads as the TLS stream does, but a peer closing an HTTP/1 connection without its
+    /// TLS close_notify reads as `UnexpectedEof` rather than a clean end: what it sent may
+    /// have been cut short (RFC 8446 section 6.1), so a body read to the close must not
+    /// look complete. HTTP/2 frames every end itself.
     fn poll_read(
         self: Pin<&mut Self>,
         cx: &mut Context,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<tokio::io::Result<()>> {
-        AsyncRead::poll_read(self.project().stream, cx, buf)
+        let mut stream = self.project().stream;
+        let filled = buf.filled().len();
+        std::task::ready!(AsyncRead::poll_read(stream.as_mut(), cx, buf))?;
+        let ssl = stream.ssl();
+        if buf.filled().len() == filled
+            && buf.remaining() > 0
+            && !close_notify_received(ssl)
+            && !ssl
+                .selected_alpn_protocol()
+                .is_some_and(|alpn| AlpnProtocol::HTTP2.eq(alpn))
+        {
+            return Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "peer closed connection without sending TLS close_notify",
+            )));
+        }
+        Poll::Ready(Ok(()))
     }
+}
+
+/// Whether the peer of `ssl` sent its TLS close_notify.
+#[allow(unsafe_code)]
+fn close_notify_received(ssl: &btls::ssl::SslRef) -> bool {
+    // SAFETY: `ssl` is a live `SSL`; reading its shutdown state has no other effect.
+    let state = unsafe { btls_sys::SSL_get_shutdown(foreign_types::ForeignTypeRef::as_ptr(ssl)) };
+    state & btls_sys::SSL_RECEIVED_SHUTDOWN != 0
 }
 
 impl<T: AsyncRead + AsyncWrite + Unpin> AsyncWrite for TlsConn<T> {
