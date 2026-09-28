@@ -78,7 +78,7 @@ use crate::{
         conn::TlsConnector,
         keylog::KeyLog,
         session::{IntoTlsSessionCache, TlsSessionCache},
-        trust::{CertStore, Identity},
+        trust::{AiaCache, CertStore, Identity},
     },
 };
 
@@ -228,6 +228,7 @@ struct Config {
     tls_identity: Option<Identity>,
     tls_cert_store: Option<CertStore>,
     tls_cert_verification: bool,
+    tls_aia: Option<AiaCache>,
     tls_verify_hostname: bool,
     tls_min_version: Option<TlsVersion>,
     tls_max_version: Option<TlsVersion>,
@@ -317,6 +318,7 @@ impl Client {
                 tls_identity: None,
                 tls_cert_store: None,
                 tls_cert_verification: true,
+                tls_aia: None,
                 tls_verify_hostname: true,
                 tls_min_version: None,
                 tls_max_version: None,
@@ -572,6 +574,7 @@ impl ClientBuilder {
                     .tls_sni(config.tls_sni)
                     .verify_hostname(config.tls_verify_hostname)
                     .cert_verification(config.tls_cert_verification)
+                    .aia(config.tls_aia)
                     .session_store(config.tls_session_cache)
                 })
                 .with_http(|http| {
@@ -1500,6 +1503,16 @@ impl ClientBuilder {
     #[inline]
     pub fn tls_cert_verification(mut self, cert_verification: bool) -> ClientBuilder {
         self.config.tls_cert_verification = cert_verification;
+        self
+    }
+
+    /// Completes certificate chains missing an issuer with the issuers `cache` fetches from
+    /// the caIssuers URLs of the certificates lacking one, as browsers do (see [`AiaCache`]).
+    ///
+    /// Off by default. It applies only with certificate verification.
+    #[inline]
+    pub fn tls_aia(mut self, cache: AiaCache) -> ClientBuilder {
+        self.config.tls_aia = Some(cache);
         self
     }
 

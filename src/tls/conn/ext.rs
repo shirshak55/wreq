@@ -4,7 +4,7 @@ use crate::{
     Error,
     tls::{
         compress::{self, CertificateCompressor},
-        trust::{CertStore, Identity},
+        trust::{AiaCache, CertStore, Identity},
     },
 };
 
@@ -18,6 +18,9 @@ pub trait SslConnectorBuilderExt {
 
     /// Configure the certificate verification for the given `SslConnectorBuilder`.
     fn set_cert_verification(self, enable: bool) -> SslConnectorBuilder;
+
+    /// Configure the AIA issuer fetching for the given `SslConnectorBuilder`.
+    fn set_aia(self, aia: Option<&AiaCache>) -> SslConnectorBuilder;
 
     /// Configure the certificate compressors for the given `SslConnectorBuilder`.
     fn set_cert_compressors(
@@ -72,6 +75,15 @@ impl SslConnectorBuilderExt for SslConnectorBuilder {
         } else {
             SslVerifyMode::NONE
         });
+
+        self
+    }
+
+    fn set_aia(mut self, aia: Option<&AiaCache>) -> SslConnectorBuilder {
+        if let Some(aia) = aia {
+            let aia = aia.clone();
+            self.set_cert_verify_callback(move |ctx| aia.verify(ctx));
+        }
 
         self
     }

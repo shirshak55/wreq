@@ -36,7 +36,7 @@ use crate::{
         AlpnProtocol, AlpsProtocol, KeyShare, TlsInfo, TlsOptions, TlsVersion,
         keylog::KeyLog,
         session::{Key, LruTlsSessionCache, TlsSession, TlsSessionCache},
-        trust::{CertStore, Identity},
+        trust::{AiaCache, CertStore, Identity},
     },
 };
 
@@ -119,6 +119,7 @@ pub struct TlsConnectorBuilder {
     identity: Option<Identity>,
     cert_store: Option<CertStore>,
     cert_verification: bool,
+    aia: Option<AiaCache>,
     keylog: Option<KeyLog>,
     session_cache: Arc<dyn TlsSessionCache>,
 }
@@ -168,6 +169,7 @@ impl TlsConnector {
             verify_hostname: true,
             cert_store: None,
             cert_verification: true,
+            aia: None,
             keylog: None,
             session_cache: Arc::new(LruTlsSessionCache::new(8)),
         }
@@ -425,6 +427,15 @@ impl TlsConnectorBuilder {
         self
     }
 
+    /// Sets the cache of issuers fetched from caIssuers URLs to complete chains missing an
+    /// issuer; `None` (the default) fetches none. It applies only with certificate
+    /// verification.
+    #[inline]
+    pub fn aia(mut self, aia: Option<AiaCache>) -> Self {
+        self.aia = aia;
+        self
+    }
+
     /// Sets the minimum TLS version to use.
     #[inline]
     pub fn min_version<T>(mut self, version: T) -> Self
@@ -490,6 +501,7 @@ impl TlsConnectorBuilder {
             .set_identity(self.identity.as_ref())?
             .set_cert_store(self.cert_store.as_ref())?
             .set_cert_verification(self.cert_verification)
+            .set_aia(self.aia.as_ref().filter(|_| self.cert_verification))
             .set_cert_compressors(opts.certificate_compressors.as_deref())?;
 
         // Set minimum TLS version
@@ -768,6 +780,12 @@ impl QuicTlsConnectorBuilder {
     /// Sets the store keeping the connections' sessions.
     pub fn session_store(self, store: Option<Arc<dyn TlsSessionCache>>) -> Self {
         Self(self.0.session_store(store))
+    }
+
+    /// Sets the cache of issuers fetched from caIssuers URLs to complete chains missing an
+    /// issuer (see [`AiaCache`]).
+    pub fn aia(self, aia: Option<AiaCache>) -> Self {
+        Self(self.0.aia(aia))
     }
 
     /// Builds the connector, failing when BoringSSL can't write the ClientHello `opts`

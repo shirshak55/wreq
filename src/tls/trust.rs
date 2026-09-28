@@ -4,6 +4,7 @@
 //! bundle management. Provides DER/PEM parsing for BoringSSL and
 //! supports both system and custom trust stores.
 
+mod aia;
 mod identity;
 mod parse;
 mod store;
@@ -11,6 +12,7 @@ mod store;
 use btls::x509::X509;
 
 pub use self::{
+    aia::AiaCache,
     identity::Identity,
     store::{CertStore, CertStoreBuilder},
 };
