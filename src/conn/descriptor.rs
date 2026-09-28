@@ -10,6 +10,8 @@ use std::{
 use http::{Uri, Version};
 use lru::DefaultHasher;
 
+#[cfg(feature = "tokio-rt")]
+use crate::tls::conn::Preconnected;
 use crate::{
     conn::net::SocketBindOptions,
     group::{Group, ScopeRef},
@@ -39,6 +41,8 @@ pub(crate) struct ConnectionDescriptor {
     socket_bind: Option<SocketBindOptions>,
     scope: Option<ScopeRef>,
     tls_name: Option<(Box<str>, bool)>,
+    #[cfg(feature = "tokio-rt")]
+    preconnected: Option<Preconnected>,
     connection_id: ConnectionId,
     session_id: ConnectionId,
     unversioned_id: Option<ConnectionId>,
@@ -125,6 +129,8 @@ impl ConnectionDescriptor {
             socket_bind,
             scope,
             tls_name: None,
+            #[cfg(feature = "tokio-rt")]
+            preconnected: None,
             connection_id,
             session_id,
             unversioned_id: unversioned.map(id),
@@ -136,6 +142,20 @@ impl ConnectionDescriptor {
     pub(crate) fn with_tls_name(mut self, tls_name: Option<(Box<str>, bool)>) -> Self {
         self.tls_name = tls_name;
         self
+    }
+
+    /// Offers a connection for the connection attempt to adopt instead of opening one.
+    #[cfg(feature = "tokio-rt")]
+    pub(crate) fn with_preconnected(mut self, preconnected: Option<Preconnected>) -> Self {
+        self.preconnected = preconnected;
+        self
+    }
+
+    /// The connection offered for adoption, if any.
+    #[cfg(feature = "tokio-rt")]
+    #[inline]
+    pub(crate) fn preconnected(&self) -> Option<&Preconnected> {
+        self.preconnected.as_ref()
     }
 
     /// Returns a [`ConnectionId`] group ID for this descriptor.

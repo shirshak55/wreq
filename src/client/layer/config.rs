@@ -8,6 +8,8 @@ use http::{HeaderMap, Request, Response, Version, uri::Authority};
 use tower::{Layer, Service};
 use wreq_proto::{http1::Http1Options, http2::Http2Options};
 
+#[cfg(feature = "tokio-rt")]
+use crate::tls::conn::Preconnected;
 use crate::{
     Error,
     config::RequestConfig,
@@ -38,6 +40,8 @@ pub(crate) struct RequestOptions {
     pub tls_server_name: Option<Option<Box<str>>>,
     pub scope: Option<ScopeRef>,
     pub connect_to: Option<Authority>,
+    #[cfg(feature = "tokio-rt")]
+    pub preconnected: Option<Preconnected>,
 }
 
 /// Configuration for the [`ConfigService`].

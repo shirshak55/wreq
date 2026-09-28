@@ -207,8 +207,8 @@ cyper = { version = "0.9.0",  default-features = false, features = ["rustls", "s
 
 # The btls fork carrying the ClientHello controls this fork's TLS options use.
 [patch.crates-io]
-btls = { git = "https://github.com/shirshak55/btls", rev = "7ad43e7d0bc9ad3843cb687b21912b08b644c725" }
-btls-sys = { git = "https://github.com/shirshak55/btls", rev = "7ad43e7d0bc9ad3843cb687b21912b08b644c725" }
+btls = { git = "https://github.com/shirshak55/btls", rev = "3fd081bbf068466ad82c88c6db724c2f14413956" }
+btls-sys = { git = "https://github.com/shirshak55/btls", rev = "3fd081bbf068466ad82c88c6db724c2f14413956" }
 
 [profile.release]
 codegen-units = 1

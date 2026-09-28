@@ -23,7 +23,7 @@ use ::http::{Extensions, HeaderMap, HeaderValue};
 #[cfg(any(feature = "tokio-rt", feature = "compio-rt"))]
 use net::TcpConnector;
 use pin_project_lite::pin_project;
-use tls_info::TlsInfoFactory;
+pub(crate) use tls_info::TlsInfoFactory;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio_btls::SslStream;
 use tower::{

@@ -128,12 +128,13 @@ impl ConnectorBuilder {
         self
     }
 
-    /// Build a [`Connector`] with the provided layers.
+    /// Build a [`Connector`] with the provided layers, and the [`TlsConnector`] it opens
+    /// connections with.
     pub fn build(
         self,
         tls_options: Option<TlsOptions>,
         layers: Vec<BoxedConnectorLayer>,
-    ) -> crate::Result<Connector> {
+    ) -> crate::Result<(Connector, TlsConnector)> {
         let mut service = ConnectorService {
             config: self.config,
             #[cfg(feature = "socks")]
@@ -144,10 +145,11 @@ impl ConnectorBuilder {
                 .build(tls_options.map(Cow::Owned).unwrap_or_default())?,
             builder: Arc::new(self.builder),
         };
+        let tls = service.tls.clone();
 
         // we have no user-provided layers, only use concrete types
         if layers.is_empty() {
-            return Ok(Connector::Simple(service));
+            return Ok((Connector::Simple(service), tls));
         }
 
         // user-provided layers exist, the timeout will be applied as an additional layer.
@@ -176,7 +178,10 @@ impl ConnectorBuilder {
                     .service(service)
                     .map_err(map_timeout_to_connector_error);
 
-                Ok(Connector::WithLayers(BoxCloneSyncService::new(service)))
+                Ok((
+                    Connector::WithLayers(BoxCloneSyncService::new(service)),
+                    tls,
+                ))
             }
             None => {
                 // no timeout, but still map err
@@ -186,7 +191,10 @@ impl ConnectorBuilder {
                     .service(service)
                     .map_err(map_timeout_to_connector_error);
 
-                Ok(Connector::WithLayers(BoxCloneSyncService::new(service)))
+                Ok((
+                    Connector::WithLayers(BoxCloneSyncService::new(service)),
+                    tls,
+                ))
             }
         }
     }
@@ -498,6 +506,31 @@ impl ConnectorService {
     }
 
     async fn connect_auto(self, req: ConnectionDescriptor) -> Result<Conn, BoxError> {
+        #[cfg(feature = "tokio-rt")]
+        if let Some(preconnected) = req.preconnected() {
+            let mut stream = preconnected
+                .take()
+                .ok_or("the adopted connection was already used")?;
+            let tls = match req.tls_options() {
+                Some(opts) => self.builder.build(Cow::Borrowed(opts))?,
+                None => self.tls.clone(),
+            };
+            if !(req.uri().is_https() && tls.opened_for(&stream, &req)?) {
+                return Err("the adopted connection is not one this request would open".into());
+            }
+            if !stream.idle() {
+                return Err("the adopted connection is closed or has unread data".into());
+            }
+            debug!("adopting a connection: {:?}", req.uri());
+            return Ok(Conn {
+                stream: self.config.verbose.wrap(TlsConn {
+                    stream: stream.stream,
+                }),
+                tls_info: self.config.tls_info,
+                proxy: None,
+            });
+        }
+
         debug!("starting new connection: {:?}", req.uri());
 
         let timeout = self.config.timeout;

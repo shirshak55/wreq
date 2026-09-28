@@ -150,28 +150,46 @@ where
         &self,
         mut req: Request<B>,
     ) -> BoxFuture<'static, Result<Response<Incoming>, BoxError>> {
+        match self.prepare(&mut req) {
+            Ok((this, descriptor)) => {
+                Box::pin(this.send_request(req, descriptor).map_err(Into::into))
+            }
+            Err(err) => Box::pin(future::err(err.into())),
+        }
+    }
+
+    /// Adopts the connection `req` offers (see
+    /// [`RequestBuilder::adopt`](crate::RequestBuilder::adopt)) into the pool as an idle
+    /// connection of the connections `req` would use, without sending `req`.
+    #[cfg(feature = "tokio-rt")]
+    pub(crate) async fn adopt(&self, mut req: Request<B>) -> Result<(), Error> {
+        let (this, descriptor) = self.prepare(&mut req)?;
+        // Dropping the ready connection puts it in the pool.
+        drop(this.connection_for(descriptor).await?);
+        Ok(())
+    }
+
+    /// This client with `req`'s per-request options applied, and the connection `req`
+    /// needs.
+    fn prepare(&self, req: &mut Request<B>) -> Result<(Self, ConnectionDescriptor), Error> {
         let is_http_connect = req.method() == Method::CONNECT;
         // Validate HTTP version early
         match req.version() {
             Version::HTTP_10 if is_http_connect => {
                 warn!("CONNECT is not allowed for HTTP/1.0");
-                return Box::pin(future::err(e!(UserUnsupportedRequestMethod).into()));
+                return Err(e!(UserUnsupportedRequestMethod));
             }
             Version::HTTP_10 | Version::HTTP_11 | Version::HTTP_2 => {}
             // completely unsupported HTTP version (like HTTP/0.9)!
             _unsupported => {
                 warn!("Request has unsupported version: {:?}", _unsupported);
-                return Box::pin(future::err(e!(UserUnsupportedVersion).into()));
+                return Err(e!(UserUnsupportedVersion));
             }
         };
 
         // Extract and normalize URI
-        let uri = match normalize_uri(&mut req, is_http_connect) {
-            Ok(uri) => uri,
-            Err(err) => {
-                return Box::pin(future::err(e!(UserAbsoluteUriRequired, err).into()));
-            }
-        };
+        let uri =
+            normalize_uri(req, is_http_connect).map_err(|err| e!(UserAbsoluteUriRequired, err))?;
 
         let mut this = self.clone();
 
@@ -188,6 +206,8 @@ where
                 tls_server_name,
                 scope,
                 connect_to,
+                #[cfg(feature = "tokio-rt")]
+                preconnected,
             } = RequestConfig::<RequestOptions>::remove(req.extensions_mut()).unwrap_or_default();
 
             if let Some(opts) = http1_options {
@@ -217,7 +237,7 @@ where
                 None => uri,
             };
 
-            ConnectionDescriptor::new(
+            let descriptor = ConnectionDescriptor::new(
                 uri,
                 group,
                 scope,
@@ -226,10 +246,13 @@ where
                 tls_options,
                 socket_bind_options,
             )
-            .with_tls_name(tls_name)
+            .with_tls_name(tls_name);
+            #[cfg(feature = "tokio-rt")]
+            let descriptor = descriptor.with_preconnected(preconnected);
+            descriptor
         };
 
-        Box::pin(this.send_request(req, descriptor).map_err(Into::into))
+        Ok((this, descriptor))
     }
 
     async fn send_request(

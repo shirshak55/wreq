@@ -23,6 +23,7 @@ use std::{
 };
 
 use http::header::{HeaderMap, HeaderValue, USER_AGENT};
+use tokio::io::{AsyncRead, AsyncWrite};
 use tower::{
     BoxError, Layer, Service, ServiceBuilder, ServiceExt,
     retry::{Retry, RetryLayer},
@@ -73,7 +74,8 @@ use crate::{
     retry,
     rt::{BoxSendFuture, Executor, Timer},
     tls::{
-        AlpnProtocol, TlsOptions, TlsVersion,
+        AlpnProtocol, TlsOptions, TlsStream, TlsVersion,
+        conn::TlsConnector,
         keylog::KeyLog,
         session::{IntoTlsSessionCache, TlsSessionCache},
         trust::{CertStore, Identity},
@@ -149,7 +151,18 @@ type BoxedClientServiceLayer = BoxCloneSyncServiceLayer<
 ///
 /// [`Rc`]: std::rc::Rc
 #[derive(Clone)]
-pub struct Client(Arc<Either<ClientService, BoxedClientService>>);
+pub struct Client(
+    Arc<Either<ClientService, BoxedClientService>>,
+    Arc<Connections>,
+);
+
+/// The TLS connector and connection pool behind a [`Client`]'s requests, for connections
+/// opened outside one.
+struct Connections {
+    tls: TlsConnector,
+    #[cfg(feature = "tokio-rt")]
+    http: HttpClient<Connector, Body>,
+}
 
 /// A [`ClientBuilder`] can be used to create a [`Client`] with custom configuration.
 #[must_use]
@@ -428,6 +441,37 @@ impl Client {
             fut: Box::pin(Oneshot::new((*self.0).clone(), req)),
         }
     }
+
+    /// Opens a TLS connection over `io` with the ClientHello, trust, and client identity
+    /// this client's HTTPS connections use: it verifies `server_name` and announces it
+    /// (SNI), or, without one, verifies `host` and announces none. It offers no ALPN and
+    /// neither offers nor keeps a TLS session, and is bounded by no timeout of the
+    /// client's. The pool can adopt the connection (see [`RequestBuilder::adopt`]).
+    pub async fn tls_connect<IO>(
+        &self,
+        io: IO,
+        host: &str,
+        server_name: Option<&str>,
+    ) -> crate::Result<TlsStream<IO>>
+    where
+        IO: AsyncRead + AsyncWrite + Unpin,
+    {
+        self.1
+            .tls
+            .connect(io, host, server_name)
+            .await
+            .map_err(Error::tls)
+    }
+
+    /// Adopts `request`'s offered connection into the pool (see [`RequestBuilder::adopt`]).
+    #[cfg(feature = "tokio-rt")]
+    pub(crate) async fn adopt(&self, request: Request) -> crate::Result<()> {
+        self.1
+            .http
+            .adopt(http::Request::<Body>::from(request))
+            .await
+            .map_err(Error::request)
+    }
 }
 
 impl tower::Service<Request> for Client {
@@ -484,7 +528,7 @@ impl ClientBuilder {
         }
 
         // Create base client service
-        let service = {
+        let (service, connections) = {
             let resolver = {
                 let mut resolver: Arc<dyn Resolve> = match config.dns_resolver {
                     Some(dns_resolver) => dns_resolver,
@@ -502,7 +546,7 @@ impl ClientBuilder {
                 DynResolver::new(resolver)
             };
 
-            let connector = Connector::builder(config.proxies, resolver)
+            let (connector, tls) = Connector::builder(config.proxies, resolver)
                 .timeout(config.connect_timeout)
                 .tls_info(config.tls_info)
                 .tcp_nodelay(config.tcp_nodelay)
@@ -570,7 +614,7 @@ impl ClientBuilder {
                 builder = builder.cookie_store(config.cookie_store);
             }
 
-            builder
+            let service = builder
                 .http1_options(config.http1_options)
                 .http2_options(config.http2_options)
                 .http2_only(matches!(config.http_version_pref, HttpVersionPref::Http2))
@@ -579,7 +623,13 @@ impl ClientBuilder {
                 .pool_idle_timeout(config.pool_idle_timeout)
                 .pool_max_idle_per_host(config.pool_max_idle_per_host)
                 .pool_max_size(config.pool_max_size)
-                .build(connector)
+                .build(connector);
+            let connections = Connections {
+                tls,
+                #[cfg(feature = "tokio-rt")]
+                http: service.clone(),
+            };
+            (service, connections)
         };
 
         // Configured client service with layers
@@ -635,7 +685,7 @@ impl ClientBuilder {
             }
         };
 
-        Ok(Client(Arc::new(client)))
+        Ok(Client(Arc::new(client), Arc::new(connections)))
     }
 
     // Runtime options

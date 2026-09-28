@@ -31,6 +31,8 @@ use super::{
 };
 #[cfg(feature = "cookies")]
 use crate::cookie::{CookieStore, IntoCookieStore};
+#[cfg(feature = "tokio-rt")]
+use crate::tls::{TlsStream, conn::Preconnected};
 use crate::{
     Error, Method, Proxy,
     config::{RequestConfig, RequestConfigValue},
@@ -826,6 +828,23 @@ impl RequestBuilder {
             }
         }
         self
+    }
+
+    /// Adopts `stream`, a connection opened with
+    /// [`Client::tls_connect`](crate::Client::tls_connect) to where this request's own
+    /// connection would go (the same address, through the same proxy), into the pool as
+    /// an idle HTTP/1 connection for the requests this one would share a connection with,
+    /// instead of sending this request. It fails, closing `stream`, unless this client
+    /// opened it verifying and announcing the name this request's connection would, and
+    /// the peer has neither closed it nor sent anything.
+    #[cfg(feature = "tokio-rt")]
+    pub async fn adopt(mut self, stream: TlsStream<tokio::net::TcpStream>) -> crate::Result<()> {
+        if let Ok(ref mut req) = self.request {
+            req.config_mut::<RequestOptions>()
+                .get_or_insert_default()
+                .preconnected = Some(Preconnected::new(stream));
+        }
+        self.client.adopt(self.request?).await
     }
 
     /// Confines this request's connection to `scope`: it reuses only connections opened

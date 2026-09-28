@@ -15,6 +15,7 @@ use std::borrow::Cow;
 pub use btls::ssl::{ExtensionType, KeyShare};
 use bytes::{BufMut, Bytes, BytesMut};
 use compress::CertificateCompressor;
+pub use conn::TlsStream;
 
 /// Http extension carrying extra TLS layer information.
 /// Made available to clients on responses when `tls_info` is set.
@@ -364,6 +365,14 @@ pub struct TlsOptions {
     /// **Default:** `None`
     pub trust_anchors: Option<Cow<'static, [u8]>>,
 
+    /// The length of the random legacy session ID a ClientHello resuming no session by ID
+    /// or TLS 1.2 ticket carries, at most 32 bytes; a TLS 1.3 one without also sends no
+    /// compatibility mode ChangeCipherSpec. `None` sends 32 bytes when offering TLS 1.3,
+    /// else none.
+    ///
+    /// **Default:** `None`
+    pub session_id_length: Option<u8>,
+
     /// Overrides AES hardware acceleration.
     ///
     /// **Default:** `None`
@@ -613,6 +622,16 @@ impl TlsOptionsBuilder {
         self
     }
 
+    /// Sets the length of the legacy session ID a ClientHello resuming no session carries.
+    #[inline]
+    pub fn session_id_length<T>(mut self, len: T) -> Self
+    where
+        T: Into<Option<u8>>,
+    {
+        self.config.session_id_length = len.into();
+        self
+    }
+
     /// Sets the AES hardware override flag.
     #[inline]
     pub fn aes_hw_override<T>(mut self, enabled: T) -> Self
@@ -698,6 +717,7 @@ impl Default for TlsOptions {
             padding_length: 0,
             renegotiation_scsv: false,
             trust_anchors: None,
+            session_id_length: None,
             aes_hw_override: None,
             preserve_tls13_cipher_list: None,
             random_aes_hw_override: false,

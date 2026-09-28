@@ -17,8 +17,12 @@ use std::{
 use btls::{
     error::ErrorStack,
     ex_data::Index,
-    ssl::{Ssl, SslConnector, SslMethod, SslOptions, SslSessionCacheMode},
+    ssl::{
+        ConnectConfiguration, HandshakeError, Ssl, SslConnector, SslMethod, SslOptions,
+        SslSessionCacheMode,
+    },
 };
+use bytes::Bytes;
 use ext::SslConnectorBuilderExt;
 use http::{Uri, Version};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
@@ -27,9 +31,9 @@ use tower::{BoxError, Service};
 
 use crate::{
     Error,
-    conn::{Connected, Connection, descriptor::ConnectionDescriptor},
+    conn::{Connected, Connection, TlsInfoFactory, descriptor::ConnectionDescriptor},
     tls::{
-        AlpnProtocol, AlpsProtocol, KeyShare, TlsOptions, TlsVersion,
+        AlpnProtocol, AlpsProtocol, KeyShare, TlsInfo, TlsOptions, TlsVersion,
         keylog::KeyLog,
         session::{Key, LruTlsSessionCache, TlsSession, TlsSessionCache},
         trust::{CertStore, Identity},
@@ -177,7 +181,60 @@ impl TlsConnector {
         Ok(ssl)
     }
 
-    fn setup_ssl2(&self, descriptor: ConnectionDescriptor) -> Result<Ssl, BoxError> {
+    /// The ALPN protocols a connection for a request forcing `version` offers, encoded.
+    fn alpn_offer(&self, version: Option<Version>) -> Option<Bytes> {
+        match version {
+            // HTTP/1 needs no ALPN, so a connector that offers none keeps offering none.
+            Some(Version::HTTP_11 | Version::HTTP_10 | Version::HTTP_09) => self
+                .settings
+                .alpn_protocols
+                .as_ref()
+                .map(|_| AlpnProtocol::HTTP1.encode()),
+            Some(Version::HTTP_2) => Some(AlpnProtocol::HTTP2.encode()),
+            Some(Version::HTTP_3) => Some(AlpnProtocol::HTTP3.encode()),
+            // For unknown versions, we don't set any ALPN protocols.
+            Some(_) => None,
+            // Default use the connector configuration.
+            None => self
+                .settings
+                .alpn_protocols
+                .as_ref()
+                .map(|alpn_values| AlpnProtocol::encode_sequence(alpn_values.as_ref())),
+        }
+    }
+
+    /// The name a connection for `descriptor` verifies, and whether it may announce it
+    /// (SNI): the URI host unless the request names another, or announces none.
+    fn verified_name(descriptor: &ConnectionDescriptor) -> Result<(&str, bool), BoxError> {
+        let host = descriptor.uri().host().ok_or("URI missing host")?;
+        let (host, sni) = descriptor.tls_name().unwrap_or((host, true));
+        Ok((Self::normalize_host(host), sni))
+    }
+
+    /// Whether `stream` can serve `descriptor`'s requests as the connection this connector
+    /// would open for it: opened by it, verifying and announcing the same name, and
+    /// speaking HTTP/1 (it negotiated no ALPN).
+    #[cfg(feature = "tokio-rt")]
+    pub(crate) fn opened_for<IO>(
+        &self,
+        stream: &TlsStream<IO>,
+        descriptor: &ConnectionDescriptor,
+    ) -> Result<bool, BoxError> {
+        let (name, sni) = Self::verified_name(descriptor)?;
+        Ok(
+            std::ptr::eq(stream.stream.ssl().ssl_context(), self.ssl.context())
+                && *stream.name == *name
+                && stream.sni == (sni && self.settings.tls_sni)
+                && !matches!(
+                    descriptor.version(),
+                    Some(Version::HTTP_2 | Version::HTTP_3)
+                ),
+        )
+    }
+
+    /// The configuration every connection starts with, offering the `alpn` protocols
+    /// (encoded; none when `None`).
+    fn configure(&self, alpn: Option<&[u8]>) -> Result<ConnectConfiguration, BoxError> {
         let mut cfg = self.ssl.configure()?;
 
         // Use server name indication
@@ -196,30 +253,8 @@ impl TlsConnector {
         }
 
         // Set ALPN protocols
-        if let Some(version) = descriptor.version() {
-            match version {
-                // HTTP/1 needs no ALPN, so a connector that offers none keeps offering none.
-                Version::HTTP_11 | Version::HTTP_10 | Version::HTTP_09 => {
-                    if self.settings.alpn_protocols.is_some() {
-                        cfg.set_alpn_protos(&AlpnProtocol::HTTP1.encode())?;
-                    }
-                }
-                Version::HTTP_2 => {
-                    cfg.set_alpn_protos(&AlpnProtocol::HTTP2.encode())?;
-                }
-                Version::HTTP_3 => {
-                    cfg.set_alpn_protos(&AlpnProtocol::HTTP3.encode())?;
-                }
-                _ => {
-                    // For unknown versions, we don't set any ALPN protocols.
-                }
-            }
-        } else {
-            // Default use the connector configuration.
-            if let Some(ref alpn_values) = self.settings.alpn_protocols {
-                let encoded = AlpnProtocol::encode_sequence(alpn_values.as_ref());
-                cfg.set_alpn_protos(&encoded)?;
-            }
+        if let Some(alpn) = alpn {
+            cfg.set_alpn_protos(alpn)?;
         }
 
         // Set ALPS protos
@@ -239,20 +274,16 @@ impl TlsConnector {
             cfg.set_client_key_shares(key_shares.as_ref())?;
         }
 
-        let uri = descriptor.uri().clone();
-        let host = uri.host().ok_or("URI missing host")?;
-        // The name verified, and announced unless the request announces none: the URI host
-        // unless the request names another.
-        let host = match descriptor.tls_name() {
-            Some((name, sni)) => {
-                if !sni {
-                    cfg.set_use_server_name_indication(false);
-                }
-                name
-            }
-            None => host,
-        };
-        let host = Self::normalize_host(host);
+        Ok(cfg)
+    }
+
+    fn setup_ssl2(&self, descriptor: ConnectionDescriptor) -> Result<Ssl, BoxError> {
+        let mut cfg = self.configure(self.alpn_offer(descriptor.version()).as_deref())?;
+
+        let (host, sni) = Self::verified_name(&descriptor)?;
+        if !sni {
+            cfg.set_use_server_name_indication(false);
+        }
 
         if let Some(ref cache) = self.cache {
             let key = Key(descriptor.session_id());
@@ -273,6 +304,65 @@ impl TlsConnector {
         }
 
         Ok(cfg.into_ssl(host)?)
+    }
+
+    /// Opens a TLS connection over `io` as this connector opens a request's, verifying
+    /// `server_name` and announcing it (SNI), or, without one, verifying `host` and
+    /// announcing none; it offers no ALPN and neither offers nor keeps a session.
+    pub(crate) async fn connect<IO>(
+        &self,
+        io: IO,
+        host: &str,
+        server_name: Option<&str>,
+    ) -> Result<TlsStream<IO>, BoxError>
+    where
+        IO: AsyncRead + AsyncWrite + Unpin,
+    {
+        let mut cfg = self.configure(None)?;
+        if server_name.is_none() {
+            cfg.set_use_server_name_indication(false);
+        }
+        let name = Self::normalize_host(server_name.unwrap_or(host));
+        let mut stream = SslStream::new(cfg.into_ssl(name)?, io)?;
+        Pin::new(&mut stream).connect().await?;
+        Ok(TlsStream {
+            stream,
+            name: Box::from(name),
+            sni: server_name.is_some() && self.settings.tls_sni,
+        })
+    }
+
+    /// Writes the ClientHello a connection opens with into a peer that never answers,
+    /// failing when BoringSSL can't set up the connection or build it.
+    fn check(&self) -> Result<(), BoxError> {
+        /// A peer that takes every byte and has none to send yet.
+        struct Silent;
+
+        impl io::Read for Silent {
+            fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
+                Err(io::ErrorKind::WouldBlock.into())
+            }
+        }
+
+        impl io::Write for Silent {
+            fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+                Ok(buf.len())
+            }
+
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let ssl = self
+            .configure(self.alpn_offer(None).as_deref())?
+            .into_ssl("example.com")?;
+        match ssl.connect(Silent) {
+            Err(HandshakeError::WouldBlock(_)) => Ok(()),
+            Err(HandshakeError::SetupFailure(err)) => Err(err.into()),
+            Err(HandshakeError::Failure(mid)) => Err(mid.into_error().into()),
+            Ok(_) => Err("the handshake completed without a peer".into()),
+        }
     }
 
     /// If `host` is an IPv6 address, we must strip away the square brackets that surround
@@ -495,6 +585,11 @@ impl TlsConnectorBuilder {
         // Set TLS trust anchor IDs
         set_option_ref_try!(opts, trust_anchors, connector, set_requested_trust_anchors);
 
+        // Set the legacy session ID length
+        connector
+            .set_session_id_length(opts.session_id_length)
+            .map_err(Error::tls)?;
+
         // Keep each connection's ClientHello for its `TlsInfo`.
         // SAFETY: `connector` owns a live `SSL_CTX`; the callback is a plain function.
         #[allow(unsafe_code)]
@@ -540,11 +635,120 @@ impl TlsConnectorBuilder {
             session_cache
         });
 
-        Ok(TlsConnector {
+        let connector = TlsConnector {
             ssl: connector.build(),
             cache,
             settings,
-        })
+        };
+        connector.check().map_err(Error::tls)?;
+        Ok(connector)
+    }
+}
+
+/// A TLS connection a client opened over a caller's stream (see
+/// [`Client::tls_connect`](crate::Client::tls_connect)).
+pub struct TlsStream<IO> {
+    pub(crate) stream: SslStream<IO>,
+    /// The name it verified, and whether it announced it.
+    name: Box<str>,
+    #[cfg_attr(not(feature = "tokio-rt"), allow(dead_code))]
+    sni: bool,
+}
+
+impl<IO> TlsStream<IO> {
+    /// The negotiated TLS of this connection, with the ClientHello it sent.
+    pub fn tls_info(&self) -> TlsInfo {
+        self.stream.tls_info().expect("TLS info of a TLS stream")
+    }
+
+    /// The stream the connection runs over.
+    pub fn get_ref(&self) -> &IO {
+        self.stream.get_ref()
+    }
+}
+
+impl<IO: AsyncRead + AsyncWrite + Unpin> TlsStream<IO> {
+    /// Whether the peer has neither closed the connection nor sent data yet, reading
+    /// only what is already there (a TLS 1.3 session ticket, say).
+    #[cfg(feature = "tokio-rt")]
+    pub(crate) fn idle(&mut self) -> bool {
+        let mut byte = [0; 1];
+        Pin::new(&mut self.stream)
+            .poll_read(
+                &mut Context::from_waker(std::task::Waker::noop()),
+                &mut ReadBuf::new(&mut byte),
+            )
+            .is_pending()
+    }
+}
+
+impl<IO: fmt::Debug> fmt::Debug for TlsStream<IO> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("TlsStream")
+            .field("stream", self.stream.get_ref())
+            .field("name", &self.name)
+            .finish()
+    }
+}
+
+impl<IO: AsyncRead + AsyncWrite + Unpin> AsyncRead for TlsStream<IO> {
+    #[inline]
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.stream).poll_read(cx, buf)
+    }
+}
+
+impl<IO: AsyncRead + AsyncWrite + Unpin> AsyncWrite for TlsStream<IO> {
+    #[inline]
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(&mut self.stream).poll_write(cx, buf)
+    }
+
+    #[inline]
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.stream).poll_flush(cx)
+    }
+
+    #[inline]
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.stream).poll_shutdown(cx)
+    }
+}
+
+/// A connection offered for adoption (see
+/// [`RequestBuilder::adopt`](crate::RequestBuilder::adopt)), which the connection attempt
+/// takes.
+#[cfg(feature = "tokio-rt")]
+#[derive(Clone)]
+pub(crate) struct Preconnected(Arc<std::sync::Mutex<Option<TlsStream<tokio::net::TcpStream>>>>);
+
+#[cfg(feature = "tokio-rt")]
+impl Preconnected {
+    pub(crate) fn new(stream: TlsStream<tokio::net::TcpStream>) -> Self {
+        Self(Arc::new(std::sync::Mutex::new(Some(stream))))
+    }
+
+    /// The connection, unless a connection attempt took it already.
+    pub(crate) fn take(&self) -> Option<TlsStream<tokio::net::TcpStream>> {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+    }
+}
+
+#[cfg(feature = "tokio-rt")]
+impl fmt::Debug for Preconnected {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.pad("Preconnected(..)")
     }
 }
 
