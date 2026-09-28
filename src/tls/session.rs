@@ -16,17 +16,22 @@ use std::{
 };
 
 use btls::ssl::{SslSession, SslVersion};
+use bytes::Bytes;
+use http::{Uri, Version};
 use lru::LruCache;
 
-use crate::{conn::descriptor::ConnectionId, sync::Mutex, tls::TlsVersion};
+use crate::{conn::descriptor::ConnectionId, group::Group, sync::Mutex, tls::TlsVersion};
 
 /// An opaque key identifying a TLS session cache entry.
 #[derive(Clone, PartialEq, Eq, Hash)]
 pub struct Key(pub(super) ConnectionId);
 
 /// A TLS session that can be stored and retrieved from a session cache.
+///
+/// A QUIC connection's session also carries the server's transport parameters, which a client
+/// resuming it with 0-RTT data must keep to.
 #[derive(Clone)]
-pub struct TlsSession(pub(super) SslSession);
+pub struct TlsSession(pub(super) SslSession, pub(super) Option<Bytes>);
 
 /// A trait for cache storing and retrieving TLS sessions.
 ///
@@ -69,6 +74,21 @@ pub struct LruTlsSessionCache {
 struct Inner {
     reverse: HashMap<TlsSession, Key>,
     per_host_sessions: HashMap<Key, LruCache<TlsSession, ()>>,
+}
+
+// ===== impl Key =====
+
+impl Key {
+    /// The key of the QUIC sessions of `origin` whose connections verify `name`, announcing it
+    /// when `sni`.
+    pub(super) fn quic(origin: &Uri, name: &str, sni: bool) -> Self {
+        let mut group = Group::new(name.to_owned());
+        group
+            .uri(origin.clone())
+            .version(Some(Version::HTTP_3))
+            .server_name(sni.then(|| Box::from(name)));
+        Key(ConnectionId::new(group))
+    }
 }
 
 // ===== impl TlsSession =====

@@ -50,6 +50,13 @@ pub(crate) struct ConnectionDescriptor {
 
 // ===== impl ConnectionId =====
 
+impl ConnectionId {
+    /// The ID of the connections `group` describes.
+    pub(crate) fn new(group: Group) -> Self {
+        ConnectionId(Arc::new((group, AtomicU64::new(u64::MIN))))
+    }
+}
+
 impl Hash for ConnectionId {
     fn hash<H: Hasher>(&self, state: &mut H) {
         let hash = self.0.1.load(Ordering::Relaxed);

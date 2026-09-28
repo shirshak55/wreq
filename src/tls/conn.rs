@@ -18,7 +18,7 @@ use btls::{
     error::ErrorStack,
     ex_data::Index,
     ssl::{
-        ConnectConfiguration, HandshakeError, Ssl, SslConnector, SslMethod, SslOptions,
+        ConnectConfiguration, HandshakeError, Ssl, SslConnector, SslMethod, SslOptions, SslRef,
         SslSessionCacheMode,
     },
 };
@@ -633,7 +633,10 @@ impl TlsConnectorBuilder {
                 let cache = session_cache.clone();
                 move |ssl, session| {
                     if let Ok(Some(key)) = key_index().map(|idx| ssl.ex_data(idx)) {
-                        cache.put(key.clone(), TlsSession(session));
+                        cache.put(
+                            key.clone(),
+                            TlsSession(session, peer_quic_transport_parameters(ssl)),
+                        );
                     }
                 }
             });
@@ -651,12 +654,44 @@ impl TlsConnectorBuilder {
     }
 }
 
+/// The transport parameters the server of a QUIC connection sent, as it encoded them; `None`
+/// for a TLS connection over TCP.
+#[allow(unsafe_code)]
+fn peer_quic_transport_parameters(ssl: &SslRef) -> Option<Bytes> {
+    // SAFETY: `ssl` is a live `SSL`; BoringSSL points `params` at `len` bytes it owns, valid
+    // until the connection changes, and they are copied at once.
+    unsafe {
+        let ssl = foreign_types::ForeignTypeRef::as_ptr(ssl);
+        if btls_sys::SSL_is_quic(ssl) == 0 {
+            return None;
+        }
+        let mut params = std::ptr::null();
+        let mut len = 0;
+        btls_sys::SSL_get_peer_quic_transport_params(ssl, &mut params, &mut len);
+        (!params.is_null()).then(|| Bytes::copy_from_slice(std::slice::from_raw_parts(params, len)))
+    }
+}
+
 /// A TLS connector for QUIC handshakes a caller drives: each [`Ssl`] it makes offers the
 /// ClientHello its [`TlsOptions`] describe, as a client's TCP connections do, and verifies
 /// the server against the same trust. The caller adds the QUIC transport (its method and
 /// transport parameters) to each.
+///
+/// With [`TlsOptions::pre_shared_key`], its connections keep the sessions they receive in its
+/// session store, with the server's transport parameters, and resume them (see
+/// [`QuicTlsConnector::new_ssl`]).
 #[derive(Clone)]
 pub struct QuicTlsConnector(TlsConnector);
+
+/// A client [`Ssl`] for one QUIC connection (see [`QuicTlsConnector::new_ssl`]).
+pub struct QuicSsl {
+    /// The connection's TLS, to which the caller adds the QUIC transport.
+    pub ssl: Ssl,
+    /// When `ssl` resumes a session, the transport parameters the server sent on the
+    /// connection that received it, as it encoded them: a client sending 0-RTT data keeps to
+    /// them.
+    pub resumed_transport_parameters: Option<Bytes>,
+}
 
 /// Builds a [`QuicTlsConnector`].
 pub struct QuicTlsConnectorBuilder(TlsConnectorBuilder);
@@ -669,7 +704,11 @@ impl QuicTlsConnector {
 
     /// A client [`Ssl`] for one QUIC connection verifying `name`, announcing it (SNI) when
     /// `sni`.
-    pub fn new_ssl(&self, name: &str, sni: bool) -> crate::Result<Ssl> {
+    ///
+    /// With `origin` (an `https` URI with the origin's host and port), and a session store,
+    /// the connection offers the session the store gives for the origin, `name` and `sni`, if
+    /// any, and keeps those it receives there.
+    pub fn new_ssl(&self, name: &str, sni: bool, origin: Option<&Uri>) -> crate::Result<QuicSsl> {
         let mut cfg = self
             .0
             .configure(self.0.alpn_offer(None).as_deref())
@@ -677,8 +716,22 @@ impl QuicTlsConnector {
         if !sni {
             cfg.set_use_server_name_indication(false);
         }
-        cfg.into_ssl(TlsConnector::normalize_host(name))
-            .map_err(Error::tls)
+        let name = TlsConnector::normalize_host(name);
+        let mut resumed_transport_parameters = None;
+        if let (Some(cache), Some(origin)) = (&self.0.cache, origin) {
+            let key = Key::quic(origin, name, sni);
+            if let Some(TlsSession(session, params)) = cache.pop(&key) {
+                #[allow(unsafe_code)]
+                unsafe { cfg.set_session(&session) }.map_err(Error::tls)?;
+                resumed_transport_parameters = params;
+            }
+            cfg.set_ex_data(key_index().map_err(Error::tls)?, key);
+        }
+        let ssl = cfg.into_ssl(name).map_err(Error::tls)?;
+        Ok(QuicSsl {
+            ssl,
+            resumed_transport_parameters,
+        })
     }
 }
 
@@ -704,6 +757,11 @@ impl QuicTlsConnectorBuilder {
     /// Sets the TLS keylog policy.
     pub fn keylog(self, keylog: Option<KeyLog>) -> Self {
         Self(self.0.keylog(keylog))
+    }
+
+    /// Sets the store keeping the connections' sessions.
+    pub fn session_store(self, store: Option<Arc<dyn TlsSessionCache>>) -> Self {
+        Self(self.0.session_store(store))
     }
 
     /// Builds the connector, failing when BoringSSL can't write the ClientHello `opts`
