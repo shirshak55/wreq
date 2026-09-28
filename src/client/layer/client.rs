@@ -47,6 +47,7 @@ use crate::{
         proxy,
     },
     error::ProxyConnect,
+    group::ScopeRef,
     rt::{Executor, Timer},
 };
 
@@ -177,13 +178,15 @@ where
         // Extract per-request options from the request extensions and apply them to the client.
         let descriptor = {
             let RequestOptions {
-                group,
+                mut group,
                 proxy,
                 version,
                 tls_options,
                 http1_options,
                 http2_options,
                 socket_bind_options,
+                tls_server_name,
+                scope,
             } = RequestConfig::<RequestOptions>::remove(req.extensions_mut()).unwrap_or_default();
 
             if let Some(opts) = http1_options {
@@ -193,7 +196,19 @@ where
                 this.h2_builder = this.h2_builder.options(opts);
             }
 
-            ConnectionDescriptor::new(uri, group, proxy, version, tls_options, socket_bind_options)
+            if let Some(name) = tls_server_name {
+                group.server_name(name);
+            }
+
+            ConnectionDescriptor::new(
+                uri,
+                group,
+                scope,
+                proxy,
+                version,
+                tls_options,
+                socket_bind_options,
+            )
         };
 
         Box::pin(this.send_request(req, descriptor).map_err(Into::into))
@@ -500,6 +515,7 @@ where
         };
         let is_ver_h2 = ver == Ver::Http2;
         let connector = self.connector.clone();
+        let scope = descriptor.scope().cloned();
         lazy(move || {
             // Try to take a "connecting lock".
             //
@@ -549,10 +565,11 @@ where
                                     trace!(
                                         "http2 handshake complete, spawning background dispatcher task"
                                     );
-                                    executor.execute(
+                                    executor.execute(scoped(
                                         conn.map_err(|_e| debug!("client connection error: {}", _e))
                                             .map(|_| ()),
-                                    );
+                                        scope,
+                                    ));
 
                                     // Wait for 'conn' to ready up before we
                                     // declare this tx as usable
@@ -580,7 +597,7 @@ where
                                     // Spawn the connection task in the background using the executor.
                                     // The task manages the HTTP/1.1 connection, including upgrades (e.g., WebSocket).
                                     // Errors are sent via err_tx to ensure they can be checked if the sender (tx) fails.
-                                    executor.execute(
+                                    executor.execute(scoped(
                                         conn.with_upgrades()
                                                 .map_err(|e| {
                                                 // Log the connection error at debug level for diagnostic purposes.
@@ -592,7 +609,8 @@ where
                                                 let _ = err_tx.send(e);
                                             })
                                             .map(|_| ()),
-                                    );
+                                        scope,
+                                    ));
 
                                     // Log that the client is waiting for the connection to be ready.
                                     // Readiness indicates the sender (tx) can accept a request without blocking. More actions
@@ -1042,6 +1060,16 @@ impl Error {
     #[inline]
     fn closed(src: wreq_proto::Error) -> Self {
         Self::new(ErrorKind::ChannelClosed, src)
+    }
+}
+
+/// Drives a connection until it ends or, for a scoped connection, its scope does.
+async fn scoped(conn: impl Future<Output = ()>, scope: Option<ScopeRef>) {
+    match scope {
+        Some(scope) => {
+            future::select(std::pin::pin!(conn), std::pin::pin!(scope.closed())).await;
+        }
+        None => conn.await,
     }
 }
 

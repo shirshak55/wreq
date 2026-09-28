@@ -18,10 +18,18 @@
 //! 3. **Resource Affinity**: Resource management (such as connection pooling) respects these
 //!    boundaries, ensuring that resources are never leaked across different request groups.
 
-use std::collections::BTreeMap;
+use std::{
+    collections::BTreeMap,
+    hash::{Hash, Hasher},
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+};
 
 use http::{Uri, Version};
 use name::GroupId;
+use tokio::sync::watch;
 
 use crate::{conn::net::SocketBindOptions, proxy::Matcher};
 
@@ -47,6 +55,8 @@ impl_group_variants! {
     Version(Version),
     Proxy(Matcher),
     SocketBind(Option<SocketBindOptions>),
+    ServerName(Option<Box<str>>),
+    Scope(ScopeRef),
 }
 
 /// A logical identifier for request grouping.
@@ -90,6 +100,28 @@ impl Group {
     #[inline]
     pub(crate) fn socket_bind(&mut self, opts: Option<SocketBindOptions>) -> &mut Self {
         self.extend(GroupKey::SocketBind, GroupVariant::SocketBind(opts))
+    }
+
+    /// Groups the request by the TLS server name it announces instead of its URI host
+    /// (`None`: no name).
+    #[inline]
+    pub(crate) fn server_name(&mut self, name: Option<Box<str>>) -> &mut Self {
+        self.extend(GroupKey::ServerName, GroupVariant::ServerName(name))
+    }
+
+    /// Confines the request's connections to a [`ConnectionScope`].
+    #[inline]
+    pub(crate) fn scope(&mut self, scope: ScopeRef) -> &mut Self {
+        self.extend(GroupKey::Scope, GroupVariant::Scope(scope))
+    }
+
+    /// The TLS server name the request announces instead of its URI host, if set
+    /// (`Some(None)`: no name).
+    pub(crate) fn tls_server_name(&self) -> Option<Option<&str>> {
+        match self.0.get(&GroupKey::ServerName) {
+            Some(GroupVariant::ServerName(name)) => Some(name.as_deref()),
+            _ => None,
+        }
     }
 
     /// Creates a nested request group.
@@ -138,6 +170,76 @@ impl From<Box<str>> for Group {
     #[inline]
     fn from(value: Box<str>) -> Self {
         Group::new(value)
+    }
+}
+
+/// Confines the connections requests open to one lifetime: a connection serves only
+/// requests of the scope it was opened for, and closes, idle or not, once every clone of
+/// the scope is dropped.
+#[derive(Clone)]
+pub struct ConnectionScope(Arc<(u64, watch::Sender<()>)>);
+
+impl ConnectionScope {
+    /// Creates a scope no other scope's requests share connections with.
+    pub fn new() -> Self {
+        static NEXT_ID: AtomicU64 = AtomicU64::new(0);
+        let (closed, _) = watch::channel(());
+        ConnectionScope(Arc::new((NEXT_ID.fetch_add(1, Ordering::Relaxed), closed)))
+    }
+
+    pub(crate) fn handle(&self) -> ScopeRef {
+        ScopeRef {
+            id: self.0.0,
+            closed: self.0.1.subscribe(),
+        }
+    }
+}
+
+impl Default for ConnectionScope {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl std::fmt::Debug for ConnectionScope {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("ConnectionScope").field(&self.0.0).finish()
+    }
+}
+
+/// A [`ConnectionScope`]'s identity and end, held by its requests and connections without
+/// keeping it alive.
+#[derive(Clone)]
+pub(crate) struct ScopeRef {
+    id: u64,
+    closed: watch::Receiver<()>,
+}
+
+impl ScopeRef {
+    /// Resolves once the scope is dropped.
+    pub(crate) async fn closed(mut self) {
+        // Nothing is ever sent, so this returns only when the sender is gone.
+        let _ = self.closed.changed().await;
+    }
+}
+
+impl Hash for ScopeRef {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.id.hash(state);
+    }
+}
+
+impl PartialEq for ScopeRef {
+    fn eq(&self, other: &Self) -> bool {
+        self.id == other.id
+    }
+}
+
+impl Eq for ScopeRef {}
+
+impl std::fmt::Debug for ScopeRef {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("ScopeRef").field(&self.id).finish()
     }
 }
 

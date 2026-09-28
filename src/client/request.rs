@@ -35,7 +35,7 @@ use crate::{
     Error, Method, Proxy,
     config::{RequestConfig, RequestConfigValue},
     ext::UriExt,
-    group::Group,
+    group::{ConnectionScope, Group},
     header::{AUTHORIZATION, HeaderMap, HeaderName, HeaderValue, OrigHeaderMap},
     redirect,
 };
@@ -789,6 +789,29 @@ impl RequestBuilder {
                 .get_or_insert_default()
                 .group
                 .request(group);
+        }
+        self
+    }
+
+    /// Sets the name the TLS handshake announces (SNI) and verifies the server certificate
+    /// against, instead of the URI host; `None` announces no name and verifies the URI host.
+    /// Connections announcing different names are never shared.
+    pub fn tls_server_name(mut self, name: Option<&str>) -> RequestBuilder {
+        if let Ok(ref mut req) = self.request {
+            req.config_mut::<RequestOptions>()
+                .get_or_insert_default()
+                .tls_server_name = Some(name.map(Box::from));
+        }
+        self
+    }
+
+    /// Confines this request's connection to `scope`: it reuses only connections opened
+    /// for requests of the same scope, and those close once the scope is dropped.
+    pub fn connection_scope(mut self, scope: &ConnectionScope) -> RequestBuilder {
+        if let Ok(ref mut req) = self.request {
+            req.config_mut::<RequestOptions>()
+                .get_or_insert_default()
+                .scope = Some(scope.handle());
         }
         self
     }

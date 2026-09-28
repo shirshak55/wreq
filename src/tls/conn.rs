@@ -241,10 +241,20 @@ impl TlsConnector {
 
         let uri = descriptor.uri().clone();
         let host = uri.host().ok_or("URI missing host")?;
+        // The name announced and verified: the URI host unless the request names another,
+        // or announces none (and then verifies the URI host).
+        let host = match descriptor.tls_server_name() {
+            Some(Some(name)) => name,
+            Some(None) => {
+                cfg.set_use_server_name_indication(false);
+                host
+            }
+            None => host,
+        };
         let host = Self::normalize_host(host);
 
         if let Some(ref cache) = self.cache {
-            let key = Key(descriptor.id());
+            let key = Key(descriptor.session_id());
 
             // If the session cache is enabled, we try to retrieve the session
             // associated with the key. If it exists, we set it in the SSL configuration.

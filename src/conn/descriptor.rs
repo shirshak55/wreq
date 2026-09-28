@@ -10,7 +10,12 @@ use std::{
 use http::{Uri, Version};
 use lru::DefaultHasher;
 
-use crate::{conn::net::SocketBindOptions, group::Group, proxy::Matcher, tls::TlsOptions};
+use crate::{
+    conn::net::SocketBindOptions,
+    group::{Group, ScopeRef},
+    proxy::Matcher,
+    tls::TlsOptions,
+};
 
 /// A key that uniquely identifies a group of interchangeable connections for pooling.
 ///
@@ -32,7 +37,9 @@ pub(crate) struct ConnectionDescriptor {
     proxy: Option<Matcher>,
     tls_options: Option<TlsOptions>,
     socket_bind: Option<SocketBindOptions>,
+    scope: Option<ScopeRef>,
     connection_id: ConnectionId,
+    session_id: ConnectionId,
 }
 
 // ===== impl ConnectionId =====
@@ -76,18 +83,29 @@ impl ConnectionDescriptor {
     pub(crate) fn new(
         uri: Uri,
         mut group: Group,
+        scope: Option<ScopeRef>,
         proxy: Option<Matcher>,
         version: Option<Version>,
         tls_options: Option<TlsOptions>,
         socket_bind: Option<SocketBindOptions>,
     ) -> ConnectionDescriptor {
-        let connection_id = {
-            group
-                .uri(uri.clone())
-                .version(version)
-                .proxy(proxy.clone())
-                .socket_bind(socket_bind.clone());
-            ConnectionId(Arc::new((group, AtomicU64::new(u64::MIN))))
+        let id = |group| ConnectionId(Arc::new((group, AtomicU64::new(u64::MIN))));
+        group
+            .uri(uri.clone())
+            .version(version)
+            .proxy(proxy.clone())
+            .socket_bind(socket_bind.clone());
+        // TLS sessions resume across scopes; connections stay within theirs.
+        let (connection_id, session_id) = match &scope {
+            Some(scope) => {
+                let session_id = id(group.clone());
+                group.scope(scope.clone());
+                (id(group), session_id)
+            }
+            None => {
+                let connection_id = id(group);
+                (connection_id.clone(), connection_id)
+            }
         };
 
         ConnectionDescriptor {
@@ -96,7 +114,9 @@ impl ConnectionDescriptor {
             version,
             tls_options,
             socket_bind,
+            scope,
             connection_id,
+            session_id,
         }
     }
 
@@ -104,6 +124,25 @@ impl ConnectionDescriptor {
     #[inline]
     pub(crate) fn id(&self) -> ConnectionId {
         self.connection_id.clone()
+    }
+
+    /// Returns the ID the connection's TLS sessions are cached under.
+    #[inline]
+    pub(crate) fn session_id(&self) -> ConnectionId {
+        self.session_id.clone()
+    }
+
+    /// Returns the scope the connection is confined to, if any.
+    #[inline]
+    pub(crate) fn scope(&self) -> Option<&ScopeRef> {
+        self.scope.as_ref()
+    }
+
+    /// Returns the TLS server name to announce instead of the URI host, if set
+    /// (`Some(None)`: no name).
+    #[inline]
+    pub(crate) fn tls_server_name(&self) -> Option<Option<&str>> {
+        self.connection_id.0.0.tls_server_name()
     }
 
     /// Returns a reference to the [`Uri`].

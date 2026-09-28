@@ -9,8 +9,14 @@ use tower::{Layer, Service};
 use wreq_proto::{http1::Http1Options, http2::Http2Options};
 
 use crate::{
-    Error, config::RequestConfig, conn::net::SocketBindOptions, ext::UriExt, group::Group,
-    header::OrigHeaderMap, proxy::Matcher, tls::TlsOptions,
+    Error,
+    config::RequestConfig,
+    conn::net::SocketBindOptions,
+    ext::UriExt,
+    group::{Group, ScopeRef},
+    header::OrigHeaderMap,
+    proxy::Matcher,
+    tls::TlsOptions,
 };
 
 /// A marker type for the default headers configuration value.
@@ -29,6 +35,8 @@ pub(crate) struct RequestOptions {
     pub http1_options: Option<Http1Options>,
     pub http2_options: Option<Http2Options>,
     pub socket_bind_options: Option<SocketBindOptions>,
+    pub tls_server_name: Option<Option<Box<str>>>,
+    pub scope: Option<ScopeRef>,
 }
 
 /// Configuration for the [`ConfigService`].
