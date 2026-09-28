@@ -131,20 +131,25 @@ impl ConnectorBuilder {
     }
 
     /// Build a [`Connector`] with the provided layers, and the [`TlsConnector`] it opens
-    /// connections with.
+    /// connections with: `tls_connector`, else one built from `tls_options`.
     pub fn build(
         self,
         tls_options: Option<TlsOptions>,
+        tls_connector: Option<TlsConnector>,
         layers: Vec<BoxedConnectorLayer>,
     ) -> crate::Result<(Connector, TlsConnector)> {
+        let tls = match tls_connector {
+            Some(tls) => tls,
+            None => self
+                .builder
+                .build(tls_options.map(Cow::Owned).unwrap_or_default())?,
+        };
         let mut service = ConnectorService {
             config: self.config,
             #[cfg(feature = "socks")]
             resolver: self.resolver.clone(),
             http: self.http,
-            tls: self
-                .builder
-                .build(tls_options.map(Cow::Owned).unwrap_or_default())?,
+            tls,
             builder: Arc::new(self.builder),
         };
         let tls = service.tls.clone();
@@ -524,7 +529,9 @@ impl ConnectorService {
                 if !(req.uri().is_https() && tls.opened_for(&stream, &req)?) {
                     return Err("the adopted connection is not one this request would open".into());
                 }
-                if !stream.idle() {
+                // An HTTP/2 peer speaks first (its SETTINGS), which the connection reads.
+                let h2 = stream.stream.ssl().selected_alpn_protocol() == Some(b"h2");
+                if !h2 && !stream.idle() {
                     return Err("the adopted connection is closed or has unread data".into());
                 }
                 debug!("adopting a connection: {:?}", req.uri());

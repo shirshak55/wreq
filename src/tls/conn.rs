@@ -215,7 +215,9 @@ impl TlsConnector {
 
     /// Whether `stream` can serve `descriptor`'s requests as the connection this connector
     /// would open for it: opened by it, verifying and announcing the same name, and
-    /// speaking HTTP/1 (it negotiated no ALPN).
+    /// speaking an HTTP version the request allows — HTTP/2 when its ALPN chose `h2` and
+    /// the request forces no version, HTTP/1 when it chose `http/1.1`, `http/1.0` or
+    /// nothing and the request doesn't force HTTP/2 or HTTP/3.
     #[cfg(feature = "tokio-rt")]
     pub(crate) fn opened_for<IO>(
         &self,
@@ -223,14 +225,19 @@ impl TlsConnector {
         descriptor: &ConnectionDescriptor,
     ) -> Result<bool, BoxError> {
         let (name, sni) = Self::verified_name(descriptor)?;
+        let speaks = match stream.stream.ssl().selected_alpn_protocol() {
+            Some(b"h2") => descriptor.version().is_none(),
+            None | Some(b"http/1.1" | b"http/1.0") => !matches!(
+                descriptor.version(),
+                Some(Version::HTTP_2 | Version::HTTP_3)
+            ),
+            Some(_) => false,
+        };
         Ok(
             std::ptr::eq(stream.stream.ssl().ssl_context(), self.ssl.context())
                 && *stream.name == *name
                 && stream.sni == (sni && self.settings.tls_sni)
-                && !matches!(
-                    descriptor.version(),
-                    Some(Version::HTTP_2 | Version::HTTP_3)
-                ),
+                && speaks,
         )
     }
 
@@ -320,19 +327,27 @@ impl TlsConnector {
     }
 
     /// Opens a TLS connection over `io` as this connector opens `descriptor`'s, offering
-    /// and keeping the same sessions, but offering no ALPN.
+    /// and keeping the same sessions, and offering its ALPN protocols only with `alpn`. A
+    /// failed handshake fails with a [`HandshakeFailure`].
     #[cfg(feature = "tokio-rt")]
     pub(crate) async fn connect<IO>(
         &self,
         io: IO,
         descriptor: &ConnectionDescriptor,
+        alpn: bool,
     ) -> Result<TlsStream<IO>, BoxError>
     where
         IO: AsyncRead + AsyncWrite + Unpin,
     {
-        let (cfg, name, sni) = self.for_descriptor(self.configure(None)?, descriptor)?;
+        let offer = alpn
+            .then(|| self.alpn_offer(descriptor.version()))
+            .flatten();
+        let (cfg, name, sni) =
+            self.for_descriptor(self.configure(offer.as_deref())?, descriptor)?;
         let mut stream = SslStream::new(cfg.into_ssl(name)?, io)?;
-        Pin::new(&mut stream).connect().await?;
+        if let Err(error) = Pin::new(&mut stream).connect().await {
+            return Err(HandshakeFailure::new(error, stream.ssl()).into());
+        }
         Ok(TlsStream {
             stream,
             name: Box::from(name),
@@ -832,6 +847,99 @@ impl<IO: AsyncRead + AsyncWrite + Unpin> TlsStream<IO> {
                 &mut ReadBuf::new(&mut byte),
             )
             .is_pending()
+    }
+}
+
+/// Why a TLS handshake a client opened over a caller's stream failed (see
+/// [`RequestBuilder::tls_connect`](crate::RequestBuilder::tls_connect)): what the peer
+/// ended it with, and what it presented.
+#[derive(Debug)]
+pub struct HandshakeFailure {
+    error: btls::ssl::Error,
+    alert: Option<u8>,
+    verify_error: Option<(i32, &'static str)>,
+    peer_certificate_chain: Vec<Bytes>,
+    version: &'static str,
+    cipher: Option<&'static str>,
+    alpn_protocol: Option<Bytes>,
+}
+
+impl HandshakeFailure {
+    #[cfg_attr(not(feature = "tokio-rt"), allow(dead_code))]
+    fn new(error: btls::ssl::Error, ssl: &SslRef) -> Self {
+        // A received alert is reported as the SSL library's reason `SSL_AD_REASON_OFFSET`
+        // plus its description.
+        let alert = error.ssl_error().and_then(|stack| {
+            stack.errors().iter().find_map(|error| {
+                let reason = error.library_reason(btls_sys::ERR_LIB_SSL)?;
+                u8::try_from(reason.checked_sub(btls_sys::SSL_AD_REASON_OFFSET)?).ok()
+            })
+        });
+        let verify_error = ssl
+            .verify_result()
+            .err()
+            .map(|error| (error.as_raw(), error.error_string()));
+        let peer_certificate_chain = ssl
+            .peer_cert_chain()
+            .into_iter()
+            .flatten()
+            .filter_map(|cert| cert.to_der().ok().map(Bytes::from))
+            .collect();
+        Self {
+            error,
+            alert,
+            verify_error,
+            peer_certificate_chain,
+            version: ssl.version_str(),
+            cipher: ssl
+                .current_cipher()
+                .map(|cipher| cipher.standard_name().unwrap_or_else(|| cipher.name())),
+            alpn_protocol: ssl.selected_alpn_protocol().map(Bytes::copy_from_slice),
+        }
+    }
+
+    /// The alert the peer ended the handshake with, if it sent one.
+    pub fn alert(&self) -> Option<u8> {
+        self.alert
+    }
+
+    /// Why the peer's certificate failed verification, if it did: the `X509_V_ERR_*` code
+    /// and its description.
+    pub fn verify_error(&self) -> Option<(i32, &'static str)> {
+        self.verify_error
+    }
+
+    /// The DER certificate chain the peer presented, leaf first; empty if it sent none.
+    pub fn peer_certificate_chain(&self) -> impl Iterator<Item = &[u8]> {
+        self.peer_certificate_chain.iter().map(|cert| cert.as_ref())
+    }
+
+    /// The protocol version the handshake got as far as negotiating, e.g. `TLSv1.3`.
+    pub fn version(&self) -> &str {
+        self.version
+    }
+
+    /// The cipher suite the handshake got as far as negotiating, by its standard (RFC)
+    /// name when it has one.
+    pub fn cipher(&self) -> Option<&str> {
+        self.cipher
+    }
+
+    /// The protocol the peer selected through ALPN, if it got as far as selecting one.
+    pub fn alpn_protocol(&self) -> Option<&[u8]> {
+        self.alpn_protocol.as_deref()
+    }
+}
+
+impl fmt::Display for HandshakeFailure {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(&self.error, f)
+    }
+}
+
+impl std::error::Error for HandshakeFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.error)
     }
 }
 

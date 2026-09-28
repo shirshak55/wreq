@@ -234,6 +234,7 @@ struct Config {
     tls_max_version: Option<TlsVersion>,
     tls_session_cache: Option<Arc<dyn TlsSessionCache>>,
     tls_options: Option<TlsOptions>,
+    tls_connector: Option<TlsConnector>,
     http1_options: Option<Http1Options>,
     http2_options: Option<Http2Options>,
     timer: Timer,
@@ -323,6 +324,7 @@ impl Client {
                 tls_min_version: None,
                 tls_max_version: None,
                 tls_session_cache: None,
+                tls_connector: None,
                 tls_options: None,
                 timer: Timer::default(),
                 executor: Executor::default(),
@@ -444,13 +446,14 @@ impl Client {
         }
     }
 
-    /// Opens a TLS connection over `io` as `request`'s own connection would open (see
-    /// [`RequestBuilder::tls_connect`]).
+    /// Opens a TLS connection over `io` as `request`'s own connection would open, offering
+    /// its ALPN protocols only with `alpn` (see [`RequestBuilder::tls_connect`]).
     #[cfg(feature = "tokio-rt")]
     pub(crate) async fn tls_connect<IO>(
         &self,
         request: Request,
         io: IO,
+        alpn: bool,
     ) -> crate::Result<TlsStream<IO>>
     where
         IO: AsyncRead + AsyncWrite + Unpin,
@@ -467,7 +470,7 @@ impl Client {
         }
         self.1
             .tls
-            .connect(io, &descriptor)
+            .connect(io, &descriptor, alpn)
             .await
             .map_err(Error::tls)
     }
@@ -614,7 +617,11 @@ impl ClientBuilder {
                         config.socket_bind_options.ipv6_address,
                     );
                 })
-                .build(config.tls_options, config.connector_layers)?;
+                .build(
+                    config.tls_options,
+                    config.tls_connector,
+                    config.connector_layers,
+                )?;
 
             #[allow(unused_mut)]
             let mut builder = HttpClient::builder(config.executor);
@@ -1582,6 +1589,16 @@ impl ClientBuilder {
     #[inline]
     pub fn tls_session_cache<S: IntoTlsSessionCache>(mut self, store: S) -> ClientBuilder {
         self.config.tls_session_cache = Some(store.into_shared());
+        self
+    }
+
+    /// Opens this client's TLS connections with `client`'s TLS connector — its ClientHello,
+    /// trust, client identity and TLS sessions — instead of one built from this builder's
+    /// TLS settings, so either client can adopt a connection the other opened (see
+    /// [`RequestBuilder::adopt`]).
+    #[inline]
+    pub fn tls_connector_of(mut self, client: &Client) -> ClientBuilder {
+        self.config.tls_connector = Some(client.1.tls.clone());
         self
     }
 

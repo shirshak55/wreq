@@ -835,22 +835,36 @@ impl RequestBuilder {
 
     /// Opens a TLS connection over `io` as this request's own connection would open, with
     /// the ClientHello, trust, client identity and TLS sessions of that connection, but
-    /// offering no ALPN. It is bounded by no timeout of the client's. The pool can adopt
-    /// the connection (see [`RequestBuilder::adopt`]).
+    /// offering no ALPN. It is bounded by no timeout of the client's, and a failed
+    /// handshake's error has a [`HandshakeFailure`](crate::tls::HandshakeFailure) source.
+    /// The pool can adopt the connection (see [`RequestBuilder::adopt`]).
     #[cfg(feature = "tokio-rt")]
     pub async fn tls_connect<IO>(self, io: IO) -> crate::Result<TlsStream<IO>>
     where
         IO: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
     {
-        self.client.tls_connect(self.request?, io).await
+        self.client.tls_connect(self.request?, io, false).await
     }
 
-    /// Adopts `stream`, a connection opened with [`RequestBuilder::tls_connect`] to where
-    /// this request's own connection would go (the same address, through the same proxy),
-    /// into the pool as an idle HTTP/1 connection for the requests this one would share a
-    /// connection with, instead of sending this request. It fails, closing `stream`,
-    /// unless this client opened it verifying and announcing the name this request's
-    /// connection would, and the peer has neither closed it nor sent anything.
+    /// Like [`RequestBuilder::tls_connect`], but offering the ALPN protocols this request's
+    /// own connection would.
+    #[cfg(feature = "tokio-rt")]
+    pub async fn tls_connect_with_alpn<IO>(self, io: IO) -> crate::Result<TlsStream<IO>>
+    where
+        IO: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+    {
+        self.client.tls_connect(self.request?, io, true).await
+    }
+
+    /// Adopts `stream`, a connection opened with [`RequestBuilder::tls_connect`] or
+    /// [`RequestBuilder::tls_connect_with_alpn`] to where this request's own connection
+    /// would go (the same address, through the same proxy), into the pool as an idle
+    /// connection for the requests this one would share a connection with, instead of
+    /// sending this request: an HTTP/2 one, set up with this request's HTTP/2 options, when
+    /// its ALPN chose `h2`, else an HTTP/1 one. It fails, closing `stream`, unless this
+    /// client's TLS connector opened it verifying and announcing the name this request's
+    /// connection would, it speaks a version this request allows, and, for HTTP/1, the peer
+    /// has neither closed it nor sent anything.
     #[cfg(feature = "tokio-rt")]
     pub async fn adopt(mut self, stream: TlsStream<tokio::net::TcpStream>) -> crate::Result<()> {
         if let Ok(ref mut req) = self.request {
