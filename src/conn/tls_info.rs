@@ -26,6 +26,10 @@ fn extract_tls_info<S>(ssl_stream: &SslStream<S>) -> TlsInfo {
             .ok()
             .and_then(|index| ssl.ex_data(index))
             .cloned(),
+        server_flight: crate::tls::conn::server_flight_index()
+            .ok()
+            .and_then(|index| ssl.ex_data(index))
+            .map(|messages| crate::tls::ServerFlight::from(messages.clone())),
         peer_certificate: ssl
             .peer_certificate()
             .and_then(|cert| cert.to_der().ok())

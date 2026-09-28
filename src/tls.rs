@@ -28,6 +28,121 @@ pub struct TlsInfo {
     pub(crate) alpn_protocol: Option<Bytes>,
     pub(crate) connection: std::sync::Arc<TlsConnectionUse>,
     pub(crate) client_hello: Option<Bytes>,
+    pub(crate) server_flight: Option<ServerFlight>,
+}
+
+/// The raw handshake messages an origin sent this connection (its server flight), in the
+/// order received, captured by the connection's BoringSSL message callback (see
+/// `crate::tls::conn`). Each entry is one handshake message: its one-byte type, its
+/// three-byte length, and its body — without the record-layer header.
+///
+/// A downstream TLS server can parse these to reproduce the origin's handshake to the
+/// real client: the ServerHello (its chosen version, cipher, group and extension order),
+/// a HelloRetryRequest (a ServerHello whose random is the well-known HRR marker), the
+/// EncryptedExtensions (ALPN, ALPS, and their order), the Certificate message, the
+/// CertificateVerify (its signature algorithm), NewSessionTicket(s) (their count,
+/// lifetime and ticket size), and for TLS 1.2 the ServerKeyExchange and
+/// CertificateRequest.
+///
+/// Tickets arrive after the handshake completes, so the flight grows as the connection is
+/// read; take a snapshot once the response head is in hand for the tickets sent so far.
+#[derive(Debug, Clone, Default)]
+pub struct ServerFlight {
+    messages: Vec<Bytes>,
+}
+
+/// A TLS handshake message type this crate names for callers reading a [`ServerFlight`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum HandshakeType {
+    /// A ServerHello (TLS 1.2 and 1.3).
+    ServerHello,
+    /// A ServerHello whose random is the RFC 8446 HelloRetryRequest marker.
+    HelloRetryRequest,
+    /// A TLS 1.3 EncryptedExtensions message.
+    EncryptedExtensions,
+    /// A Certificate message.
+    Certificate,
+    /// A CertificateVerify message.
+    CertificateVerify,
+    /// A TLS 1.2 ServerKeyExchange message.
+    ServerKeyExchange,
+    /// A CertificateRequest message (client authentication).
+    CertificateRequest,
+    /// A TLS 1.2 ServerHelloDone message.
+    ServerHelloDone,
+    /// A NewSessionTicket message.
+    NewSessionTicket,
+    /// A Finished message.
+    Finished,
+    /// Any other handshake type, by its wire code.
+    Other(u8),
+}
+
+impl ServerFlight {
+    /// The well-known SHA-256 marker a ServerHello carries as its random to signal a
+    /// HelloRetryRequest (RFC 8446 section 4.1.3).
+    const HRR_RANDOM: [u8; 32] = [
+        0xCF, 0x21, 0xAD, 0x74, 0xE5, 0x9A, 0x61, 0x11, 0xBE, 0x1D, 0x8C, 0x02, 0x1E, 0x65, 0xB8,
+        0x91, 0xC2, 0xA2, 0x11, 0x16, 0x7A, 0xBB, 0x8C, 0x5E, 0x07, 0x9E, 0x09, 0xE2, 0xC8, 0xA8,
+        0x33, 0x9C,
+    ];
+
+    /// The raw handshake messages received so far, in order (type + 3-byte length + body).
+    #[must_use]
+    pub fn messages(&self) -> &[Bytes] {
+        &self.messages
+    }
+
+    /// The classified messages received so far, in order: each type paired with its raw
+    /// bytes (type + 3-byte length + body). A ServerHello carrying the HRR random is
+    /// reported as [`HandshakeType::HelloRetryRequest`].
+    #[must_use]
+    pub fn classified(&self) -> Vec<(HandshakeType, &Bytes)> {
+        self.messages
+            .iter()
+            .map(|msg| (Self::classify(msg), msg))
+            .collect()
+    }
+
+    fn classify(msg: &Bytes) -> HandshakeType {
+        match msg.first().copied() {
+            Some(2) => {
+                // ServerHello: type(1) len(3) legacy_version(2) random(32)...
+                let random = msg.get(6..38);
+                if random == Some(&Self::HRR_RANDOM[..]) {
+                    HandshakeType::HelloRetryRequest
+                } else {
+                    HandshakeType::ServerHello
+                }
+            }
+            Some(8) => HandshakeType::EncryptedExtensions,
+            Some(11) => HandshakeType::Certificate,
+            Some(15) => HandshakeType::CertificateVerify,
+            Some(12) => HandshakeType::ServerKeyExchange,
+            Some(13) => HandshakeType::CertificateRequest,
+            Some(14) => HandshakeType::ServerHelloDone,
+            Some(4) => HandshakeType::NewSessionTicket,
+            Some(20) => HandshakeType::Finished,
+            Some(other) => HandshakeType::Other(other),
+            None => HandshakeType::Other(0),
+        }
+    }
+
+    /// The number of NewSessionTicket messages received so far.
+    #[must_use]
+    pub fn ticket_count(&self) -> usize {
+        self.messages
+            .iter()
+            .filter(|msg| matches!(Self::classify(msg), HandshakeType::NewSessionTicket))
+            .count()
+    }
+}
+
+impl From<Vec<Bytes>> for ServerFlight {
+    fn from(messages: Vec<Bytes>) -> Self {
+        Self { messages }
+    }
 }
 
 /// The connection a [`TlsInfo`] was taken from, shared by every response it carries.
@@ -57,6 +172,12 @@ impl TlsInfo {
     /// header) this connection sent first.
     pub fn client_hello(&self) -> Option<&[u8]> {
         self.client_hello.as_deref()
+    }
+
+    /// The origin's server flight: the raw handshake messages it sent this connection, in
+    /// order, as captured up to when this `TlsInfo` was taken. See [`ServerFlight`].
+    pub fn server_flight(&self) -> Option<&ServerFlight> {
+        self.server_flight.as_ref()
     }
 
     /// An id for the TLS connection this response arrived on, the same for every response

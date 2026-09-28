@@ -45,17 +45,29 @@ fn key_index() -> Result<Index<Ssl, Key>, ErrorStack> {
     IDX.clone()
 }
 
-/// Where each connection keeps the first ClientHello it sent (see [`record_client_hello`]).
+/// Where each connection keeps the first ClientHello it sent (see [`record_handshake_message`]).
 pub(crate) fn client_hello_index() -> Result<Index<Ssl, bytes::Bytes>, ErrorStack> {
     static IDX: LazyLock<Result<Index<Ssl, bytes::Bytes>, ErrorStack>> =
         LazyLock::new(Ssl::new_ex_index);
     IDX.clone()
 }
 
-/// BoringSSL message callback keeping the first ClientHello handshake message a
-/// connection sends, so its `TlsInfo` carries the exact bytes this connection offered.
+/// Where each connection keeps the origin's server-flight handshake messages, in the
+/// order received (see [`record_handshake_message`] and [`crate::tls::ServerFlight`]).
+pub(crate) fn server_flight_index() -> Result<Index<Ssl, Vec<bytes::Bytes>>, ErrorStack> {
+    static IDX: LazyLock<Result<Index<Ssl, Vec<bytes::Bytes>>, ErrorStack>> =
+        LazyLock::new(Ssl::new_ex_index);
+    IDX.clone()
+}
+
+/// BoringSSL message callback keeping the exact ClientHello a connection sends and the
+/// raw handshake messages the origin sends back (its server flight), so a connection's
+/// `TlsInfo` carries both: the ClientHello for fingerprint measurement, and the server
+/// flight (ServerHello, HelloRetryRequest, EncryptedExtensions, Certificate,
+/// CertificateVerify, NewSessionTicket, and for TLS 1.2 ServerKeyExchange /
+/// CertificateRequest) for a downstream server that reproduces it to the real client.
 #[allow(unsafe_code)]
-unsafe extern "C" fn record_client_hello(
+unsafe extern "C" fn record_handshake_message(
     is_write: std::os::raw::c_int,
     _version: std::os::raw::c_int,
     content_type: std::os::raw::c_int,
@@ -66,7 +78,7 @@ unsafe extern "C" fn record_client_hello(
 ) {
     const HANDSHAKE: std::os::raw::c_int = 22;
     const CLIENT_HELLO: u8 = 1;
-    if is_write == 0 || content_type != HANDSHAKE || buf.is_null() || len == 0 || ssl.is_null() {
+    if content_type != HANDSHAKE || buf.is_null() || len == 0 || ssl.is_null() {
         return;
     }
     // SAFETY: BoringSSL passes a live `SSL` and a message buffer of `len` bytes that stay
@@ -77,14 +89,29 @@ unsafe extern "C" fn record_client_hello(
             <btls::ssl::SslRef as foreign_types::ForeignTypeRef>::from_ptr_mut(ssl),
         )
     };
-    if message[0] != CLIENT_HELLO {
+    if is_write != 0 {
+        // Our own ClientHello, kept once for fingerprint measurement.
+        if message[0] != CLIENT_HELLO {
+            return;
+        }
+        let Ok(index) = client_hello_index() else {
+            return;
+        };
+        if ssl.ex_data(index).is_none() {
+            ssl.set_ex_data(index, bytes::Bytes::copy_from_slice(message));
+        }
         return;
     }
-    let Ok(index) = client_hello_index() else {
+    // The origin's server flight, kept in order. NewSessionTickets arrive after the
+    // handshake completes, so this keeps appending for the connection's whole life.
+    let Ok(index) = server_flight_index() else {
         return;
     };
-    if ssl.ex_data(index).is_none() {
-        ssl.set_ex_data(index, bytes::Bytes::copy_from_slice(message));
+    let record = bytes::Bytes::copy_from_slice(message);
+    if let Some(flight) = ssl.ex_data_mut(index) {
+        flight.push(record);
+    } else {
+        ssl.set_ex_data(index, vec![record]);
     }
 }
 
@@ -633,7 +660,7 @@ impl TlsConnectorBuilder {
         // SAFETY: `connector` owns a live `SSL_CTX`; the callback is a plain function.
         #[allow(unsafe_code)]
         unsafe {
-            btls_sys::SSL_CTX_set_msg_callback(connector.as_ptr(), Some(record_client_hello));
+            btls_sys::SSL_CTX_set_msg_callback(connector.as_ptr(), Some(record_handshake_message));
         }
 
         // Set TLS keylog handler.
