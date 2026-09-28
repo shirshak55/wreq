@@ -619,9 +619,12 @@ where
                                     trace!(
                                         "http2 handshake complete, spawning background dispatcher task"
                                     );
+                                    let registration = scope
+                                        .as_ref()
+                                        .map(|scope| scope.register_http2(tx.control().clone()));
                                     executor.execute(scoped(
                                         conn.map_err(|_e| debug!("client connection error: {}", _e))
-                                            .map(|_| ()),
+                                            .map(move |_| drop(registration)),
                                         scope,
                                     ));
 
