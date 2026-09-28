@@ -596,6 +596,12 @@ impl TlsConnectorBuilder {
             .set_session_id_length(opts.session_id_length)
             .map_err(Error::tls)?;
 
+        // Set the GREASE ECH extension's payload length and cipher suite
+        connector
+            .set_ech_grease_payload_length(opts.ech_grease_payload_length)
+            .map_err(Error::tls)?;
+        connector.set_ech_grease_cipher_suite(opts.ech_grease_cipher_suite);
+
         // Keep each connection's ClientHello for its `TlsInfo`.
         // SAFETY: `connector` owns a live `SSL_CTX`; the callback is a plain function.
         #[allow(unsafe_code)]

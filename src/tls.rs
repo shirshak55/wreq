@@ -373,6 +373,19 @@ pub struct TlsOptions {
     /// **Default:** `None`
     pub session_id_length: Option<u8>,
 
+    /// The length of the random payload of the GREASE ECH extension (see
+    /// [`TlsOptions::enable_ech_grease`]), at least 1 byte. `None` picks a random multiple of
+    /// 32 bytes from 128 to 224 plus the 16-byte AEAD tag.
+    ///
+    /// **Default:** `None`
+    pub ech_grease_payload_length: Option<u16>,
+
+    /// The HPKE `(kdf_id, aead_id)` cipher suite the GREASE ECH extension names, as given.
+    /// `None` names HKDF-SHA256 with AES-128-GCM with AES hardware, else ChaCha20-Poly1305.
+    ///
+    /// **Default:** `None`
+    pub ech_grease_cipher_suite: Option<(u16, u16)>,
+
     /// Overrides AES hardware acceleration.
     ///
     /// **Default:** `None`
@@ -632,6 +645,26 @@ impl TlsOptionsBuilder {
         self
     }
 
+    /// Sets the length of the GREASE ECH extension's random payload.
+    #[inline]
+    pub fn ech_grease_payload_length<T>(mut self, len: T) -> Self
+    where
+        T: Into<Option<u16>>,
+    {
+        self.config.ech_grease_payload_length = len.into();
+        self
+    }
+
+    /// Sets the HPKE `(kdf_id, aead_id)` cipher suite the GREASE ECH extension names.
+    #[inline]
+    pub fn ech_grease_cipher_suite<T>(mut self, suite: T) -> Self
+    where
+        T: Into<Option<(u16, u16)>>,
+    {
+        self.config.ech_grease_cipher_suite = suite.into();
+        self
+    }
+
     /// Sets the AES hardware override flag.
     #[inline]
     pub fn aes_hw_override<T>(mut self, enabled: T) -> Self
@@ -718,6 +751,8 @@ impl Default for TlsOptions {
             renegotiation_scsv: false,
             trust_anchors: None,
             session_id_length: None,
+            ech_grease_payload_length: None,
+            ech_grease_cipher_suite: None,
             aes_hw_override: None,
             preserve_tls13_cipher_list: None,
             random_aes_hw_override: false,
