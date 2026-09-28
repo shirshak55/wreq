@@ -450,7 +450,7 @@ impl ConnectorService {
                     return self.tunnel_conn_from_stream(io);
                 }
 
-                *descriptor.uri_mut() = proxy_uri;
+                descriptor.set_uri(proxy_uri);
                 self.connect_auto_proxy(descriptor, proxy)
                     .await
                     .map_err(ProxyConnect)

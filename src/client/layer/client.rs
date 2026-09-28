@@ -187,6 +187,7 @@ where
                 socket_bind_options,
                 tls_server_name,
                 scope,
+                connect_to,
             } = RequestConfig::<RequestOptions>::remove(req.extensions_mut()).unwrap_or_default();
 
             if let Some(opts) = http1_options {
@@ -196,9 +197,25 @@ where
                 this.h2_builder = this.h2_builder.options(opts);
             }
 
-            if let Some(name) = tls_server_name {
-                group.server_name(name);
+            // The name TLS verifies and whether it announces it: the request's own unless it
+            // names another, also on a connection opened to another authority.
+            let host = uri.host().unwrap_or_default();
+            let tls_name = match tls_server_name {
+                Some(Some(name)) => Some((name, true)),
+                Some(None) => Some((Box::from(host), false)),
+                None => connect_to.is_some().then(|| (Box::from(host), true)),
+            };
+            if let Some((name, sni)) = &tls_name {
+                group.server_name(sni.then(|| name.clone()));
             }
+            let uri = match connect_to {
+                Some(authority) => {
+                    let mut parts = uri.into_parts();
+                    parts.authority = Some(authority);
+                    Uri::from_parts(parts).expect("valid base URI")
+                }
+                None => uri,
+            };
 
             ConnectionDescriptor::new(
                 uri,
@@ -209,6 +226,7 @@ where
                 tls_options,
                 socket_bind_options,
             )
+            .with_tls_name(tls_name)
         };
 
         Box::pin(this.send_request(req, descriptor).map_err(Into::into))

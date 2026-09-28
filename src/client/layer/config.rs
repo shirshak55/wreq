@@ -4,7 +4,7 @@ use std::{
 };
 
 use futures_util::future::{self, Either, Ready};
-use http::{HeaderMap, Request, Response, Version};
+use http::{HeaderMap, Request, Response, Version, uri::Authority};
 use tower::{Layer, Service};
 use wreq_proto::{http1::Http1Options, http2::Http2Options};
 
@@ -37,6 +37,7 @@ pub(crate) struct RequestOptions {
     pub socket_bind_options: Option<SocketBindOptions>,
     pub tls_server_name: Option<Option<Box<str>>>,
     pub scope: Option<ScopeRef>,
+    pub connect_to: Option<Authority>,
 }
 
 /// Configuration for the [`ConfigService`].

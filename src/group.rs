@@ -115,15 +115,6 @@ impl Group {
         self.extend(GroupKey::Scope, GroupVariant::Scope(scope))
     }
 
-    /// The TLS server name the request announces instead of its URI host, if set
-    /// (`Some(None)`: no name).
-    pub(crate) fn tls_server_name(&self) -> Option<Option<&str>> {
-        match self.0.get(&GroupKey::ServerName) {
-            Some(GroupVariant::ServerName(name)) => Some(name.as_deref()),
-            _ => None,
-        }
-    }
-
     /// Creates a nested request group.
     #[inline]
     pub(crate) fn request(&mut self, group: Group) -> &mut Self {

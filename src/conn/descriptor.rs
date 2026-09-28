@@ -38,6 +38,7 @@ pub(crate) struct ConnectionDescriptor {
     tls_options: Option<TlsOptions>,
     socket_bind: Option<SocketBindOptions>,
     scope: Option<ScopeRef>,
+    tls_name: Option<(Box<str>, bool)>,
     connection_id: ConnectionId,
     session_id: ConnectionId,
 }
@@ -115,9 +116,17 @@ impl ConnectionDescriptor {
             tls_options,
             socket_bind,
             scope,
+            tls_name: None,
             connection_id,
             session_id,
         }
+    }
+
+    /// Sets the name the TLS handshake verifies instead of the URI host, and whether it
+    /// announces it (SNI).
+    pub(crate) fn with_tls_name(mut self, tls_name: Option<(Box<str>, bool)>) -> Self {
+        self.tls_name = tls_name;
+        self
     }
 
     /// Returns a [`ConnectionId`] group ID for this descriptor.
@@ -138,11 +147,11 @@ impl ConnectionDescriptor {
         self.scope.as_ref()
     }
 
-    /// Returns the TLS server name to announce instead of the URI host, if set
-    /// (`Some(None)`: no name).
+    /// Returns the name the TLS handshake verifies instead of the URI host, and whether it
+    /// announces it, if set.
     #[inline]
-    pub(crate) fn tls_server_name(&self) -> Option<Option<&str>> {
-        self.connection_id.0.0.tls_server_name()
+    pub(crate) fn tls_name(&self) -> Option<(&str, bool)> {
+        self.tls_name.as_ref().map(|(name, sni)| (&**name, *sni))
     }
 
     /// Returns a reference to the [`Uri`].
@@ -151,10 +160,11 @@ impl ConnectionDescriptor {
         &self.uri
     }
 
-    /// Returns a mutable reference to the [`Uri`].
+    /// Opens the connection to `uri` itself (a proxy), whose TLS then names its host.
     #[inline]
-    pub(crate) fn uri_mut(&mut self) -> &mut Uri {
-        &mut self.uri
+    pub(crate) fn set_uri(&mut self, uri: Uri) {
+        self.uri = uri;
+        self.tls_name = None;
     }
 
     /// Return the negotiated HTTP version, if any.

@@ -241,13 +241,14 @@ impl TlsConnector {
 
         let uri = descriptor.uri().clone();
         let host = uri.host().ok_or("URI missing host")?;
-        // The name announced and verified: the URI host unless the request names another,
-        // or announces none (and then verifies the URI host).
-        let host = match descriptor.tls_server_name() {
-            Some(Some(name)) => name,
-            Some(None) => {
-                cfg.set_use_server_name_indication(false);
-                host
+        // The name verified, and announced unless the request announces none: the URI host
+        // unless the request names another.
+        let host = match descriptor.tls_name() {
+            Some((name, sni)) => {
+                if !sni {
+                    cfg.set_use_server_name_indication(false);
+                }
+                name
             }
             None => host,
         };

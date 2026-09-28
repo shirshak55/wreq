@@ -8,7 +8,7 @@ use std::{
 
 #[cfg(any(feature = "form", feature = "json", feature = "multipart"))]
 use http::header::CONTENT_TYPE;
-use http::{Extensions, Uri, Version};
+use http::{Extensions, Uri, Version, uri::Authority};
 #[cfg(any(feature = "query", feature = "form", feature = "json"))]
 use serde::Serialize;
 #[cfg(feature = "multipart")]
@@ -801,6 +801,29 @@ impl RequestBuilder {
             req.config_mut::<RequestOptions>()
                 .get_or_insert_default()
                 .tls_server_name = Some(name.map(Box::from));
+        }
+        self
+    }
+
+    /// Opens this request's connection to `authority` instead of the URI's (as curl's
+    /// `--connect-to`): DNS, any proxy tunnel, and the pool key follow `authority`, while
+    /// TLS still names the URI host (or [`tls_server_name`](Self::tls_server_name)) and
+    /// the request keeps its URI. Requests naming different hosts thus share a connection
+    /// opened to the same authority under the same TLS name.
+    pub fn connect_to<A>(mut self, authority: A) -> RequestBuilder
+    where
+        Authority: TryFrom<A>,
+        <Authority as TryFrom<A>>::Error: Into<http::Error>,
+    {
+        if let Ok(ref mut req) = self.request {
+            match Authority::try_from(authority) {
+                Ok(authority) => {
+                    req.config_mut::<RequestOptions>()
+                        .get_or_insert_default()
+                        .connect_to = Some(authority);
+                }
+                Err(err) => self.request = Err(Error::builder(err.into())),
+            }
         }
         self
     }
