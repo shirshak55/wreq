@@ -651,6 +651,71 @@ impl TlsConnectorBuilder {
     }
 }
 
+/// A TLS connector for QUIC handshakes a caller drives: each [`Ssl`] it makes offers the
+/// ClientHello its [`TlsOptions`] describe, as a client's TCP connections do, and verifies
+/// the server against the same trust. The caller adds the QUIC transport (its method and
+/// transport parameters) to each.
+#[derive(Clone)]
+pub struct QuicTlsConnector(TlsConnector);
+
+/// Builds a [`QuicTlsConnector`].
+pub struct QuicTlsConnectorBuilder(TlsConnectorBuilder);
+
+impl QuicTlsConnector {
+    /// Creates a [`QuicTlsConnectorBuilder`].
+    pub fn builder() -> QuicTlsConnectorBuilder {
+        QuicTlsConnectorBuilder(TlsConnector::builder())
+    }
+
+    /// A client [`Ssl`] for one QUIC connection verifying `name`, announcing it (SNI) when
+    /// `sni`.
+    pub fn new_ssl(&self, name: &str, sni: bool) -> crate::Result<Ssl> {
+        let mut cfg = self
+            .0
+            .configure(self.0.alpn_offer(None).as_deref())
+            .map_err(Error::tls)?;
+        if !sni {
+            cfg.set_use_server_name_indication(false);
+        }
+        cfg.into_ssl(TlsConnector::normalize_host(name))
+            .map_err(Error::tls)
+    }
+}
+
+impl QuicTlsConnectorBuilder {
+    /// Sets the certificate store the server is verified against.
+    pub fn cert_store<T>(self, cert_store: T) -> Self
+    where
+        T: Into<Option<CertStore>>,
+    {
+        Self(self.0.cert_store(cert_store))
+    }
+
+    /// Sets whether the server's certificate is verified.
+    pub fn cert_verification(self, enabled: bool) -> Self {
+        Self(self.0.cert_verification(enabled))
+    }
+
+    /// Sets the identity for client certificate authentication.
+    pub fn identity(self, identity: Option<Identity>) -> Self {
+        Self(self.0.identity(identity))
+    }
+
+    /// Sets the TLS keylog policy.
+    pub fn keylog(self, keylog: Option<KeyLog>) -> Self {
+        Self(self.0.keylog(keylog))
+    }
+
+    /// Builds the connector, failing when BoringSSL can't write the ClientHello `opts`
+    /// describe.
+    pub fn build<'a, T>(&self, opts: T) -> crate::Result<QuicTlsConnector>
+    where
+        T: Into<Cow<'a, TlsOptions>>,
+    {
+        self.0.build(opts).map(QuicTlsConnector)
+    }
+}
+
 /// A TLS connection a client opened over a caller's stream (see
 /// [`Client::tls_connect`](crate::Client::tls_connect)).
 pub struct TlsStream<IO> {
