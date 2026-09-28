@@ -442,23 +442,30 @@ impl Client {
         }
     }
 
-    /// Opens a TLS connection over `io` with the ClientHello, trust, and client identity
-    /// this client's HTTPS connections use: it verifies `server_name` and announces it
-    /// (SNI), or, without one, verifies `host` and announces none. It offers no ALPN and
-    /// neither offers nor keeps a TLS session, and is bounded by no timeout of the
-    /// client's. The pool can adopt the connection (see [`RequestBuilder::adopt`]).
-    pub async fn tls_connect<IO>(
+    /// Opens a TLS connection over `io` as `request`'s own connection would open (see
+    /// [`RequestBuilder::tls_connect`]).
+    #[cfg(feature = "tokio-rt")]
+    pub(crate) async fn tls_connect<IO>(
         &self,
+        request: Request,
         io: IO,
-        host: &str,
-        server_name: Option<&str>,
     ) -> crate::Result<TlsStream<IO>>
     where
         IO: AsyncRead + AsyncWrite + Unpin,
     {
+        let descriptor = self
+            .1
+            .http
+            .descriptor(http::Request::<Body>::from(request))
+            .map_err(Error::request)?;
+        if descriptor.tls_options().is_some() {
+            return Err(Error::tls(
+                "a request with TLS options of its own opens no raw TLS connection",
+            ));
+        }
         self.1
             .tls
-            .connect(io, host, server_name)
+            .connect(io, &descriptor)
             .await
             .map_err(Error::tls)
     }

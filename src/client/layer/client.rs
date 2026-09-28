@@ -169,6 +169,12 @@ where
         Ok(())
     }
 
+    /// The connection `req` needs.
+    #[cfg(feature = "tokio-rt")]
+    pub(crate) fn descriptor(&self, mut req: Request<B>) -> Result<ConnectionDescriptor, Error> {
+        self.prepare(&mut req).map(|(_, descriptor)| descriptor)
+    }
+
     /// This client with `req`'s per-request options applied, and the connection `req`
     /// needs.
     fn prepare(&self, req: &mut Request<B>) -> Result<(Self, ConnectionDescriptor), Error> {

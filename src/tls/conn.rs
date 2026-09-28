@@ -278,9 +278,20 @@ impl TlsConnector {
     }
 
     fn setup_ssl2(&self, descriptor: ConnectionDescriptor) -> Result<Ssl, BoxError> {
-        let mut cfg = self.configure(self.alpn_offer(descriptor.version()).as_deref())?;
+        let cfg = self.configure(self.alpn_offer(descriptor.version()).as_deref())?;
+        let (cfg, host, _) = self.for_descriptor(cfg, &descriptor)?;
+        Ok(cfg.into_ssl(host)?)
+    }
 
-        let (host, sni) = Self::verified_name(&descriptor)?;
+    /// `cfg` made to open `descriptor`'s connection: announcing its name unless it
+    /// announces none, and offering and keeping the session cached for its connections.
+    /// Returns the name it verifies and whether it announces it.
+    fn for_descriptor<'a>(
+        &self,
+        mut cfg: ConnectConfiguration,
+        descriptor: &'a ConnectionDescriptor,
+    ) -> Result<(ConnectConfiguration, &'a str, bool), BoxError> {
+        let (host, sni) = Self::verified_name(descriptor)?;
         if !sni {
             cfg.set_use_server_name_indication(false);
         }
@@ -303,32 +314,27 @@ impl TlsConnector {
             cfg.set_ex_data(idx, key);
         }
 
-        Ok(cfg.into_ssl(host)?)
+        Ok((cfg, host, sni))
     }
 
-    /// Opens a TLS connection over `io` as this connector opens a request's, verifying
-    /// `server_name` and announcing it (SNI), or, without one, verifying `host` and
-    /// announcing none; it offers no ALPN and neither offers nor keeps a session.
+    /// Opens a TLS connection over `io` as this connector opens `descriptor`'s, offering
+    /// and keeping the same sessions, but offering no ALPN.
+    #[cfg(feature = "tokio-rt")]
     pub(crate) async fn connect<IO>(
         &self,
         io: IO,
-        host: &str,
-        server_name: Option<&str>,
+        descriptor: &ConnectionDescriptor,
     ) -> Result<TlsStream<IO>, BoxError>
     where
         IO: AsyncRead + AsyncWrite + Unpin,
     {
-        let mut cfg = self.configure(None)?;
-        if server_name.is_none() {
-            cfg.set_use_server_name_indication(false);
-        }
-        let name = Self::normalize_host(server_name.unwrap_or(host));
+        let (cfg, name, sni) = self.for_descriptor(self.configure(None)?, descriptor)?;
         let mut stream = SslStream::new(cfg.into_ssl(name)?, io)?;
         Pin::new(&mut stream).connect().await?;
         Ok(TlsStream {
             stream,
             name: Box::from(name),
-            sni: server_name.is_some() && self.settings.tls_sni,
+            sni: sni && self.settings.tls_sni,
         })
     }
 
@@ -723,21 +729,37 @@ impl<IO: AsyncRead + AsyncWrite + Unpin> AsyncWrite for TlsStream<IO> {
     }
 }
 
-/// A connection offered for adoption (see
-/// [`RequestBuilder::adopt`](crate::RequestBuilder::adopt)), which the connection attempt
-/// takes.
+/// A connection offered to a request's connection attempt, which takes it.
 #[cfg(feature = "tokio-rt")]
 #[derive(Clone)]
-pub(crate) struct Preconnected(Arc<std::sync::Mutex<Option<TlsStream<tokio::net::TcpStream>>>>);
+pub(crate) enum Preconnected {
+    /// An established TLS connection to adopt as it is (see
+    /// [`RequestBuilder::adopt`](crate::RequestBuilder::adopt)).
+    Adopt(Offer<TlsStream<tokio::net::TcpStream>>),
+    /// A TCP connection that TLS runs over like a newly opened one (see
+    /// [`RequestBuilder::connect_over`](crate::RequestBuilder::connect_over)).
+    Over(Offer<tokio::net::TcpStream>),
+}
+
+/// An offered connection, until a connection attempt takes it.
+#[cfg(feature = "tokio-rt")]
+pub(crate) struct Offer<T>(Arc<std::sync::Mutex<Option<T>>>);
 
 #[cfg(feature = "tokio-rt")]
-impl Preconnected {
-    pub(crate) fn new(stream: TlsStream<tokio::net::TcpStream>) -> Self {
-        Self(Arc::new(std::sync::Mutex::new(Some(stream))))
+impl<T> Clone for Offer<T> {
+    fn clone(&self) -> Self {
+        Self(Arc::clone(&self.0))
+    }
+}
+
+#[cfg(feature = "tokio-rt")]
+impl<T> Offer<T> {
+    pub(crate) fn new(connection: T) -> Self {
+        Self(Arc::new(std::sync::Mutex::new(Some(connection))))
     }
 
     /// The connection, unless a connection attempt took it already.
-    pub(crate) fn take(&self) -> Option<TlsStream<tokio::net::TcpStream>> {
+    pub(crate) fn take(&self) -> Option<T> {
         self.0
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)

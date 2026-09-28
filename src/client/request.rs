@@ -32,7 +32,10 @@ use super::{
 #[cfg(feature = "cookies")]
 use crate::cookie::{CookieStore, IntoCookieStore};
 #[cfg(feature = "tokio-rt")]
-use crate::tls::{TlsStream, conn::Preconnected};
+use crate::tls::{
+    TlsStream,
+    conn::{Offer, Preconnected},
+};
 use crate::{
     Error, Method, Proxy,
     config::{RequestConfig, RequestConfigValue},
@@ -830,21 +833,47 @@ impl RequestBuilder {
         self
     }
 
-    /// Adopts `stream`, a connection opened with
-    /// [`Client::tls_connect`](crate::Client::tls_connect) to where this request's own
-    /// connection would go (the same address, through the same proxy), into the pool as
-    /// an idle HTTP/1 connection for the requests this one would share a connection with,
-    /// instead of sending this request. It fails, closing `stream`, unless this client
-    /// opened it verifying and announcing the name this request's connection would, and
-    /// the peer has neither closed it nor sent anything.
+    /// Opens a TLS connection over `io` as this request's own connection would open, with
+    /// the ClientHello, trust, client identity and TLS sessions of that connection, but
+    /// offering no ALPN. It is bounded by no timeout of the client's. The pool can adopt
+    /// the connection (see [`RequestBuilder::adopt`]).
+    #[cfg(feature = "tokio-rt")]
+    pub async fn tls_connect<IO>(self, io: IO) -> crate::Result<TlsStream<IO>>
+    where
+        IO: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+    {
+        self.client.tls_connect(self.request?, io).await
+    }
+
+    /// Adopts `stream`, a connection opened with [`RequestBuilder::tls_connect`] to where
+    /// this request's own connection would go (the same address, through the same proxy),
+    /// into the pool as an idle HTTP/1 connection for the requests this one would share a
+    /// connection with, instead of sending this request. It fails, closing `stream`,
+    /// unless this client opened it verifying and announcing the name this request's
+    /// connection would, and the peer has neither closed it nor sent anything.
     #[cfg(feature = "tokio-rt")]
     pub async fn adopt(mut self, stream: TlsStream<tokio::net::TcpStream>) -> crate::Result<()> {
         if let Ok(ref mut req) = self.request {
             req.config_mut::<RequestOptions>()
                 .get_or_insert_default()
-                .preconnected = Some(Preconnected::new(stream));
+                .preconnected = Some(Preconnected::Adopt(Offer::new(stream)));
         }
         self.client.adopt(self.request?).await
+    }
+
+    /// Opens this request's connection, should it need a new one, over `stream`, a TCP
+    /// connection already open to where that connection would go (the same address,
+    /// through the same proxy), instead of connecting; TLS then runs over it as over any
+    /// new connection. An idle pooled connection still serves the request first, and
+    /// `stream` then closes unused.
+    #[cfg(feature = "tokio-rt")]
+    pub fn connect_over(mut self, stream: tokio::net::TcpStream) -> RequestBuilder {
+        if let Ok(ref mut req) = self.request {
+            req.config_mut::<RequestOptions>()
+                .get_or_insert_default()
+                .preconnected = Some(Preconnected::Over(Offer::new(stream)));
+        }
+        self
     }
 
     /// Confines this request's connection to `scope`: it reuses only connections opened

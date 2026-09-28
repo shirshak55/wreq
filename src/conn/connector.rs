@@ -21,6 +21,8 @@ use super::{
     TlsConn, TlsInfoFactory, Unnameable, descriptor::ConnectionDescriptor, http::HttpConnect,
     net::TcpConnector, proxy, verbose::Verbose,
 };
+#[cfg(feature = "tokio-rt")]
+use crate::tls::conn::Preconnected;
 use crate::{
     dns::DynResolver,
     error::{ProxyConnect, TimedOut, map_timeout_to_connector_error},
@@ -506,29 +508,36 @@ impl ConnectorService {
     }
 
     async fn connect_auto(self, req: ConnectionDescriptor) -> Result<Conn, BoxError> {
+        // A TCP connection offered to open over; a retry after it was taken connects anew.
         #[cfg(feature = "tokio-rt")]
-        if let Some(preconnected) = req.preconnected() {
-            let mut stream = preconnected
-                .take()
-                .ok_or("the adopted connection was already used")?;
-            let tls = match req.tls_options() {
-                Some(opts) => self.builder.build(Cow::Borrowed(opts))?,
-                None => self.tls.clone(),
-            };
-            if !(req.uri().is_https() && tls.opened_for(&stream, &req)?) {
-                return Err("the adopted connection is not one this request would open".into());
+        let mut offered_tcp = None;
+        #[cfg(feature = "tokio-rt")]
+        match req.preconnected() {
+            Some(Preconnected::Adopt(offer)) => {
+                let mut stream = offer
+                    .take()
+                    .ok_or("the adopted connection was already used")?;
+                let tls = match req.tls_options() {
+                    Some(opts) => self.builder.build(Cow::Borrowed(opts))?,
+                    None => self.tls.clone(),
+                };
+                if !(req.uri().is_https() && tls.opened_for(&stream, &req)?) {
+                    return Err("the adopted connection is not one this request would open".into());
+                }
+                if !stream.idle() {
+                    return Err("the adopted connection is closed or has unread data".into());
+                }
+                debug!("adopting a connection: {:?}", req.uri());
+                return Ok(Conn {
+                    stream: self.config.verbose.wrap(TlsConn {
+                        stream: stream.stream,
+                    }),
+                    tls_info: self.config.tls_info,
+                    proxy: None,
+                });
             }
-            if !stream.idle() {
-                return Err("the adopted connection is closed or has unread data".into());
-            }
-            debug!("adopting a connection: {:?}", req.uri());
-            return Ok(Conn {
-                stream: self.config.verbose.wrap(TlsConn {
-                    stream: stream.stream,
-                }),
-                tls_info: self.config.tls_info,
-                proxy: None,
-            });
+            Some(Preconnected::Over(offer)) => offered_tcp = offer.take(),
+            None => {}
         }
 
         debug!("starting new connection: {:?}", req.uri());
@@ -537,6 +546,21 @@ impl ConnectorService {
 
         // Determine if a proxy should be used for this request.
         let fut = async {
+            #[cfg(feature = "tokio-rt")]
+            if let Some(stream) = offered_tcp {
+                debug!(
+                    "opening the connection over an offered one: {:?}",
+                    req.uri()
+                );
+                let is_https = req.uri().is_https();
+                let mut connector = self.build_https_connector(is_https, &req)?;
+                let io = connector.call(EstablishedConn::new(stream, req)).await?;
+                if is_https && !self.config.nodelay {
+                    io.as_ref().set_nodelay(false)?;
+                }
+                return self.tunnel_conn_from_stream(io);
+            }
+
             let intercepted = req
                 .proxy()
                 .and_then(|prox| prox.intercept(req.uri()))
