@@ -333,6 +333,37 @@ pub struct TlsOptions {
     /// **Default:** `None`
     pub extension_permutation: Option<Cow<'static, [ExtensionType]>>,
 
+    /// Starts the `signature_algorithms` extension with a GREASE value
+    /// ([RFC 8701](https://datatracker.ietf.org/doc/html/rfc8701)).
+    ///
+    /// **Default:** `false`
+    pub grease_signature_algorithms: bool,
+
+    /// Whether [`Self::extension_permutation`] is the ClientHello's whole extension list: the
+    /// listed extensions are sent in that order, each when its configuration calls for it, and
+    /// no others. A GREASE value places a GREASE extension, [`ExtensionType::PADDING`] a padding
+    /// extension of [`Self::padding_length`] bytes, and [`ExtensionType::ENCRYPT_THEN_MAC`] an
+    /// encrypt_then_mac extension when no CBC cipher suite is offered.
+    ///
+    /// **Default:** `false`
+    pub strict_extension_order: bool,
+
+    /// The length of the padding extension a strict extension order places.
+    ///
+    /// **Default:** `0`
+    pub padding_length: u16,
+
+    /// Ends the cipher suite list with TLS_EMPTY_RENEGOTIATION_INFO_SCSV
+    /// ([RFC 5746](https://datatracker.ietf.org/doc/html/rfc5746)).
+    ///
+    /// **Default:** `false`
+    pub renegotiation_scsv: bool,
+
+    /// Trust anchor IDs to request, as the encoded list of the `trust_anchors` extension.
+    ///
+    /// **Default:** `None`
+    pub trust_anchors: Option<Cow<'static, [u8]>>,
+
     /// Overrides AES hardware acceleration.
     ///
     /// **Default:** `None`
@@ -544,6 +575,44 @@ impl TlsOptionsBuilder {
         self
     }
 
+    /// Sets whether to start the `signature_algorithms` extension with a GREASE value.
+    #[inline]
+    pub fn grease_signature_algorithms(mut self, enabled: bool) -> Self {
+        self.config.grease_signature_algorithms = enabled;
+        self
+    }
+
+    /// Sets whether the extension permutation is the ClientHello's whole extension list.
+    #[inline]
+    pub fn strict_extension_order(mut self, enabled: bool) -> Self {
+        self.config.strict_extension_order = enabled;
+        self
+    }
+
+    /// Sets the length of the padding extension a strict extension order places.
+    #[inline]
+    pub fn padding_length(mut self, len: u16) -> Self {
+        self.config.padding_length = len;
+        self
+    }
+
+    /// Sets whether to end the cipher suite list with TLS_EMPTY_RENEGOTIATION_INFO_SCSV.
+    #[inline]
+    pub fn renegotiation_scsv(mut self, enabled: bool) -> Self {
+        self.config.renegotiation_scsv = enabled;
+        self
+    }
+
+    /// Sets the trust anchor IDs to request.
+    #[inline]
+    pub fn trust_anchors<T>(mut self, ids: T) -> Self
+    where
+        T: Into<Cow<'static, [u8]>>,
+    {
+        self.config.trust_anchors = Some(ids.into());
+        self
+    }
+
     /// Sets the AES hardware override flag.
     #[inline]
     pub fn aes_hw_override<T>(mut self, enabled: T) -> Self
@@ -624,6 +693,11 @@ impl Default for TlsOptions {
             sigalgs_list: None,
             certificate_compressors: None,
             extension_permutation: None,
+            grease_signature_algorithms: false,
+            strict_extension_order: false,
+            padding_length: 0,
+            renegotiation_scsv: false,
+            trust_anchors: None,
             aes_hw_override: None,
             preserve_tls13_cipher_list: None,
             random_aes_hw_override: false,

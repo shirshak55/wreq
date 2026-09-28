@@ -442,6 +442,7 @@ impl TlsConnectorBuilder {
 
         // Set TLS grease options
         set_option!(opts, grease_enabled, connector, set_grease_enabled);
+        connector.set_grease_signature_algorithms(opts.grease_signature_algorithms);
 
         // Set TLS permute extensions options
         set_option!(opts, permute_extensions, connector, set_permute_extensions);
@@ -483,6 +484,16 @@ impl TlsConnectorBuilder {
                 .set_extension_permutation(extension_permutation)
                 .map_err(Error::tls)?;
         }
+
+        // Set whether the extension permutation is the whole extension list
+        connector.set_strict_extension_order(opts.strict_extension_order);
+        connector.set_padding_length(opts.padding_length);
+
+        // Set TLS renegotiation signalling cipher suite value
+        connector.set_renegotiation_scsv(opts.renegotiation_scsv);
+
+        // Set TLS trust anchor IDs
+        set_option_ref_try!(opts, trust_anchors, connector, set_requested_trust_anchors);
 
         // Keep each connection's ClientHello for its `TlsInfo`.
         // SAFETY: `connector` owns a live `SSL_CTX`; the callback is a plain function.

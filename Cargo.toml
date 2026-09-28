@@ -205,6 +205,11 @@ criterion = { version = "0.8.2", features = ["async_tokio"] }
 reqwest = { version = "0.13.3", default-features = false, features = ["rustls", "stream", "http2"] }
 cyper = { version = "0.9.0",  default-features = false, features = ["rustls", "stream"] }
 
+# The btls fork carrying the ClientHello controls this fork's TLS options use.
+[patch.crates-io]
+btls = { git = "https://github.com/shirshak55/btls", rev = "7ad43e7d0bc9ad3843cb687b21912b08b644c725" }
+btls-sys = { git = "https://github.com/shirshak55/btls", rev = "7ad43e7d0bc9ad3843cb687b21912b08b644c725" }
+
 [profile.release]
 codegen-units = 1
 incremental = false
