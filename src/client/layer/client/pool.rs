@@ -153,6 +153,27 @@ impl<T: Poolable, K: Key> Pool<T, K> {
         }
     }
 
+    /// Takes an idle connection under `key` that can't be shared (HTTP/1) right away,
+    /// leaving any shared one in place.
+    pub fn checkout_unshared(&self, key: &K) -> Option<Pooled<T, K>> {
+        let value = {
+            let mut inner = self.inner.as_ref()?.lock();
+            let expiration = Expiration::new(inner.timeout);
+            let now = inner.now();
+            let list = inner.idle.get_mut(key)?;
+            list.retain(|entry| entry.value.is_open() && !expiration.expires(entry.idle_at, now));
+            let value = list
+                .iter()
+                .rposition(|entry| !entry.value.can_share())
+                .map(|index| list.remove(index).value);
+            if list.is_empty() {
+                inner.idle.pop(key);
+            }
+            value
+        }?;
+        Some(self.reuse(key, value))
+    }
+
     /// Ensure that there is only ever 1 connecting task for HTTP/2
     /// connections. This does nothing for HTTP/1.
     pub fn connecting(&self, key: K, ver: Ver) -> Option<Connecting<T, K>> {

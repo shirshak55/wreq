@@ -436,6 +436,13 @@ where
                 .map_err(ClientConnectError::Normal);
         }
 
+        if let Some(pooled) = descriptor
+            .unversioned_id()
+            .and_then(|id| self.pool.checkout_unshared(id))
+        {
+            return Ok(pooled);
+        }
+
         // This actually races 2 different futures to try to get a ready
         // connection the fastest, and to reduce connection churn.
         //

@@ -41,6 +41,7 @@ pub(crate) struct ConnectionDescriptor {
     tls_name: Option<(Box<str>, bool)>,
     connection_id: ConnectionId,
     session_id: ConnectionId,
+    unversioned_id: Option<ConnectionId>,
 }
 
 // ===== impl ConnectionId =====
@@ -93,14 +94,21 @@ impl ConnectionDescriptor {
         let id = |group| ConnectionId(Arc::new((group, AtomicU64::new(u64::MIN))));
         group
             .uri(uri.clone())
-            .version(version)
             .proxy(proxy.clone())
             .socket_bind(socket_bind.clone());
+        // An idle HTTP/1 connection opened without a forced version serves a request that
+        // forces HTTP/1 just as well.
+        let mut unversioned =
+            matches!(version, Some(Version::HTTP_10 | Version::HTTP_11)).then(|| group.clone());
+        group.version(version);
         // TLS sessions resume across scopes; connections stay within theirs.
         let (connection_id, session_id) = match &scope {
             Some(scope) => {
                 let session_id = id(group.clone());
                 group.scope(scope.clone());
+                if let Some(unversioned) = &mut unversioned {
+                    unversioned.scope(scope.clone());
+                }
                 (id(group), session_id)
             }
             None => {
@@ -119,6 +127,7 @@ impl ConnectionDescriptor {
             tls_name: None,
             connection_id,
             session_id,
+            unversioned_id: unversioned.map(id),
         }
     }
 
@@ -133,6 +142,13 @@ impl ConnectionDescriptor {
     #[inline]
     pub(crate) fn id(&self) -> ConnectionId {
         self.connection_id.clone()
+    }
+
+    /// For a request that forces HTTP/1, the ID its connections would have without the
+    /// forced version: idle HTTP/1 connections there can serve it too.
+    #[inline]
+    pub(crate) fn unversioned_id(&self) -> Option<&ConnectionId> {
+        self.unversioned_id.as_ref()
     }
 
     /// Returns the ID the connection's TLS sessions are cached under.
