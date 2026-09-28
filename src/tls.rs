@@ -106,18 +106,24 @@ impl TlsVersion {
 }
 
 /// A TLS ALPN protocol.
-#[derive(Debug, Clone, Copy, Hash, PartialEq, Eq)]
-pub struct AlpnProtocol(&'static [u8]);
+#[derive(Debug, Clone, Hash, PartialEq, Eq)]
+pub struct AlpnProtocol(Cow<'static, [u8]>);
 
 impl AlpnProtocol {
     /// Prefer HTTP/1.1
-    pub const HTTP1: AlpnProtocol = AlpnProtocol(b"http/1.1");
+    pub const HTTP1: AlpnProtocol = AlpnProtocol(Cow::Borrowed(b"http/1.1"));
 
     /// Prefer HTTP/2
-    pub const HTTP2: AlpnProtocol = AlpnProtocol(b"h2");
+    pub const HTTP2: AlpnProtocol = AlpnProtocol(Cow::Borrowed(b"h2"));
 
     /// Prefer HTTP/3
-    pub const HTTP3: AlpnProtocol = AlpnProtocol(b"h3");
+    pub const HTTP3: AlpnProtocol = AlpnProtocol(Cow::Borrowed(b"h3"));
+
+    /// A protocol by its identification sequence, such as any a client offered.
+    #[inline]
+    pub fn new(id: impl Into<Cow<'static, [u8]>>) -> AlpnProtocol {
+        AlpnProtocol(id.into())
+    }
 
     #[inline]
     fn encode(self) -> Bytes {
@@ -131,7 +137,7 @@ impl AlpnProtocol {
         let mut buf = BytesMut::new();
         for item in items {
             buf.put_u8(item.0.len() as u8);
-            buf.extend_from_slice(item.0);
+            buf.extend_from_slice(&item.0);
         }
         buf.freeze()
     }
@@ -140,7 +146,7 @@ impl AlpnProtocol {
 impl PartialEq<[u8]> for AlpnProtocol {
     #[inline]
     fn eq(&self, other: &[u8]) -> bool {
-        self.0 == other
+        *self.0 == *other
     }
 }
 

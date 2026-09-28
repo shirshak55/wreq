@@ -198,8 +198,11 @@ impl TlsConnector {
         // Set ALPN protocols
         if let Some(version) = descriptor.version() {
             match version {
+                // HTTP/1 needs no ALPN, so a connector that offers none keeps offering none.
                 Version::HTTP_11 | Version::HTTP_10 | Version::HTTP_09 => {
-                    cfg.set_alpn_protos(&AlpnProtocol::HTTP1.encode())?;
+                    if self.settings.alpn_protocols.is_some() {
+                        cfg.set_alpn_protos(&AlpnProtocol::HTTP1.encode())?;
+                    }
                 }
                 Version::HTTP_2 => {
                     cfg.set_alpn_protos(&AlpnProtocol::HTTP2.encode())?;
@@ -370,6 +373,7 @@ impl TlsConnectorBuilder {
         let min_tls_version = opts.min_tls_version.or(self.min_version);
         let alpn_protocols = self
             .alpn_protocol
+            .clone()
             .map(|proto| Cow::Owned(vec![proto]))
             .or_else(|| opts.alpn_protocols.clone());
 
