@@ -23,7 +23,7 @@ where
     T: AsyncRead + AsyncWrite + Unpin,
 {
     let mut stream = SslStream::new(ssl, conn)?;
-    Pin::new(&mut stream).connect().await?;
+    crate::tls::trust::aia::handshake(&mut stream).await?;
     Ok(MaybeHttpsStream::Https(stream))
 }
 

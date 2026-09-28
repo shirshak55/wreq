@@ -30,6 +30,9 @@ fn extract_tls_info<S>(ssl_stream: &SslStream<S>) -> TlsInfo {
             .ok()
             .and_then(|index| ssl.ex_data(index))
             .map(|messages| crate::tls::ServerFlight::from(messages.clone())),
+        group: ssl.curve(),
+        hello_retry_request: ssl.used_hello_retry_request(),
+        aia_fetches: crate::tls::trust::aia::fetches(ssl),
         peer_certificate: ssl
             .peer_certificate()
             .and_then(|cert| cert.to_der().ok())

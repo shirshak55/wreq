@@ -29,6 +29,9 @@ pub struct TlsInfo {
     pub(crate) connection: std::sync::Arc<TlsConnectionUse>,
     pub(crate) client_hello: Option<Bytes>,
     pub(crate) server_flight: Option<ServerFlight>,
+    pub(crate) group: Option<u16>,
+    pub(crate) hello_retry_request: bool,
+    pub(crate) aia_fetches: Vec<trust::AiaFetch>,
 }
 
 /// The raw handshake messages an origin sent this connection (its server flight), in the
@@ -166,6 +169,22 @@ impl TlsInfo {
     /// The protocol selected through ALPN, if any.
     pub fn alpn_protocol(&self) -> Option<&[u8]> {
         self.alpn_protocol.as_deref()
+    }
+
+    /// The negotiated key exchange group's TLS id (e.g. 29 for X25519), if any.
+    pub fn group(&self) -> Option<u16> {
+        self.group
+    }
+
+    /// Whether the server answered the first ClientHello with a HelloRetryRequest.
+    pub fn hello_retry_request(&self) -> bool {
+        self.hello_retry_request
+    }
+
+    /// The caIssuers URLs whose issuers the certificate verification needed (see
+    /// [`AiaCache`](trust::AiaCache)), in the order it needed them.
+    pub fn aia_fetches(&self) -> &[trust::AiaFetch] {
+        &self.aia_fetches
     }
 
     /// The ClientHello handshake message (type, length and body, without the record

@@ -1,6 +1,9 @@
 use std::{
+    future::Future,
     io,
     num::NonZeroUsize,
+    os::raw::c_int,
+    pin::Pin,
     ptr,
     sync::{Arc, LazyLock},
     time::{Duration, Instant},
@@ -9,15 +12,17 @@ use std::{
 use btls::{
     asn1::Asn1ObjectRef,
     error::ErrorStack,
+    ex_data::Index,
     nid::Nid,
+    ssl::{Ssl, SslAlert, SslRef, SslVerifyError},
     stack::Stack,
-    x509::{
-        GeneralNameRef, X509, X509Ref, X509StoreContext, X509StoreContextRef, X509VerifyError,
-        X509VerifyResult, store::X509StoreRef,
-    },
+    x509::{GeneralNameRef, X509, X509Ref, X509StoreContext, X509VerifyError, X509VerifyResult},
 };
 use foreign_types::{ForeignType, ForeignTypeRef};
+use futures_util::future::{FutureExt, Shared};
 use lru::LruCache;
+use tokio::io::{AsyncRead, AsyncWrite};
+use tokio_btls::SslStream;
 
 use crate::sync::Mutex;
 
@@ -30,16 +35,18 @@ const MAX_URLS: usize = 3;
 /// How long a URL that failed is not fetched again.
 const FAILURE_TTL: Duration = Duration::from_secs(30);
 
-/// The default fetcher's time limit for one URL, redirects included.
-const FETCH_TIMEOUT: Duration = Duration::from_secs(5);
+/// The largest caIssuers response taken.
+const MAX_BODY: usize = 64 * 1024;
 
-/// The default fetcher's response body limit.
-const MAX_BODY: u64 = 64 * 1024;
+type FetchFuture = Pin<Box<dyn Future<Output = io::Result<Vec<u8>>> + Send>>;
 
-/// How many redirects the default fetcher follows.
-const MAX_REDIRECTS: u32 = 3;
+type Fetch = dyn Fn(String) -> FetchFuture + Send + Sync;
 
-type Fetch = dyn Fn(&str) -> io::Result<Vec<u8>> + Send + Sync;
+/// A fetch of one URL, shared by every handshake waiting for it.
+type Fetching = Shared<Pin<Box<dyn Future<Output = Fetched> + Send>>>;
+
+/// The certificates a URL served, or why it served none.
+type Fetched = Result<Vec<X509>, Arc<str>>;
 
 /// Issuer certificates fetched from the Authority Information Access (AIA) caIssuers URLs
 /// of server certificates, cached for every client and connector sharing this cache.
@@ -50,13 +57,11 @@ type Fetch = dyn Fn(&str) -> io::Result<Vec<u8>> + Send + Sync;
 /// intermediate, for up to three chain levels. The chain must still end at a trusted root
 /// and pass every other check; when it doesn't, the last verification's error stands.
 ///
-/// The cache holds the certificates of its capacity of URLs, dropping the least recently
-/// used, and remembers a URL that failed for 30 seconds, during which verifications
-/// needing it fail without fetching.
-///
-/// A fetch runs inside the handshake and blocks it: on a multi-threaded tokio runtime
-/// through [`tokio::task::block_in_place`], elsewhere blocking the thread (stalling a
-/// current-thread runtime meanwhile). Cached URLs don't block.
+/// A fetch doesn't block: the handshake waits for it asynchronously, and handshakes needing
+/// a URL already being fetched wait for that fetch. The fetcher bounds its own time; a
+/// response over 64 KiB fails. The cache holds the certificates of its capacity of URLs,
+/// dropping the least recently used, and remembers a URL that failed for 30 seconds, during
+/// which verifications needing it fail without fetching.
 #[derive(Clone)]
 pub struct AiaCache(Arc<Inner>);
 
@@ -67,106 +72,277 @@ struct Inner {
 
 enum Entry {
     Issuers(Vec<X509>),
-    Failed { until: Instant },
+    Failed { until: Instant, error: Arc<str> },
+    Fetching(Fetching),
+}
+
+/// A caIssuers URL a connection's certificate verification needed (see
+/// [`TlsInfo::aia_fetches`](crate::tls::TlsInfo::aia_fetches)).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AiaFetch {
+    url: String,
+    cached: bool,
+    result: Result<usize, String>,
+}
+
+impl AiaFetch {
+    /// The caIssuers URL.
+    pub fn url(&self) -> &str {
+        &self.url
+    }
+
+    /// Whether the cache already held its outcome, so this connection didn't wait for it.
+    pub fn cached(&self) -> bool {
+        self.cached
+    }
+
+    /// How many certificates it served, unless it failed.
+    pub fn certificates(&self) -> Option<usize> {
+        self.result.as_ref().ok().copied()
+    }
+
+    /// Why it served none, if it failed.
+    pub fn error(&self) -> Option<&str> {
+        self.result.as_ref().err().map(String::as_str)
+    }
+}
+
+/// A connection's verification state across the retries of its certificate verification.
+#[derive(Default)]
+struct State {
+    /// The URLs it needed, with their outcomes.
+    fetches: Vec<AiaFetch>,
+    /// The URLs whose fetch it waited for.
+    waited: Vec<String>,
+    /// The fetch it waits for.
+    pending: Option<Fetching>,
+    /// Why its last verification failed.
+    error: Option<X509VerifyError>,
+}
+
+fn state_index() -> Result<Index<Ssl, Mutex<State>>, ErrorStack> {
+    static IDX: LazyLock<Result<Index<Ssl, Mutex<State>>, ErrorStack>> =
+        LazyLock::new(Ssl::new_ex_index);
+    IDX.clone()
+}
+
+/// What a lookup of a certificate's caIssuers URLs found.
+enum Lookup {
+    Issuers(Vec<X509>),
+    Pending(Fetching),
+    None,
 }
 
 impl AiaCache {
-    /// A cache of up to `capacity` URLs' certificates, fetched with a plain HTTP GET: only
-    /// `http://` URLs (an `https://` one would need a verification of its own), following up
-    /// to three redirects to `http://` URLs, with 5 seconds and 64 KiB per URL, and no proxy.
-    pub fn new(capacity: NonZeroUsize) -> AiaCache {
-        AiaCache::with_fetcher(capacity, fetch)
-    }
-
-    /// A cache of up to `capacity` URLs' certificates, fetched with `fetch`, which returns
-    /// the body a caIssuers URL serves: a DER certificate, DER PKCS#7 certificates (`.p7c`),
-    /// or PEM certificates.
-    pub fn with_fetcher<F>(capacity: NonZeroUsize, fetch: F) -> AiaCache
+    /// A cache of up to `capacity` URLs' certificates, fetched with `fetch`, which resolves
+    /// to the body a caIssuers URL serves: a DER certificate, DER PKCS#7 certificates
+    /// (`.p7c`), or PEM certificates.
+    pub fn new<F, Fut>(capacity: NonZeroUsize, fetch: F) -> AiaCache
     where
-        F: Fn(&str) -> io::Result<Vec<u8>> + Send + Sync + 'static,
+        F: Fn(String) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = io::Result<Vec<u8>>> + Send + 'static,
     {
         AiaCache(Arc::new(Inner {
             entries: Mutex::new(LruCache::new(capacity)),
-            fetch: Box::new(fetch),
+            fetch: Box::new(move |url| Box::pin(fetch(url))),
         }))
     }
 
-    /// Verifies the peer certificate of `ctx`, which BoringSSL set up, as BoringSSL does,
-    /// then, while that fails for a missing issuer, again with the issuers fetched for the
-    /// certificate lacking one. `ctx` keeps the last verification's result.
-    pub(crate) fn verify(&self, ctx: &mut X509StoreContextRef) -> bool {
-        if ctx.verify_cert().unwrap_or(false) {
-            return true;
+    /// The custom verification of a connection's peer certificate: BoringSSL's own, then,
+    /// while that fails for a missing issuer, again with the issuers fetched for the
+    /// certificate lacking one. A fetch still running pauses the handshake (see
+    /// [`handshake`]).
+    pub(crate) fn verify(&self, ssl: &mut SslRef) -> Result<(), SslVerifyError> {
+        let index = state_index().map_err(|_| SslVerifyError::Invalid(SslAlert::INTERNAL_ERROR))?;
+        if ssl.ex_data(index).is_none() {
+            ssl.set_ex_data(index, Mutex::new(State::default()));
         }
-
-        let (Some(leaf), Some(mut lacking)) = (
-            ctx.cert().map(ToOwned::to_owned),
-            ctx.current_cert().map(ToOwned::to_owned),
-        ) else {
-            return false;
+        let ssl: &SslRef = ssl;
+        let Some(state) = ssl.ex_data(index) else {
+            return Err(SslVerifyError::Invalid(SslAlert::INTERNAL_ERROR));
         };
-        let mut untrusted: Vec<X509> = ctx
-            .untrusted()
-            .into_iter()
-            .flatten()
-            .map(ToOwned::to_owned)
-            .collect();
-        let mut result = ctx.verify_result();
+        let mut state = state.lock();
+        state.pending = None;
 
+        let internal = |_| SslVerifyError::Invalid(SslAlert::INTERNAL_ERROR);
+        let mut untrusted = Vec::new();
+        let (mut verified, mut result, mut current) =
+            verify_chain(ssl, &untrusted).map_err(internal)?;
         for _ in 0..MAX_LEVELS {
-            if !issuer_missing(result) {
+            if verified || !issuer_missing(result) {
                 break;
             }
-            let issuers = self.issuers(&lacking);
-            if issuers.is_empty() {
-                break;
-            }
-            untrusted.extend(issuers);
-
-            let Ok((verified, retried, current)) = reverify(ctx, &leaf, &untrusted) else {
+            let Some(lacking) = current.take() else {
                 break;
             };
-            ctx.set_error(retried);
-            if verified {
-                return true;
+            match self.issuers(&lacking, &mut state) {
+                Lookup::Issuers(issuers) => untrusted.extend(issuers),
+                Lookup::Pending(fetch) => {
+                    state.pending = Some(fetch);
+                    return Err(SslVerifyError::Retry);
+                }
+                Lookup::None => break,
             }
+            (verified, result, current) = verify_chain(ssl, &untrusted).map_err(internal)?;
             // A certificate still lacking its issuer after its fetch has no other to try.
-            match current {
-                Some(cert) if cert.as_ptr() != lacking.as_ptr() => lacking = cert,
-                _ => break,
+            if current
+                .as_ref()
+                .is_some_and(|cert| cert.as_ptr() == lacking.as_ptr())
+            {
+                break;
             }
-            result = retried;
         }
-        false
+
+        match result {
+            Ok(()) if verified => {
+                state.error = None;
+                Ok(())
+            }
+            result => {
+                let error = result.err();
+                state.error = error;
+                let raw = error.map_or(btls_sys::X509_V_ERR_UNSPECIFIED as c_int, |error| {
+                    error.as_raw()
+                });
+                // SAFETY: a pure mapping of a verification result to an alert.
+                #[allow(unsafe_code)]
+                let alert = unsafe { btls_sys::SSL_alert_from_verify_result(raw.into()) };
+                Err(SslVerifyError::Invalid(alert_of(alert)))
+            }
+        }
     }
 
-    /// The certificates the first of `cert`'s caIssuers URLs that serves any serves.
-    fn issuers(&self, cert: &X509Ref) -> Vec<X509> {
-        ca_issuers(cert)
+    /// The issuers the first of `cert`'s caIssuers URLs that serves any serves, or the
+    /// fetch to wait for before the next URL is tried.
+    fn issuers(&self, cert: &X509Ref, state: &mut State) -> Lookup {
+        for url in ca_issuers(cert).into_iter().take(MAX_URLS) {
+            match self.lookup(&url, state) {
+                Some(Ok(issuers)) => return Lookup::Issuers(issuers),
+                Some(Err(fetch)) => return Lookup::Pending(fetch),
+                None => {}
+            }
+        }
+        Lookup::None
+    }
+
+    /// The certificates `url` serves: `Some(Ok)` when known, `None` when it failed, and
+    /// `Some(Err)` with the fetch to wait for while one runs, started here if none is.
+    fn lookup(&self, url: &str, state: &mut State) -> Option<Result<Vec<X509>, Fetching>> {
+        // A URL that failed this connection isn't tried again for it.
+        if state
+            .fetches
             .iter()
-            .take(MAX_URLS)
-            .find_map(|url| self.get(url))
-            .unwrap_or_default()
-    }
-
-    /// The certificates `url` serves, cached or fetched, or `None` when it failed.
-    fn get(&self, url: &str) -> Option<Vec<X509>> {
-        match self.0.entries.lock().get(url) {
-            Some(Entry::Issuers(certs)) => return Some(certs.clone()),
-            Some(Entry::Failed { until }) if *until > Instant::now() => return None,
-            _ => {}
+            .any(|fetch| fetch.url == url && fetch.result.is_err())
+        {
+            return None;
         }
 
-        let (entry, certs) = match blocking(|| (self.0.fetch)(url)).and_then(|body| parse(&body)) {
-            Ok(certs) => (Entry::Issuers(certs.clone()), Some(certs)),
-            Err(_err) => {
-                debug!("tls AIA fetch of {} failed: {}", url, _err);
-                let until = Instant::now() + FAILURE_TTL;
-                (Entry::Failed { until }, None)
+        let mut entries = self.0.entries.lock();
+        let (fetched, finished) = match entries.get(url) {
+            Some(Entry::Issuers(issuers)) => (Ok(issuers.clone()), false),
+            Some(Entry::Failed { until, error }) if *until > Instant::now() => {
+                (Err(Arc::clone(error)), false)
+            }
+            Some(Entry::Fetching(fetch)) => match fetch.peek() {
+                Some(fetched) => (fetched.clone(), true),
+                None => {
+                    state.waited.push(url.to_owned());
+                    return Some(Err(fetch.clone()));
+                }
+            },
+            _ => {
+                let fetch = (self.0.fetch)(url.to_owned());
+                let fetch: Fetching = async move {
+                    match fetch.await {
+                        Ok(body) if body.len() > MAX_BODY => {
+                            Err(format!("response over {MAX_BODY} bytes").into())
+                        }
+                        Ok(body) => parse(&body).map_err(|err| err.to_string().into()),
+                        Err(err) => Err(err.to_string().into()),
+                    }
+                }
+                .boxed()
+                .shared();
+                entries.put(url.into(), Entry::Fetching(fetch.clone()));
+                state.waited.push(url.to_owned());
+                return Some(Err(fetch));
             }
         };
-        self.0.entries.lock().put(url.into(), entry);
-        certs
+
+        if finished {
+            let entry = match &fetched {
+                Ok(issuers) => Entry::Issuers(issuers.clone()),
+                Err(error) => {
+                    debug!("tls AIA fetch of {} failed: {}", url, error);
+                    Entry::Failed {
+                        until: Instant::now() + FAILURE_TTL,
+                        error: Arc::clone(error),
+                    }
+                }
+            };
+            entries.put(url.into(), entry);
+        }
+        drop(entries);
+
+        let cached = !state.waited.iter().any(|waited| waited == url);
+        state.fetches.retain(|fetch| fetch.url != url);
+        state.fetches.push(AiaFetch {
+            url: url.to_owned(),
+            cached,
+            result: fetched
+                .as_ref()
+                .map(Vec::len)
+                .map_err(|error| error.to_string()),
+        });
+        fetched.ok().map(Ok)
+    }
+}
+
+/// Runs `stream`'s client handshake, waiting out the issuer fetches its certificate
+/// verification pauses it for (see [`AiaCache`]).
+pub(crate) async fn handshake<S>(stream: &mut SslStream<S>) -> Result<(), btls::ssl::Error>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    loop {
+        match Pin::new(&mut *stream).connect().await {
+            Err(error) if error.code() == btls::ssl::ErrorCode::WANT_CERTIFICATE_VERIFY => {
+                let pending = state_index()
+                    .ok()
+                    .and_then(|index| stream.ssl().ex_data(index))
+                    .and_then(|state| state.lock().pending.take());
+                match pending {
+                    Some(fetch) => {
+                        let _ = fetch.await;
+                    }
+                    None => return Err(error),
+                }
+            }
+            result => return result,
+        }
+    }
+}
+
+/// The caIssuers URLs a connection's certificate verification needed.
+pub(crate) fn fetches(ssl: &SslRef) -> Vec<AiaFetch> {
+    state_index()
+        .ok()
+        .and_then(|index| ssl.ex_data(index))
+        .map(|state| state.lock().fetches.clone())
+        .unwrap_or_default()
+}
+
+/// Why a connection's certificate verification failed: BoringSSL reports a failed custom
+/// verification as `X509_V_ERR_APPLICATION_VERIFICATION`, so the error this cache's verification
+/// failed with, when it ran.
+pub(crate) fn verify_result(ssl: &SslRef) -> X509VerifyResult {
+    let error = state_index()
+        .ok()
+        .and_then(|index| ssl.ex_data(index))
+        .and_then(|state| state.lock().error);
+    match error {
+        Some(error) => Err(error),
+        None => ssl.verify_result(),
     }
 }
 
@@ -179,52 +355,93 @@ fn issuer_missing(result: X509VerifyResult) -> bool {
     })
 }
 
-/// Verifies `leaf` again as BoringSSL set `ctx` up to verify it (trust store, parameters,
-/// verify callback and connection), with `untrusted` as the peer's chain. Returns whether it
-/// verified, the result, and the certificate an error concerns.
+/// The alert BoringSSL sends for a verification error it maps to `raw`.
+fn alert_of(raw: c_int) -> SslAlert {
+    [
+        (btls_sys::SSL_AD_BAD_CERTIFICATE, SslAlert::BAD_CERTIFICATE),
+        (
+            btls_sys::SSL_AD_CERTIFICATE_EXPIRED,
+            SslAlert::CERTIFICATE_EXPIRED,
+        ),
+        (
+            btls_sys::SSL_AD_CERTIFICATE_REVOKED,
+            SslAlert::CERTIFICATE_REVOKED,
+        ),
+        (
+            btls_sys::SSL_AD_CERTIFICATE_UNKNOWN,
+            SslAlert::CERTIFICATE_UNKNOWN,
+        ),
+        (btls_sys::SSL_AD_DECRYPT_ERROR, SslAlert::DECRYPT_ERROR),
+        (
+            btls_sys::SSL_AD_HANDSHAKE_FAILURE,
+            SslAlert::HANDSHAKE_FAILURE,
+        ),
+        (btls_sys::SSL_AD_UNKNOWN_CA, SslAlert::UNKNOWN_CA),
+        (
+            btls_sys::SSL_AD_UNSUPPORTED_CERTIFICATE,
+            SslAlert::UNSUPPORTED_CERTIFICATE,
+        ),
+    ]
+    .into_iter()
+    .find_map(|(code, alert)| (code as c_int == raw).then_some(alert))
+    .unwrap_or(SslAlert::INTERNAL_ERROR)
+}
+
+/// Verifies the peer certificate chain of `ssl` exactly as BoringSSL does for a client
+/// (`ssl_crypto_x509_session_verify_cert_chain`) — its context's trust store, the
+/// connection's verify parameters, ECH name override and verify callback — with
+/// `untrusted` added to the chain the peer sent. Returns whether it verified, the result,
+/// and the certificate an error concerns.
 #[allow(unsafe_code)]
-fn reverify(
-    ctx: &X509StoreContextRef,
-    leaf: &X509Ref,
+fn verify_chain(
+    ssl: &SslRef,
     untrusted: &[X509],
 ) -> Result<(bool, X509VerifyResult, Option<X509>), ErrorStack> {
+    let peer = ssl.peer_cert_chain();
+    let Some(leaf) = peer.and_then(|chain| chain.iter().next()) else {
+        // SAFETY: the code of an existing verification error.
+        let error = unsafe { X509VerifyError::from_raw(btls_sys::X509_V_ERR_UNSPECIFIED as c_int) };
+        return Ok((false, error, None));
+    };
     let mut chain = Stack::new()?;
-    for cert in untrusted {
-        chain.push(cert.clone())?;
+    for cert in peer
+        .into_iter()
+        .flatten()
+        .chain(untrusted.iter().map(|cert| &**cert))
+    {
+        chain.push(cert.to_owned())?;
     }
 
-    let original = ctx.as_ptr();
-    // SAFETY: BoringSSL initialized `ctx` with a live store for the verification running.
-    let store = unsafe { X509StoreRef::from_ptr(btls_sys::X509_STORE_CTX_get0_store(original)) };
-    X509StoreContext::new()?.init(store, leaf, &chain, |retry| {
-        let ptr = retry.as_ptr();
-        // SAFETY: both contexts are initialized; `retry` owns the parameters it is given
-        // before copying into them, and the connection outlives the verification.
+    X509StoreContext::new()?.init(ssl.ssl_context().cert_store(), leaf, &chain, |ctx| {
+        let ctx_ptr = ctx.as_ptr();
+        let ssl_ptr = ssl.as_ptr();
+        // SAFETY: `ctx` is initialized and `ssl` outlives the verification.
         unsafe {
-            let param = btls_sys::X509_VERIFY_PARAM_new();
-            if param.is_null() {
-                return Err(ErrorStack::get());
-            }
-            btls_sys::X509_STORE_CTX_set0_param(ptr, param);
-            let idx = btls_sys::SSL_get_ex_data_X509_STORE_CTX_idx();
-            let ssl = btls_sys::X509_STORE_CTX_get_ex_data(original, idx);
-            if btls_sys::X509_VERIFY_PARAM_set1(
-                param,
-                btls_sys::X509_STORE_CTX_get0_param(original),
+            let mut name = ptr::null();
+            let mut name_len = 0;
+            btls_sys::SSL_get0_ech_name_override(ssl_ptr, &mut name, &mut name_len);
+            let param = btls_sys::X509_STORE_CTX_get0_param(ctx_ptr);
+            if btls_sys::X509_STORE_CTX_set_ex_data(
+                ctx_ptr,
+                btls_sys::SSL_get_ex_data_X509_STORE_CTX_idx(),
+                ssl_ptr.cast(),
             ) == 0
-                || btls_sys::X509_STORE_CTX_set_ex_data(ptr, idx, ssl) == 0
+                || btls_sys::X509_STORE_CTX_set_default(ctx_ptr, c"ssl_server".as_ptr()) == 0
+                || btls_sys::X509_VERIFY_PARAM_set1(param, btls_sys::SSL_get0_param(ssl_ptr)) == 0
+                || (name_len != 0
+                    && btls_sys::X509_VERIFY_PARAM_set1_host(param, name, name_len) == 0)
             {
                 return Err(ErrorStack::get());
             }
-            if let Some(callback) = btls_sys::SSL_get_verify_callback(ssl.cast()) {
-                btls_sys::X509_STORE_CTX_set_verify_cb(ptr, Some(callback));
+            if let Some(callback) = btls_sys::SSL_get_verify_callback(ssl_ptr) {
+                btls_sys::X509_STORE_CTX_set_verify_cb(ctx_ptr, Some(callback));
             }
         }
-        let verified = retry.verify_cert()?;
+        let verified = ctx.verify_cert()?;
         Ok((
             verified,
-            retry.verify_result(),
-            retry.current_cert().map(ToOwned::to_owned),
+            ctx.verify_result(),
+            ctx.current_cert().map(ToOwned::to_owned),
         ))
     })
 }
@@ -293,50 +510,4 @@ fn pkcs7_certificates(der: &[u8]) -> Result<Vec<X509>, ErrorStack> {
         return Err(ErrorStack::get());
     }
     Ok(certs.into_iter().collect())
-}
-
-/// Runs `f`, which blocks, without stalling the other tasks of a multi-threaded tokio
-/// runtime it runs on.
-fn blocking<R>(f: impl FnOnce() -> R) -> R {
-    #[cfg(feature = "tokio-rt")]
-    if tokio::runtime::Handle::try_current()
-        .is_ok_and(|rt| rt.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread)
-    {
-        return tokio::task::block_in_place(f);
-    }
-    f()
-}
-
-/// The default fetcher: a plain HTTP GET of an `http://` URL.
-fn fetch(url: &str) -> io::Result<Vec<u8>> {
-    // Without a TLS provider, redirects to `https://` URLs fail too.
-    static AGENT: LazyLock<ureq::Agent> = LazyLock::new(|| {
-        ureq::Agent::config_builder()
-            .timeout_global(Some(FETCH_TIMEOUT))
-            .max_redirects(MAX_REDIRECTS)
-            .proxy(None)
-            .build()
-            .into()
-    });
-
-    if !url
-        .get(..7)
-        .is_some_and(|scheme| scheme.eq_ignore_ascii_case("http://"))
-    {
-        return Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "only http:// URLs are fetched",
-        ));
-    }
-    AGENT
-        .get(url)
-        .call()
-        .and_then(|mut response| {
-            response
-                .body_mut()
-                .with_config()
-                .limit(MAX_BODY)
-                .read_to_vec()
-        })
-        .map_err(io::Error::other)
 }

@@ -82,7 +82,7 @@ impl SslConnectorBuilderExt for SslConnectorBuilder {
     fn set_aia(mut self, aia: Option<&AiaCache>) -> SslConnectorBuilder {
         if let Some(aia) = aia {
             let aia = aia.clone();
-            self.set_cert_verify_callback(move |ctx| aia.verify(ctx));
+            self.set_custom_verify_callback(SslVerifyMode::PEER, move |ssl| aia.verify(ssl));
         }
 
         self

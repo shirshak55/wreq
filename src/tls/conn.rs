@@ -36,7 +36,7 @@ use crate::{
         AlpnProtocol, AlpsProtocol, KeyShare, TlsInfo, TlsOptions, TlsVersion,
         keylog::KeyLog,
         session::{Key, LruTlsSessionCache, TlsSession, TlsSessionCache},
-        trust::{AiaCache, CertStore, Identity},
+        trust::{AiaCache, AiaFetch, CertStore, Identity, aia},
     },
 };
 
@@ -372,7 +372,7 @@ impl TlsConnector {
         let (cfg, name, sni) =
             self.for_descriptor(self.configure(offer.as_deref())?, descriptor)?;
         let mut stream = SslStream::new(cfg.into_ssl(name)?, io)?;
-        if let Err(error) = Pin::new(&mut stream).connect().await {
+        if let Err(error) = aia::handshake(&mut stream).await {
             return Err(HandshakeFailure::new(error, stream.ssl()).into());
         }
         Ok(TlsStream {
@@ -824,12 +824,6 @@ impl QuicTlsConnectorBuilder {
         Self(self.0.session_store(store))
     }
 
-    /// Sets the cache of issuers fetched from caIssuers URLs to complete chains missing an
-    /// issuer (see [`AiaCache`]).
-    pub fn aia(self, aia: Option<AiaCache>) -> Self {
-        Self(self.0.aia(aia))
-    }
-
     /// Builds the connector, failing when BoringSSL can't write the ClientHello `opts`
     /// describe.
     pub fn build<'a, T>(&self, opts: T) -> crate::Result<QuicTlsConnector>
@@ -889,6 +883,9 @@ pub struct HandshakeFailure {
     version: &'static str,
     cipher: Option<&'static str>,
     alpn_protocol: Option<Bytes>,
+    group: Option<u16>,
+    hello_retry_request: bool,
+    aia_fetches: Vec<AiaFetch>,
 }
 
 impl HandshakeFailure {
@@ -902,8 +899,7 @@ impl HandshakeFailure {
                 u8::try_from(reason.checked_sub(btls_sys::SSL_AD_REASON_OFFSET)?).ok()
             })
         });
-        let verify_error = ssl
-            .verify_result()
+        let verify_error = aia::verify_result(ssl)
             .err()
             .map(|error| (error.as_raw(), error.error_string()));
         let peer_certificate_chain = ssl
@@ -922,6 +918,9 @@ impl HandshakeFailure {
                 .current_cipher()
                 .map(|cipher| cipher.standard_name().unwrap_or_else(|| cipher.name())),
             alpn_protocol: ssl.selected_alpn_protocol().map(Bytes::copy_from_slice),
+            group: ssl.curve(),
+            hello_retry_request: ssl.used_hello_retry_request(),
+            aia_fetches: aia::fetches(ssl),
         }
     }
 
@@ -955,6 +954,22 @@ impl HandshakeFailure {
     /// The protocol the peer selected through ALPN, if it got as far as selecting one.
     pub fn alpn_protocol(&self) -> Option<&[u8]> {
         self.alpn_protocol.as_deref()
+    }
+
+    /// The key exchange group the handshake got as far as negotiating, by its TLS id.
+    pub fn group(&self) -> Option<u16> {
+        self.group
+    }
+
+    /// Whether the server answered the first ClientHello with a HelloRetryRequest.
+    pub fn hello_retry_request(&self) -> bool {
+        self.hello_retry_request
+    }
+
+    /// The caIssuers URLs whose issuers the certificate verification needed (see
+    /// [`AiaCache`]), in the order it needed them.
+    pub fn aia_fetches(&self) -> &[AiaFetch] {
+        &self.aia_fetches
     }
 }
 
