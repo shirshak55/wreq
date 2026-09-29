@@ -169,11 +169,28 @@ impl From<Box<str>> for Group {
 /// requests of the scope it was opened for, and closes, idle or not, once every clone of
 /// the scope is dropped.
 #[derive(Clone)]
-pub struct ConnectionScope(Arc<(u64, watch::Sender<()>, Http2Controls)>);
+pub struct ConnectionScope(Arc<(u64, watch::Sender<()>, Arc<Connections>)>);
 
 /// The HTTP/2 connections open in a scope, each by an id, able to send frames of the
-/// caller's choosing.
-type Http2Controls = Arc<Mutex<Vec<(u64, Control)>>>;
+/// caller's choosing, and the first connection opened in it, once one is: the
+/// [`Control`] of an HTTP/2 one, `None` for an HTTP/1 one.
+#[derive(Default)]
+struct Connections {
+    http2: Mutex<Vec<(u64, Control)>>,
+    first: watch::Sender<Option<Option<Control>>>,
+}
+
+impl Connections {
+    fn opened(&self, control: Option<Control>) {
+        self.first.send_if_modified(|first| {
+            let none = first.is_none();
+            if none {
+                *first = Some(control);
+            }
+            none
+        });
+    }
+}
 
 impl ConnectionScope {
     /// Creates a scope no other scope's requests share connections with.
@@ -183,7 +200,7 @@ impl ConnectionScope {
         ConnectionScope(Arc::new((
             NEXT_ID.fetch_add(1, Ordering::Relaxed),
             closed,
-            Http2Controls::default(),
+            Arc::default(),
         )))
     }
 
@@ -191,22 +208,34 @@ impl ConnectionScope {
         ScopeRef {
             id: self.0.0,
             closed: self.0.1.subscribe(),
-            http2: self.0.2.clone(),
+            connections: self.0.2.clone(),
         }
+    }
+
+    /// The [`Control`] of the first connection opened in this scope, once one is; `None`
+    /// when that connection speaks HTTP/1 (no later HTTP/2 one is told).
+    pub async fn first_http2(&self) -> Option<Control> {
+        let mut first = self.0.2.first.subscribe();
+        first
+            .wait_for(Option::is_some)
+            .await
+            .expect("the scope holds the sender")
+            .clone()
+            .flatten()
     }
 
     /// Sends a SETTINGS frame of exactly `params`, `(identifier, value)` in order, on each
     /// HTTP/2 connection open in this scope, once the previous one it sent was
     /// acknowledged; the known parameters apply to it on the acknowledgement.
     pub fn send_http2_settings(&self, params: &[(u16, u32)]) {
-        for (_, control) in self.0.2.lock().iter() {
+        for (_, control) in self.0.2.http2.lock().iter() {
             control.send_settings(params.iter().copied());
         }
     }
 
     /// Sends a PING carrying `payload` on each HTTP/2 connection open in this scope.
     pub fn send_http2_ping(&self, payload: [u8; 8]) {
-        for (_, control) in self.0.2.lock().iter() {
+        for (_, control) in self.0.2.http2.lock().iter() {
             control.send_ping(payload);
         }
     }
@@ -216,7 +245,7 @@ impl ConnectionScope {
     /// bytes of received data were released since the last, rather than once half the
     /// window was (`None`).
     pub fn set_http2_window_update_thresholds(&self, connection: Option<u32>, stream: Option<u32>) {
-        for (_, control) in self.0.2.lock().iter() {
+        for (_, control) in self.0.2.http2.lock().iter() {
             control.set_window_update_thresholds(connection, stream);
         }
     }
@@ -240,32 +269,42 @@ impl std::fmt::Debug for ConnectionScope {
 pub(crate) struct ScopeRef {
     id: u64,
     closed: watch::Receiver<()>,
-    http2: Http2Controls,
+    connections: Arc<Connections>,
 }
 
 /// An HTTP/2 connection's place among its scope's, which it leaves when dropped.
 pub(crate) struct Http2Registration {
     id: u64,
-    controls: Http2Controls,
+    connections: Arc<Connections>,
 }
 
 impl Drop for Http2Registration {
     fn drop(&mut self) {
-        self.controls.lock().retain(|(id, _)| *id != self.id);
+        self.connections
+            .http2
+            .lock()
+            .retain(|(id, _)| *id != self.id);
     }
 }
 
 impl ScopeRef {
     /// Makes the scope's HTTP/2 frames go on the connection `control` sends on, until the
-    /// registration returned is dropped.
+    /// registration returned is dropped, and tells it as the scope's first connection
+    /// should it be.
     pub(crate) fn register_http2(&self, control: Control) -> Http2Registration {
         static NEXT_ID: AtomicU64 = AtomicU64::new(0);
         let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
-        self.http2.lock().push((id, control));
+        self.connections.http2.lock().push((id, control.clone()));
+        self.connections.opened(Some(control));
         Http2Registration {
             id,
-            controls: self.http2.clone(),
+            connections: self.connections.clone(),
         }
+    }
+
+    /// Tells an HTTP/1 connection opened as the scope's first connection, should it be.
+    pub(crate) fn opened_http1(&self) {
+        self.connections.opened(None);
     }
 
     /// Resolves once the scope is dropped.

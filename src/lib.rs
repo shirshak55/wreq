@@ -354,7 +354,7 @@ pub mod http2 {
         Priorities, PrioritiesBuilder, Priority, PseudoId, PseudoOrder, Setting, SettingId,
         SettingsOrder, SettingsOrderBuilder, StreamDependency, StreamId,
     };
-    pub use wreq_proto::http2::{Http2Options, Http2OptionsBuilder};
+    pub use wreq_proto::http2::{Control, Http2Options, Http2OptionsBuilder, LoggedFrame};
 }
 
 pub use http::{Method, StatusCode, Uri, Version};

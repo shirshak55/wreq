@@ -646,6 +646,9 @@ where
                                     trace!(
                                         "http1 handshake complete, spawning background dispatcher task"
                                     );
+                                    if let Some(scope) = &scope {
+                                        scope.opened_http1();
+                                    }
 
                                     // Create a oneshot channel to communicate errors from the connection task.
                                     // err_tx sends errors from the connection task, and err_rx receives them
