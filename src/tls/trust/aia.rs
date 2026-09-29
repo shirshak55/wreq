@@ -232,6 +232,8 @@ impl AiaCache {
                     && ssl.peer_application_settings().is_some()
                 {
                     state.alps_paused = true;
+                    // Reading the connection's TLS takes this state's lock again.
+                    drop(state);
                     gate.pause(crate::conn::tls_info_of(ssl));
                     return Err(SslVerifyError::Retry);
                 }
