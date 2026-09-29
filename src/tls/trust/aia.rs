@@ -356,11 +356,12 @@ where
                     }
                     None => {
                         let gate = alps_gate(stream.ssl());
+                        let waiting = state.is_some_and(|state| {
+                            let state = state.lock();
+                            state.alps_paused && state.alps_settings.is_none()
+                        });
                         match (state, gate) {
-                            (Some(state), Some(gate))
-                                if state.lock().alps_paused
-                                    && state.lock().alps_settings.is_none() =>
-                            {
+                            (Some(state), Some(gate)) if waiting => {
                                 let settings = gate.settings().await;
                                 state.lock().alps_settings = Some(settings);
                             }
