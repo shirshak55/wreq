@@ -32,6 +32,7 @@ pub struct TlsInfo {
     pub(crate) group: Option<u16>,
     pub(crate) hello_retry_request: bool,
     pub(crate) aia_fetches: Vec<trust::AiaFetch>,
+    pub(crate) peer_ocsp: Option<Bytes>,
 }
 
 /// The raw handshake messages an origin sent this connection (its server flight), in the
@@ -197,6 +198,12 @@ impl TlsInfo {
     /// order, as captured up to when this `TlsInfo` was taken. See [`ServerFlight`].
     pub fn server_flight(&self) -> Option<&ServerFlight> {
         self.server_flight.as_ref()
+    }
+
+    /// The DER OCSP response the origin stapled (its `CertificateStatus` / TLS 1.3
+    /// status_request), if it stapled one and this connection requested stapling.
+    pub fn peer_ocsp(&self) -> Option<&[u8]> {
+        self.peer_ocsp.as_deref()
     }
 
     /// An id for the TLS connection this response arrived on, the same for every response

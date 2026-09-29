@@ -33,6 +33,7 @@ fn extract_tls_info<S>(ssl_stream: &SslStream<S>) -> TlsInfo {
         group: ssl.curve(),
         hello_retry_request: ssl.used_hello_retry_request(),
         aia_fetches: crate::tls::trust::aia::fetches(ssl),
+        peer_ocsp: ssl.ocsp_status().map(Bytes::copy_from_slice),
         peer_certificate: ssl
             .peer_certificate()
             .and_then(|cert| cert.to_der().ok())
