@@ -24,6 +24,7 @@ where
 {
     let mut stream = SslStream::new(ssl, conn)?;
     crate::tls::trust::aia::handshake(&mut stream).await?;
+    super::forbid_http2_renegotiation(stream.ssl());
     Ok(MaybeHttpsStream::Https(stream))
 }
 

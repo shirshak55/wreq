@@ -133,6 +133,7 @@ pub struct HandshakeSettings {
     alps_use_new_codepoint: bool,
     key_shares: Option<Cow<'static, [KeyShare]>>,
     random_aes_hw_override: bool,
+    renegotiation: bool,
 }
 
 /// A Connector using BoringSSL to support `http` and `https` schemes.
@@ -290,6 +291,9 @@ impl TlsConnector {
         // Set ECH grease
         cfg.set_enable_ech_grease(self.settings.enable_ech_grease);
 
+        // Take the server's TLS 1.2 renegotiation when offering secure renegotiation
+        set_renegotiation(&cfg, self.settings.renegotiation);
+
         // Set random AES hardware override
         if self.settings.random_aes_hw_override {
             let random = (crate::util::fast_random() & 1) == 0;
@@ -401,6 +405,7 @@ impl TlsConnector {
         if let Err(error) = aia::handshake(&mut stream).await {
             return Err(HandshakeFailure::new(error, stream.ssl()).into());
         }
+        forbid_http2_renegotiation(stream.ssl());
         Ok(TlsStream {
             stream,
             name: Box::from(name),
@@ -709,6 +714,7 @@ impl TlsConnectorBuilder {
             enable_ech_grease: opts.enable_ech_grease,
             key_shares: opts.key_shares.clone(),
             random_aes_hw_override: opts.random_aes_hw_override,
+            renegotiation: opts.renegotiation || opts.renegotiation_scsv,
         };
 
         // If the session cache is disabled, we don't need to set up any callbacks.
@@ -738,6 +744,28 @@ impl TlsConnectorBuilder {
         };
         connector.check().map_err(Error::tls)?;
         Ok(connector)
+    }
+}
+
+/// Sets whether `ssl`, a client, takes the server's TLS 1.2 renegotiations, as browsers
+/// offering secure renegotiation do on HTTP/1, or refuses them (BoringSSL's default).
+#[allow(unsafe_code)]
+fn set_renegotiation(ssl: &SslRef, freely: bool) {
+    let mode = if freely {
+        btls_sys::ssl_renegotiate_mode_t::ssl_renegotiate_freely
+    } else {
+        btls_sys::ssl_renegotiate_mode_t::ssl_renegotiate_never
+    };
+    // SAFETY: `ssl` is a live `SSL`, and the mode is a setting it reads when the server
+    // starts a renegotiation.
+    unsafe { btls_sys::SSL_set_renegotiate_mode(foreign_types::ForeignTypeRef::as_ptr(ssl), mode) }
+}
+
+/// Refuses renegotiation on `ssl`, a connection whose handshake completed, once it speaks
+/// HTTP/2, which forbids it (RFC 9113 §9.2.1).
+pub(crate) fn forbid_http2_renegotiation(ssl: &SslRef) {
+    if ssl.selected_alpn_protocol() == Some(b"h2") {
+        set_renegotiation(ssl, false);
     }
 }
 

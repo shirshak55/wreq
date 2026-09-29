@@ -259,6 +259,25 @@ impl ConnectionScope {
         }
     }
 
+    /// Sends `priority`, a PRIORITY frame numbered as the connection requests were recorded
+    /// on numbered streams, on each HTTP/2 connection open in this scope, as it numbers them
+    /// (see [`Control::send_priority`]).
+    pub fn send_http2_priority(&self, priority: &http2::frame::Priority) {
+        for (_, control) in self.0.2.http2.lock().iter() {
+            control.send_priority(priority.clone());
+        }
+    }
+
+    /// Sends a PRIORITY_UPDATE frame (RFC 9218) giving `stream_id`, numbered as the
+    /// connection requests were recorded on numbered it, the priority `field_value` on each
+    /// HTTP/2 connection open in this scope, as it numbers it (see
+    /// [`Control::send_priority_update`]).
+    pub fn send_http2_priority_update(&self, stream_id: u32, field_value: &[u8]) {
+        for (_, control) in self.0.2.http2.lock().iter() {
+            control.send_priority_update(stream_id, field_value);
+        }
+    }
+
     /// Sets when each HTTP/2 connection open in this scope sends a WINDOW_UPDATE: once
     /// `connection`, for the connection, or `stream`, for the streams it opens from now on,
     /// bytes of received data were released since the last, rather than once half the
