@@ -57,6 +57,8 @@ impl_group_variants! {
     Proxy(Matcher),
     SocketBind(Option<SocketBindOptions>),
     ServerName(Option<Box<str>>),
+    VerifyName(Box<str>),
+    AcceptedCertificate([u8; 32]),
     Scope(ScopeRef),
 }
 
@@ -108,6 +110,23 @@ impl Group {
     #[inline]
     pub(crate) fn server_name(&mut self, name: Option<Box<str>>) -> &mut Self {
         self.extend(GroupKey::ServerName, GroupVariant::ServerName(name))
+    }
+
+    /// Groups the request by the name TLS verifies instead of its URI host while announcing
+    /// none.
+    #[inline]
+    pub(crate) fn verify_name(&mut self, name: Option<Box<str>>) -> &mut Self {
+        self.extend(GroupKey::VerifyName, name.map(GroupVariant::VerifyName))
+    }
+
+    /// Groups the request by the SHA-256 of the leaf certificate its TLS accepts even when
+    /// verification fails.
+    #[inline]
+    pub(crate) fn accepted_certificate(&mut self, leaf_sha256: Option<[u8; 32]>) -> &mut Self {
+        self.extend(
+            GroupKey::AcceptedCertificate,
+            leaf_sha256.map(GroupVariant::AcceptedCertificate),
+        )
     }
 
     /// Confines the request's connections to a [`ConnectionScope`].

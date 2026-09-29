@@ -808,13 +808,41 @@ impl RequestBuilder {
     }
 
     /// Sets the name the TLS handshake announces (SNI) and verifies the server certificate
-    /// against, instead of the URI host; `None` announces no name and verifies the URI host.
-    /// Connections announcing different names are never shared.
+    /// against, instead of the URI host; `None` announces no name and verifies the URI host
+    /// (or [`tls_verify_name`](Self::tls_verify_name)). Connections announcing different
+    /// names are never shared.
     pub fn tls_server_name(mut self, name: Option<&str>) -> RequestBuilder {
         if let Ok(ref mut req) = self.request {
             req.config_mut::<RequestOptions>()
                 .get_or_insert_default()
                 .tls_server_name = Some(name.map(Box::from));
+        }
+        self
+    }
+
+    /// Sets the name the TLS handshake verifies the server certificate against, instead of
+    /// the URI host, when it announces no name ([`tls_server_name(None)`](Self::tls_server_name)),
+    /// still announcing none. Connections verifying different names are never shared. It
+    /// has no effect otherwise.
+    pub fn tls_verify_name(mut self, name: &str) -> RequestBuilder {
+        if let Ok(ref mut req) = self.request {
+            req.config_mut::<RequestOptions>()
+                .get_or_insert_default()
+                .tls_verify_name = Some(Box::from(name));
+        }
+        self
+    }
+
+    /// Completes the TLS handshake of a new connection this request opens even when the
+    /// server certificate fails verification (an untrusted issuer, expiry, a name
+    /// mismatch, …), provided the SHA-256 of the leaf certificate's DER is `leaf_sha256`;
+    /// another leaf fails it as before. Connections accepting a certificate are shared only
+    /// with requests accepting the same one.
+    pub fn accept_certificate(mut self, leaf_sha256: [u8; 32]) -> RequestBuilder {
+        if let Ok(ref mut req) = self.request {
+            req.config_mut::<RequestOptions>()
+                .get_or_insert_default()
+                .accepted_certificate = Some(leaf_sha256);
         }
         self
     }

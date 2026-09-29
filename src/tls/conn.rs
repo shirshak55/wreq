@@ -17,6 +17,7 @@ use std::{
 use btls::{
     error::ErrorStack,
     ex_data::Index,
+    hash::MessageDigest,
     ssl::{
         ConnectConfiguration, HandshakeError, Ssl, SslConnector, SslMethod, SslOptions, SslRef,
         SslSessionCacheMode,
@@ -246,10 +247,11 @@ impl TlsConnector {
     }
 
     /// Whether `stream` can serve `descriptor`'s requests as the connection this connector
-    /// would open for it: opened by it, verifying and announcing the same name, and
-    /// speaking an HTTP version the request allows — HTTP/2 when its ALPN chose `h2` and
-    /// the request forces no version, HTTP/1 when it chose `http/1.1`, `http/1.0` or
-    /// nothing and the request doesn't force HTTP/2 or HTTP/3.
+    /// would open for it: opened by it, verifying and announcing the same name, accepting
+    /// the same leaf certificate should verification fail, and speaking an HTTP version the
+    /// request allows — HTTP/2 when its ALPN chose `h2` and the request forces no version,
+    /// HTTP/1 when it chose `http/1.1`, `http/1.0` or nothing and the request doesn't force
+    /// HTTP/2 or HTTP/3.
     #[cfg(feature = "tokio-rt")]
     pub(crate) fn opened_for<IO>(
         &self,
@@ -269,6 +271,7 @@ impl TlsConnector {
             std::ptr::eq(stream.stream.ssl().ssl_context(), self.ssl.context())
                 && *stream.name == *name
                 && stream.sni == (sni && self.settings.tls_sni)
+                && stream.accepted_certificate == descriptor.accepted_certificate()
                 && speaks,
         )
     }
@@ -325,8 +328,9 @@ impl TlsConnector {
     }
 
     /// `cfg` made to open `descriptor`'s connection: announcing its name unless it
-    /// announces none, and offering and keeping the session cached for its connections.
-    /// Returns the name it verifies and whether it announces it.
+    /// announces none, accepting the leaf certificate it pins should verification fail, and
+    /// offering and keeping the session cached for its connections. Returns the name it
+    /// verifies and whether it announces it.
     fn for_descriptor<'a>(
         &self,
         mut cfg: ConnectConfiguration,
@@ -335,6 +339,18 @@ impl TlsConnector {
         let (host, sni) = Self::verified_name(descriptor)?;
         if !sni {
             cfg.set_use_server_name_indication(false);
+        }
+
+        // Every verification failure, the name's included, goes through the callback.
+        if let Some(leaf_sha256) = descriptor.accepted_certificate() {
+            let mode = cfg.verify_mode();
+            cfg.set_verify_callback(mode, move |verified, ctx| {
+                verified
+                    || ctx
+                        .cert()
+                        .and_then(|leaf| leaf.digest(MessageDigest::sha256()).ok())
+                        .is_some_and(|digest| *digest == leaf_sha256)
+            });
         }
 
         if let Some(ref cache) = self.cache {
@@ -389,6 +405,7 @@ impl TlsConnector {
             stream,
             name: Box::from(name),
             sni: sni && self.settings.tls_sni,
+            accepted_certificate: descriptor.accepted_certificate(),
         })
     }
 
@@ -852,6 +869,9 @@ pub struct TlsStream<IO> {
     name: Box<str>,
     #[cfg_attr(not(feature = "tokio-rt"), allow(dead_code))]
     sni: bool,
+    /// The SHA-256 of the leaf certificate it accepts should verification fail.
+    #[cfg_attr(not(feature = "tokio-rt"), allow(dead_code))]
+    accepted_certificate: Option<[u8; 32]>,
 }
 
 impl<IO> TlsStream<IO> {

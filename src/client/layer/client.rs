@@ -210,6 +210,8 @@ where
                 http2_options,
                 socket_bind_options,
                 tls_server_name,
+                tls_verify_name,
+                accepted_certificate,
                 scope,
                 connect_to,
                 #[cfg(feature = "tokio-rt")]
@@ -224,16 +226,21 @@ where
             }
 
             // The name TLS verifies and whether it announces it: the request's own unless it
-            // names another, also on a connection opened to another authority.
+            // names another (only to verify, when it announces none), also on a connection
+            // opened to another authority.
             let host = uri.host().unwrap_or_default();
             let tls_name = match tls_server_name {
                 Some(Some(name)) => Some((name, true)),
-                Some(None) => Some((Box::from(host), false)),
+                Some(None) => {
+                    group.verify_name(tls_verify_name.clone());
+                    Some((tls_verify_name.unwrap_or_else(|| Box::from(host)), false))
+                }
                 None => connect_to.is_some().then(|| (Box::from(host), true)),
             };
             if let Some((name, sni)) = &tls_name {
                 group.server_name(sni.then(|| name.clone()));
             }
+            group.accepted_certificate(accepted_certificate);
             let uri = match connect_to {
                 Some(authority) => {
                     let mut parts = uri.into_parts();
@@ -252,7 +259,8 @@ where
                 tls_options,
                 socket_bind_options,
             )
-            .with_tls_name(tls_name);
+            .with_tls_name(tls_name)
+            .with_accepted_certificate(accepted_certificate);
             #[cfg(feature = "tokio-rt")]
             let descriptor = descriptor.with_preconnected(preconnected);
             descriptor

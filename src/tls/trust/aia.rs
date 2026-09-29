@@ -225,7 +225,8 @@ impl AiaCache {
         }
 
         match result {
-            Ok(()) if verified => {
+            // The verify callback may accept a chain despite an error.
+            _ if verified => {
                 state.error = None;
                 if let Some(gate) = alps_gate(ssl)
                     && !state.alps_paused

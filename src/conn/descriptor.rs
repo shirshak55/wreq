@@ -41,6 +41,7 @@ pub(crate) struct ConnectionDescriptor {
     socket_bind: Option<SocketBindOptions>,
     scope: Option<ScopeRef>,
     tls_name: Option<(Box<str>, bool)>,
+    accepted_certificate: Option<[u8; 32]>,
     #[cfg(feature = "tokio-rt")]
     preconnected: Option<Preconnected>,
     connection_id: ConnectionId,
@@ -136,6 +137,7 @@ impl ConnectionDescriptor {
             socket_bind,
             scope,
             tls_name: None,
+            accepted_certificate: None,
             #[cfg(feature = "tokio-rt")]
             preconnected: None,
             connection_id,
@@ -148,6 +150,13 @@ impl ConnectionDescriptor {
     /// announces it (SNI).
     pub(crate) fn with_tls_name(mut self, tls_name: Option<(Box<str>, bool)>) -> Self {
         self.tls_name = tls_name;
+        self
+    }
+
+    /// Sets the SHA-256 of the leaf certificate (its DER) the TLS handshake accepts even
+    /// when verification fails.
+    pub(crate) fn with_accepted_certificate(mut self, leaf_sha256: Option<[u8; 32]>) -> Self {
+        self.accepted_certificate = leaf_sha256;
         self
     }
 
@@ -197,17 +206,26 @@ impl ConnectionDescriptor {
         self.tls_name.as_ref().map(|(name, sni)| (&**name, *sni))
     }
 
+    /// Returns the SHA-256 of the leaf certificate the TLS handshake accepts even when
+    /// verification fails, if set.
+    #[inline]
+    pub(crate) fn accepted_certificate(&self) -> Option<[u8; 32]> {
+        self.accepted_certificate
+    }
+
     /// Returns a reference to the [`Uri`].
     #[inline]
     pub(crate) fn uri(&self) -> &Uri {
         &self.uri
     }
 
-    /// Opens the connection to `uri` itself (a proxy), whose TLS then names its host.
+    /// Opens the connection to `uri` itself (a proxy), whose TLS then names its host and
+    /// accepts no certificate failing verification.
     #[inline]
     pub(crate) fn set_uri(&mut self, uri: Uri) {
         self.uri = uri;
         self.tls_name = None;
+        self.accepted_certificate = None;
     }
 
     /// Return the negotiated HTTP version, if any.

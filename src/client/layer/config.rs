@@ -38,6 +38,8 @@ pub(crate) struct RequestOptions {
     pub http2_options: Option<Http2Options>,
     pub socket_bind_options: Option<SocketBindOptions>,
     pub tls_server_name: Option<Option<Box<str>>>,
+    pub tls_verify_name: Option<Box<str>>,
+    pub accepted_certificate: Option<[u8; 32]>,
     pub scope: Option<ScopeRef>,
     pub connect_to: Option<Authority>,
     #[cfg(feature = "tokio-rt")]
