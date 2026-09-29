@@ -53,9 +53,11 @@ pub(crate) fn client_hello_index() -> Result<Index<Ssl, bytes::Bytes>, ErrorStac
 }
 
 /// Where each connection keeps the origin's server-flight handshake messages, in the
-/// order received (see [`record_handshake_message`] and [`crate::tls::ServerFlight`]).
-pub(crate) fn server_flight_index() -> Result<Index<Ssl, Vec<bytes::Bytes>>, ErrorStack> {
-    static IDX: LazyLock<Result<Index<Ssl, Vec<bytes::Bytes>>, ErrorStack>> =
+/// order received (see [`record_handshake_message`] and [`crate::tls::ServerFlight`]),
+/// shared with every [`crate::tls::TlsInfo`] taken of it, which reads it live: the
+/// NewSessionTickets arrive after the handshake, once the connection is in use.
+pub(crate) fn server_flight_index() -> Result<Index<Ssl, SharedFlight>, ErrorStack> {
+    static IDX: LazyLock<Result<Index<Ssl, SharedFlight>, ErrorStack>> =
         LazyLock::new(Ssl::new_ex_index);
     IDX.clone()
 }
@@ -108,12 +110,15 @@ unsafe extern "C" fn record_handshake_message(
         return;
     };
     let record = bytes::Bytes::copy_from_slice(message);
-    if let Some(flight) = ssl.ex_data_mut(index) {
-        flight.push(record);
+    if let Some(flight) = ssl.ex_data(index) {
+        flight.lock().push(record);
     } else {
-        ssl.set_ex_data(index, vec![record]);
+        ssl.set_ex_data(index, Arc::new(crate::sync::Mutex::new(vec![record])));
     }
 }
+
+/// A connection's server flight so far, shared with the `TlsInfo`s taken of it.
+pub(crate) type SharedFlight = Arc<crate::sync::Mutex<Vec<bytes::Bytes>>>;
 
 /// Settings for [`TlsConnector`]
 #[derive(Clone)]
@@ -931,7 +936,7 @@ impl HandshakeFailure {
             server_flight: server_flight_index()
                 .ok()
                 .and_then(|index| ssl.ex_data(index))
-                .map(|messages| crate::tls::ServerFlight::from(messages.clone())),
+                .map(|messages| crate::tls::ServerFlight::from(messages.lock().clone())),
             peer_ocsp: ssl.ocsp_status().map(Bytes::copy_from_slice),
         }
     }

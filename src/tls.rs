@@ -28,7 +28,7 @@ pub struct TlsInfo {
     pub(crate) alpn_protocol: Option<Bytes>,
     pub(crate) connection: std::sync::Arc<TlsConnectionUse>,
     pub(crate) client_hello: Option<Bytes>,
-    pub(crate) server_flight: Option<ServerFlight>,
+    pub(crate) server_flight: Option<conn::SharedFlight>,
     pub(crate) group: Option<u16>,
     pub(crate) hello_retry_request: bool,
     pub(crate) aia_fetches: Vec<trust::AiaFetch>,
@@ -258,9 +258,12 @@ impl TlsInfo {
     }
 
     /// The origin's server flight: the raw handshake messages it sent this connection, in
-    /// order, as captured up to when this `TlsInfo` was taken. See [`ServerFlight`].
-    pub fn server_flight(&self) -> Option<&ServerFlight> {
-        self.server_flight.as_ref()
+    /// order, as captured so far — the NewSessionTickets arrive after the handshake, once
+    /// the connection is read. See [`ServerFlight`].
+    pub fn server_flight(&self) -> Option<ServerFlight> {
+        self.server_flight
+            .as_ref()
+            .map(|messages| ServerFlight::from(messages.lock().clone()))
     }
 
     /// The DER OCSP response the origin stapled (its `CertificateStatus` / TLS 1.3

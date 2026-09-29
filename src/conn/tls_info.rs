@@ -33,7 +33,7 @@ pub(crate) fn tls_info_of(ssl: &btls::ssl::SslRef) -> TlsInfo {
         server_flight: crate::tls::conn::server_flight_index()
             .ok()
             .and_then(|index| ssl.ex_data(index))
-            .map(|messages| crate::tls::ServerFlight::from(messages.clone())),
+            .cloned(),
         group: ssl.curve(),
         hello_retry_request: ssl.used_hello_retry_request(),
         aia_fetches: crate::tls::trust::aia::fetches(ssl),
