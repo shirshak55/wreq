@@ -574,6 +574,15 @@ impl RequestBuilder {
         self
     }
 
+    /// Makes a connection [`Self::tls_connect`] opens wait on `gate` for the application
+    /// settings (ALPS) it sends (see [`AlpsGate`](crate::tls::AlpsGate)).
+    pub fn alps_gate(mut self, gate: crate::tls::AlpsGate) -> RequestBuilder {
+        if let Ok(ref mut req) = self.request {
+            req.extensions_mut().insert(gate);
+        }
+        self
+    }
+
     /// Set the redirect policy for this request.
     pub fn redirect(mut self, policy: redirect::Policy) -> RequestBuilder {
         if let Ok(ref mut req) = self.request {

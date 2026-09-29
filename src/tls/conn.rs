@@ -362,6 +362,7 @@ impl TlsConnector {
         io: IO,
         descriptor: &ConnectionDescriptor,
         alpn: bool,
+        gate: Option<crate::tls::AlpsGate>,
     ) -> Result<TlsStream<IO>, BoxError>
     where
         IO: AsyncRead + AsyncWrite + Unpin,
@@ -371,7 +372,11 @@ impl TlsConnector {
             .flatten();
         let (cfg, name, sni) =
             self.for_descriptor(self.configure(offer.as_deref())?, descriptor)?;
-        let mut stream = SslStream::new(cfg.into_ssl(name)?, io)?;
+        let mut ssl = cfg.into_ssl(name)?;
+        if let Some(gate) = gate {
+            aia::set_alps_gate(&mut ssl, gate)?;
+        }
+        let mut stream = SslStream::new(ssl, io)?;
         if let Err(error) = aia::handshake(&mut stream).await {
             return Err(HandshakeFailure::new(error, stream.ssl()).into());
         }

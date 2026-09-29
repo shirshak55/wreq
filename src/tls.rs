@@ -55,6 +55,69 @@ pub struct ServerFlight {
     messages: Vec<Bytes>,
 }
 
+/// Lets a client connection's handshake wait, once the server's flight is in and its
+/// certificate verified, for the application settings (ALPS) it sends: a proxy learning
+/// them from its own client mid-handshake supplies them then (see
+/// [`RequestBuilder::alps_gate`](crate::RequestBuilder::alps_gate)). The handshake pauses
+/// only when the server negotiated ALPS; [`AlpsGate::paused`] resolves with what the
+/// server sent so far when it does.
+#[derive(Clone, Debug)]
+pub struct AlpsGate {
+    paused: tokio::sync::watch::Sender<Option<TlsInfo>>,
+    settings: tokio::sync::watch::Sender<Option<Option<Vec<u8>>>>,
+}
+
+impl Default for AlpsGate {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl AlpsGate {
+    /// A gate no handshake has paused on yet.
+    pub fn new() -> Self {
+        Self {
+            paused: tokio::sync::watch::Sender::new(None),
+            settings: tokio::sync::watch::Sender::new(None),
+        }
+    }
+
+    /// Resolves once the handshake pauses, with the server's flight so far.
+    pub async fn paused(&self) -> TlsInfo {
+        let mut paused = self.paused.subscribe();
+        loop {
+            if let Some(info) = paused.borrow_and_update().clone() {
+                return info;
+            }
+            if paused.changed().await.is_err() {
+                std::future::pending::<()>().await;
+            }
+        }
+    }
+
+    /// Supplies the settings the connection sends (none: the ones it was configured
+    /// with), resuming its handshake.
+    pub fn supply(&self, settings: Option<Vec<u8>>) {
+        self.settings.send_replace(Some(settings));
+    }
+
+    pub(crate) fn pause(&self, info: TlsInfo) {
+        self.paused.send_replace(Some(info));
+    }
+
+    pub(crate) async fn settings(&self) -> Option<Vec<u8>> {
+        let mut settings = self.settings.subscribe();
+        loop {
+            if let Some(settings) = settings.borrow_and_update().clone() {
+                return settings;
+            }
+            if settings.changed().await.is_err() {
+                return None;
+            }
+        }
+    }
+}
+
 /// A TLS handshake message type this crate names for callers reading a [`ServerFlight`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]

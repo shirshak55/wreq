@@ -14,7 +14,11 @@ pub trait TlsInfoFactory {
 }
 
 fn extract_tls_info<S>(ssl_stream: &SslStream<S>) -> TlsInfo {
-    let ssl = ssl_stream.ssl();
+    tls_info_of(ssl_stream.ssl())
+}
+
+/// The TLS `ssl` negotiated so far.
+pub(crate) fn tls_info_of(ssl: &btls::ssl::SslRef) -> TlsInfo {
     TlsInfo {
         version: ssl.version_str(),
         cipher: ssl

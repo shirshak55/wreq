@@ -25,6 +25,7 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use tokio_btls::SslStream;
 
 use crate::sync::Mutex;
+use crate::tls::AlpsGate;
 
 /// How many missing issuers one verification fetches, one chain level each.
 const MAX_LEVELS: usize = 3;
@@ -118,6 +119,27 @@ struct State {
     pending: Option<Fetching>,
     /// Why its last verification failed.
     error: Option<X509VerifyError>,
+    /// Whether the handshake paused for its ALPS gate, and the settings the gate
+    /// supplied, to send once the verification is retried.
+    alps_paused: bool,
+    alps_settings: Option<Option<Vec<u8>>>,
+}
+
+fn gate_index() -> Result<Index<Ssl, AlpsGate>, ErrorStack> {
+    static IDX: LazyLock<Result<Index<Ssl, AlpsGate>, ErrorStack>> =
+        LazyLock::new(Ssl::new_ex_index);
+    IDX.clone()
+}
+
+/// Makes `ssl`'s handshake wait on `gate` for its application settings (see
+/// [`AlpsGate`]).
+pub(crate) fn set_alps_gate(ssl: &mut Ssl, gate: AlpsGate) -> Result<(), ErrorStack> {
+    ssl.set_ex_data(gate_index()?, gate);
+    Ok(())
+}
+
+fn alps_gate(ssl: &SslRef) -> Option<&AlpsGate> {
+    gate_index().ok().and_then(|index| ssl.ex_data(index))
 }
 
 fn state_index() -> Result<Index<Ssl, Mutex<State>>, ErrorStack> {
@@ -156,6 +178,15 @@ impl AiaCache {
         let index = state_index().map_err(|_| SslVerifyError::Invalid(SslAlert::INTERNAL_ERROR))?;
         if ssl.ex_data(index).is_none() {
             ssl.set_ex_data(index, Mutex::new(State::default()));
+        }
+        // The settings the ALPS gate supplied while the verification waited (see
+        // [`handshake`]) go on the connection before this retry finishes it.
+        let supplied = ssl
+            .ex_data(index)
+            .and_then(|state| state.lock().alps_settings.take());
+        if let Some(Some(settings)) = supplied {
+            // Failing here means the server negotiated no ALPS after all.
+            let _ = ssl.set_pending_application_settings(&settings);
         }
         let ssl: &SslRef = ssl;
         let Some(state) = ssl.ex_data(index) else {
@@ -196,6 +227,14 @@ impl AiaCache {
         match result {
             Ok(()) if verified => {
                 state.error = None;
+                if let Some(gate) = alps_gate(ssl)
+                    && !state.alps_paused
+                    && ssl.peer_application_settings().is_some()
+                {
+                    state.alps_paused = true;
+                    gate.pause(crate::conn::tls_info_of(ssl));
+                    return Err(SslVerifyError::Retry);
+                }
                 Ok(())
             }
             result => {
@@ -307,15 +346,27 @@ where
     loop {
         match Pin::new(&mut *stream).connect().await {
             Err(error) if error.code() == btls::ssl::ErrorCode::WANT_CERTIFICATE_VERIFY => {
-                let pending = state_index()
+                let state = state_index()
                     .ok()
-                    .and_then(|index| stream.ssl().ex_data(index))
-                    .and_then(|state| state.lock().pending.take());
+                    .and_then(|index| stream.ssl().ex_data(index));
+                let pending = state.and_then(|state| state.lock().pending.take());
                 match pending {
                     Some(fetch) => {
                         let _ = fetch.await;
                     }
-                    None => return Err(error),
+                    None => {
+                        let gate = alps_gate(stream.ssl());
+                        match (state, gate) {
+                            (Some(state), Some(gate))
+                                if state.lock().alps_paused
+                                    && state.lock().alps_settings.is_none() =>
+                            {
+                                let settings = gate.settings().await;
+                                state.lock().alps_settings = Some(settings);
+                            }
+                            _ => return Err(error),
+                        }
+                    }
                 }
             }
             result => return result,

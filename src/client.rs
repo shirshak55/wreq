@@ -458,6 +458,7 @@ impl Client {
     where
         IO: AsyncRead + AsyncWrite + Unpin,
     {
+        let gate = request.extensions().get::<crate::tls::AlpsGate>().cloned();
         let descriptor = self
             .1
             .http
@@ -470,7 +471,7 @@ impl Client {
         }
         self.1
             .tls
-            .connect(io, &descriptor, alpn)
+            .connect(io, &descriptor, alpn, gate)
             .await
             .map_err(Error::tls)
     }
