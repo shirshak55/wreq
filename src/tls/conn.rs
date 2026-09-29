@@ -886,6 +886,8 @@ pub struct HandshakeFailure {
     group: Option<u16>,
     hello_retry_request: bool,
     aia_fetches: Vec<AiaFetch>,
+    server_flight: Option<crate::tls::ServerFlight>,
+    peer_ocsp: Option<Bytes>,
 }
 
 impl HandshakeFailure {
@@ -921,6 +923,11 @@ impl HandshakeFailure {
             group: ssl.curve(),
             hello_retry_request: ssl.used_hello_retry_request(),
             aia_fetches: aia::fetches(ssl),
+            server_flight: server_flight_index()
+                .ok()
+                .and_then(|index| ssl.ex_data(index))
+                .map(|messages| crate::tls::ServerFlight::from(messages.clone())),
+            peer_ocsp: ssl.ocsp_status().map(Bytes::copy_from_slice),
         }
     }
 
@@ -964,6 +971,16 @@ impl HandshakeFailure {
     /// Whether the server answered the first ClientHello with a HelloRetryRequest.
     pub fn hello_retry_request(&self) -> bool {
         self.hello_retry_request
+    }
+
+    /// The origin's server flight as far as it got (see [`crate::tls::ServerFlight`]).
+    pub fn server_flight(&self) -> Option<&crate::tls::ServerFlight> {
+        self.server_flight.as_ref()
+    }
+
+    /// The DER OCSP response the origin stapled, if it did and stapling was requested.
+    pub fn peer_ocsp(&self) -> Option<&[u8]> {
+        self.peer_ocsp.as_deref()
     }
 
     /// The caIssuers URLs whose issuers the certificate verification needed (see
