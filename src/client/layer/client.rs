@@ -29,7 +29,7 @@ use wreq_proto::{
     conn::{self, TrySendError as ConnTrySendError},
     http1::Http1Options,
     http2::Http2Options,
-    rt::Executor as _,
+    rt::{Executor as _, Timer as _},
 };
 #[cfg(feature = "cookies")]
 use {
@@ -64,6 +64,7 @@ pub(crate) struct HttpClient<C, B> {
     config: Config,
     connector: C,
     exec: Executor,
+    timer: Timer,
     h1_builder: conn::http1::Builder,
     h2_builder: conn::http2::Builder<Executor>,
     pool: pool::Pool<PoolClient<B>, ConnectionId>,
@@ -571,6 +572,7 @@ where
     + Unpin
     + 'static {
         let executor = self.exec.clone();
+        let timer = self.timer.clone();
         let pool = self.pool.clone();
 
         let h1_builder = self.h1_builder.clone();
@@ -641,6 +643,7 @@ where
                                         scope,
                                         dropped,
                                         true,
+                                        timer,
                                     ));
 
                                     // Wait for 'conn' to ready up before we
@@ -687,6 +690,7 @@ where
                                         scope,
                                         dropped,
                                         false,
+                                        timer,
                                     ));
 
                                     // Log that the client is waiting for the connection to be ready.
@@ -786,6 +790,7 @@ impl<C: Clone, B> Clone for HttpClient<C, B> {
         HttpClient {
             config: self.config,
             exec: self.exec.clone(),
+            timer: self.timer.clone(),
             h1_builder: self.h1_builder.clone(),
             h2_builder: self.h2_builder.clone(),
             connector: self.connector.clone(),
@@ -1052,6 +1057,7 @@ impl Builder {
         HttpClient {
             config: self.config,
             exec: exec.clone(),
+            timer: timer.clone(),
             connector,
             h1_builder: self.h1_builder,
             h2_builder: self.h2_builder,
@@ -1140,15 +1146,19 @@ impl Error {
     }
 }
 
+/// How long an HTTP/1 connection whose scope ended gets to close its transport.
+const SCOPED_CLOSE_TIMEOUT: Duration = Duration::from_secs(1);
+
 /// Drives a connection until it ends or, for a scoped connection, its scope does. An HTTP/1
 /// connection whose scope ends gracefully (see [`ConnectionEnd`]) then closes its transport,
-/// back once the connection dropped it (`dropped`), as a client done with it does; an HTTP/2
-/// one (`http2`) closes so itself.
+/// back once the connection dropped it (`dropped`), as a client done with it does, within
+/// [`SCOPED_CLOSE_TIMEOUT`] by `timer`; an HTTP/2 one (`http2`) closes so itself.
 async fn scoped<T: AsyncWrite + Unpin>(
     conn: impl Future<Output = ()>,
     scope: Option<ScopeRef>,
     dropped: tokio::sync::oneshot::Receiver<T>,
     http2: bool,
+    timer: Timer,
 ) {
     let Some(scope) = scope else {
         return conn.await;
@@ -1163,10 +1173,14 @@ async fn scoped<T: AsyncWrite + Unpin>(
     if http2 || scope.end() != ConnectionEnd::Graceful {
         return;
     }
-    if let Ok(mut io) = dropped.await
-        && let Err(_e) = io.shutdown().await
-    {
-        debug!("closing a scoped connection failed: {}", _e);
+    let Ok(mut io) = dropped.await else {
+        return;
+    };
+    let shutdown = std::pin::pin!(io.shutdown());
+    match future::select(shutdown, timer.sleep(SCOPED_CLOSE_TIMEOUT)).await {
+        Either::Left((Ok(()), _)) => {}
+        Either::Left((Err(_e), _)) => debug!("closing a scoped connection failed: {}", _e),
+        Either::Right(_) => debug!("closing a scoped connection timed out"),
     }
 }
 
