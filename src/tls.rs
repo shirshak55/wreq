@@ -638,6 +638,12 @@ pub struct TlsOptions {
     /// **Default:** `None`
     pub session_id_length: Option<u8>,
 
+    /// The record version of the handshake records carrying the ClientHello (those written
+    /// before the server's first byte), rather than BoringSSL's TLS 1.0 (`0x0301`).
+    ///
+    /// **Default:** `None`
+    pub hello_record_version: Option<u16>,
+
     /// The length of the random payload of the GREASE ECH extension (see
     /// [`TlsOptions::enable_ech_grease`]), at least 1 byte. `None` picks a random multiple of
     /// 32 bytes from 128 to 224 plus the 16-byte AEAD tag.
@@ -980,6 +986,16 @@ impl TlsOptionsBuilder {
         self
     }
 
+    /// Sets the record version of the records carrying the ClientHello.
+    #[inline]
+    pub fn hello_record_version<T>(mut self, version: T) -> Self
+    where
+        T: Into<Option<u16>>,
+    {
+        self.config.hello_record_version = version.into();
+        self
+    }
+
     /// Sets the length of the GREASE ECH extension's random payload.
     #[inline]
     pub fn ech_grease_payload_length<T>(mut self, len: T) -> Self
@@ -1093,6 +1109,7 @@ impl Default for TlsOptions {
             renegotiation_scsv: false,
             trust_anchors: None,
             session_id_length: None,
+            hello_record_version: None,
             ech_grease_payload_length: None,
             ech_grease_cipher_suite: None,
             aes_hw_override: None,

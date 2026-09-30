@@ -134,6 +134,7 @@ pub struct HandshakeSettings {
     key_shares: Option<Cow<'static, [KeyShare]>>,
     random_aes_hw_override: bool,
     renegotiation: bool,
+    hello_record_version: Option<u16>,
 }
 
 /// A Connector using BoringSSL to support `http` and `https` schemes.
@@ -401,6 +402,7 @@ impl TlsConnector {
         if let Some(gate) = gate {
             aia::set_alps_gate(&mut ssl, gate)?;
         }
+        let io = HelloRecords::new(io, self.settings.hello_record_version);
         let mut stream = SslStream::new(ssl, io)?;
         if let Err(error) = aia::handshake(&mut stream).await {
             return Err(HandshakeFailure::new(error, stream.ssl()).into());
@@ -752,6 +754,7 @@ impl TlsConnectorBuilder {
             key_shares: opts.key_shares.clone(),
             random_aes_hw_override: opts.random_aes_hw_override,
             renegotiation: opts.renegotiation || opts.renegotiation_scsv,
+            hello_record_version: opts.hello_record_version,
         };
 
         // If the session cache is disabled, we don't need to set up any callbacks.
@@ -929,7 +932,7 @@ impl QuicTlsConnectorBuilder {
 /// A TLS connection a client opened over a caller's stream (see
 /// [`Client::tls_connect`](crate::Client::tls_connect)).
 pub struct TlsStream<IO> {
-    pub(crate) stream: SslStream<IO>,
+    pub(crate) stream: SslStream<HelloRecords<IO>>,
     /// The name it verified, and whether it announced it.
     name: Box<str>,
     #[cfg_attr(not(feature = "tokio-rt"), allow(dead_code))]
@@ -947,7 +950,7 @@ impl<IO> TlsStream<IO> {
 
     /// The stream the connection runs over.
     pub fn get_ref(&self) -> &IO {
-        self.stream.get_ref()
+        &self.stream.get_ref().io
     }
 }
 
@@ -1111,7 +1114,7 @@ impl std::error::Error for HandshakeFailure {
 impl<IO: fmt::Debug> fmt::Debug for TlsStream<IO> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("TlsStream")
-            .field("stream", self.stream.get_ref())
+            .field("stream", self.get_ref())
             .field("name", &self.name)
             .finish()
     }
@@ -1146,6 +1149,111 @@ impl<IO: AsyncRead + AsyncWrite + Unpin> AsyncWrite for TlsStream<IO> {
     #[inline]
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         Pin::new(&mut self.stream).poll_shutdown(cx)
+    }
+}
+
+/// The stream a TLS connection runs over, writing the records it sends before the
+/// server's first byte (its ClientHello) with `version` as their record version, rather
+/// than the TLS 1.0 BoringSSL writes them with.
+pub struct HelloRecords<IO> {
+    io: IO,
+    version: Option<[u8; 2]>,
+    framing: Framing,
+}
+
+/// Where the next byte written falls: in a record's header (of a `kind` record), or
+/// `fragment` bytes of its fragment before the next header.
+#[derive(Clone, Copy, Default)]
+struct Framing {
+    header: usize,
+    kind: u8,
+    length: u8,
+    fragment: usize,
+}
+
+impl Framing {
+    /// Sets the record version of every handshake record's header in `bytes`, the next
+    /// ones written.
+    fn frame(&mut self, version: [u8; 2], bytes: &mut [u8]) {
+        let mut at = 0;
+        while at < bytes.len() {
+            if self.fragment > 0 {
+                let skipped = self.fragment.min(bytes.len() - at);
+                self.fragment -= skipped;
+                at += skipped;
+                continue;
+            }
+            match self.header {
+                0 => self.kind = bytes[at],
+                1 | 2 if self.kind == 0x16 => bytes[at] = version[self.header - 1],
+                3 => self.length = bytes[at],
+                4 => self.fragment = usize::from(u16::from_be_bytes([self.length, bytes[at]])),
+                _ => {}
+            }
+            self.header = (self.header + 1) % 5;
+            at += 1;
+        }
+    }
+}
+
+impl<IO> HelloRecords<IO> {
+    fn new(io: IO, version: Option<u16>) -> Self {
+        Self {
+            io,
+            version: version.map(u16::to_be_bytes),
+            framing: Framing::default(),
+        }
+    }
+}
+
+impl<IO: Connection> Connection for HelloRecords<IO> {
+    fn connected(&self) -> Connected {
+        self.io.connected()
+    }
+
+    fn socket(&self) -> Option<socket2::SockRef<'_>> {
+        self.io.socket()
+    }
+}
+
+impl<IO: AsyncRead + Unpin> AsyncRead for HelloRecords<IO> {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        let filled = buf.filled().len();
+        let read = Pin::new(&mut self.io).poll_read(cx, buf);
+        if buf.filled().len() > filled {
+            self.version = None;
+        }
+        read
+    }
+}
+
+impl<IO: AsyncWrite + Unpin> AsyncWrite for HelloRecords<IO> {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        let Some(version) = self.version else {
+            return Pin::new(&mut self.io).poll_write(cx, buf);
+        };
+        let mut framed = buf.to_vec();
+        let mut ahead = self.framing;
+        ahead.frame(version, &mut framed);
+        let written = std::task::ready!(Pin::new(&mut self.io).poll_write(cx, &framed))?;
+        self.framing.frame(version, &mut framed[..written]);
+        Poll::Ready(Ok(written))
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.io).poll_flush(cx)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.io).poll_shutdown(cx)
     }
 }
 
@@ -1199,7 +1307,7 @@ pub enum MaybeHttpsStream<T> {
     /// A raw HTTP stream.
     Http(T),
     /// An SSL-wrapped HTTP stream.
-    Https(SslStream<T>),
+    Https(SslStream<HelloRecords<T>>),
 }
 
 /// A connection that has been established with a TLS handshake.
@@ -1215,7 +1323,7 @@ impl<T> AsRef<T> for MaybeHttpsStream<T> {
     fn as_ref(&self) -> &T {
         match self {
             MaybeHttpsStream::Http(s) => s,
-            MaybeHttpsStream::Https(s) => s.get_ref(),
+            MaybeHttpsStream::Https(s) => &s.get_ref().io,
         }
     }
 }
