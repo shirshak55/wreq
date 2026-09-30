@@ -556,11 +556,63 @@ pub struct TlsOptions {
     /// Whether [`Self::extension_permutation`] is the ClientHello's whole extension list: the
     /// listed extensions are sent in that order, each when its configuration calls for it, and
     /// no others. A GREASE value places a GREASE extension, [`ExtensionType::PADDING`] a padding
-    /// extension of [`Self::padding_length`] bytes, and [`ExtensionType::ENCRYPT_THEN_MAC`] an
-    /// encrypt_then_mac extension when no CBC cipher suite is offered.
+    /// extension of [`Self::padding_length`] bytes, [`ExtensionType::SIGNATURE_ALGORITHMS_CERT`]
+    /// the [`Self::offered_sigalgs_cert`] list if set, and [`ExtensionType::ENCRYPT_THEN_MAC`] an
+    /// encrypt_then_mac extension, which BoringSSL does not implement: a server accepting it for
+    /// a CBC cipher suite is an offer-only selection (see [`Self::offered_cipher_suites`]).
     ///
     /// **Default:** `false`
     pub strict_extension_order: bool,
+
+    /// The cipher suite list the initial ClientHello writes, verbatim and in order, each GREASE
+    /// value standing for the connection's GREASE value. It may offer suites BoringSSL does not
+    /// implement or [`Self::cipher_list`] does not enable: only the enabled ones it offers are
+    /// negotiated, and a server selecting another fails the handshake as an offer-only
+    /// selection (see [`HandshakeFailure::offer_only_selection`]). The `offered_*` lists below
+    /// work alike.
+    ///
+    /// **Default:** `None`
+    pub offered_cipher_suites: Option<Cow<'static, [u16]>>,
+
+    /// The supported_groups list the initial ClientHello writes; [`Self::curves_list`] is
+    /// what is negotiated.
+    ///
+    /// **Default:** `None`
+    pub offered_groups: Option<Cow<'static, [u16]>>,
+
+    /// The groups the initial ClientHello sends key shares for, in order, a GREASE value
+    /// placing a GREASE key share: each an enabled group [`Self::offered_groups`] offers, at
+    /// most once. Takes precedence over [`Self::key_shares`].
+    ///
+    /// **Default:** `None`
+    pub offered_key_shares: Option<Cow<'static, [u16]>>,
+
+    /// The supported_versions list the initial ClientHello writes, sent even when the
+    /// maximum version is below TLS 1.3; [`Self::min_tls_version`] to
+    /// [`Self::max_tls_version`] is what is negotiated.
+    ///
+    /// **Default:** `None`
+    pub offered_versions: Option<Cow<'static, [u16]>>,
+
+    /// The signature_algorithms list the initial ClientHello writes; [`Self::sigalgs_list`]
+    /// is what is negotiated. A server certificate whose key type BoringSSL does not implement
+    /// is also an offer-only selection when this offers algorithms `sigalgs_list` lacks.
+    ///
+    /// **Default:** `None`
+    pub offered_sigalgs: Option<Cow<'static, [u16]>>,
+
+    /// The signature_algorithms_cert list the initial ClientHello writes where a strict
+    /// extension order places it (see [`Self::strict_extension_order`]).
+    ///
+    /// **Default:** `None`
+    pub offered_sigalgs_cert: Option<Cow<'static, [u16]>>,
+
+    /// The ec_point_formats list the initial ClientHello writes. BoringSSL takes only
+    /// uncompressed points, so a server's compressed ECDHE point is an offer-only selection
+    /// when this offers a compressed format.
+    ///
+    /// **Default:** `None`
+    pub offered_point_formats: Option<Cow<'static, [u8]>>,
 
     /// The length of the padding extension a strict extension order places.
     ///
@@ -824,6 +876,76 @@ impl TlsOptionsBuilder {
         self
     }
 
+    /// Sets the cipher suite list the initial ClientHello writes.
+    #[inline]
+    pub fn offered_cipher_suites<T>(mut self, suites: T) -> Self
+    where
+        T: Into<Cow<'static, [u16]>>,
+    {
+        self.config.offered_cipher_suites = Some(suites.into());
+        self
+    }
+
+    /// Sets the supported_groups list the initial ClientHello writes.
+    #[inline]
+    pub fn offered_groups<T>(mut self, groups: T) -> Self
+    where
+        T: Into<Cow<'static, [u16]>>,
+    {
+        self.config.offered_groups = Some(groups.into());
+        self
+    }
+
+    /// Sets the groups the initial ClientHello sends key shares for.
+    #[inline]
+    pub fn offered_key_shares<T>(mut self, groups: T) -> Self
+    where
+        T: Into<Cow<'static, [u16]>>,
+    {
+        self.config.offered_key_shares = Some(groups.into());
+        self
+    }
+
+    /// Sets the supported_versions list the initial ClientHello writes.
+    #[inline]
+    pub fn offered_versions<T>(mut self, versions: T) -> Self
+    where
+        T: Into<Cow<'static, [u16]>>,
+    {
+        self.config.offered_versions = Some(versions.into());
+        self
+    }
+
+    /// Sets the signature_algorithms list the initial ClientHello writes.
+    #[inline]
+    pub fn offered_sigalgs<T>(mut self, sigalgs: T) -> Self
+    where
+        T: Into<Cow<'static, [u16]>>,
+    {
+        self.config.offered_sigalgs = Some(sigalgs.into());
+        self
+    }
+
+    /// Sets the signature_algorithms_cert list the initial ClientHello writes.
+    #[inline]
+    pub fn offered_sigalgs_cert<T>(mut self, sigalgs: T) -> Self
+    where
+        T: Into<Cow<'static, [u16]>>,
+    {
+        self.config.offered_sigalgs_cert = Some(sigalgs.into());
+        self
+    }
+
+    /// Sets the ec_point_formats list the initial ClientHello writes.
+    #[inline]
+    pub fn offered_point_formats<T>(mut self, formats: T) -> Self
+    where
+        T: Into<Cow<'static, [u8]>>,
+    {
+        self.config.offered_point_formats = Some(formats.into());
+        self
+    }
+
     /// Sets the length of the padding extension a strict extension order places.
     #[inline]
     pub fn padding_length(mut self, len: u16) -> Self {
@@ -960,6 +1082,13 @@ impl Default for TlsOptions {
             extension_permutation: None,
             grease_signature_algorithms: false,
             strict_extension_order: false,
+            offered_cipher_suites: None,
+            offered_groups: None,
+            offered_key_shares: None,
+            offered_versions: None,
+            offered_sigalgs: None,
+            offered_sigalgs_cert: None,
+            offered_point_formats: None,
             padding_length: 0,
             renegotiation_scsv: false,
             trust_anchors: None,

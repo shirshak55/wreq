@@ -19,8 +19,8 @@ use btls::{
     ex_data::Index,
     hash::MessageDigest,
     ssl::{
-        ConnectConfiguration, HandshakeError, Ssl, SslConnector, SslMethod, SslOptions, SslRef,
-        SslSessionCacheMode,
+        ClientHelloList, ConnectConfiguration, HandshakeError, Ssl, SslConnector, SslMethod,
+        SslOptions, SslRef, SslSessionCacheMode,
     },
 };
 use bytes::Bytes;
@@ -671,6 +671,43 @@ impl TlsConnectorBuilder {
         connector.set_strict_extension_order(opts.strict_extension_order);
         connector.set_padding_length(opts.padding_length);
 
+        // Set the ClientHello's offered lists
+        let point_formats = opts
+            .offered_point_formats
+            .as_deref()
+            .map(|formats| formats.iter().copied().map(u16::from).collect::<Vec<_>>());
+        for (list, values) in [
+            (
+                ClientHelloList::CIPHER_SUITES,
+                opts.offered_cipher_suites.as_deref(),
+            ),
+            (
+                ClientHelloList::SUPPORTED_GROUPS,
+                opts.offered_groups.as_deref(),
+            ),
+            (
+                ClientHelloList::KEY_SHARES,
+                opts.offered_key_shares.as_deref(),
+            ),
+            (
+                ClientHelloList::SUPPORTED_VERSIONS,
+                opts.offered_versions.as_deref(),
+            ),
+            (
+                ClientHelloList::SIGNATURE_ALGORITHMS,
+                opts.offered_sigalgs.as_deref(),
+            ),
+            (
+                ClientHelloList::SIGNATURE_ALGORITHMS_CERT,
+                opts.offered_sigalgs_cert.as_deref(),
+            ),
+            (ClientHelloList::EC_POINT_FORMATS, point_formats.as_deref()),
+        ] {
+            connector
+                .set_client_hello_list(list, values)
+                .map_err(Error::tls)?;
+        }
+
         // Set TLS renegotiation signalling cipher suite value
         connector.set_renegotiation_scsv(opts.renegotiation_scsv);
 
@@ -992,6 +1029,17 @@ impl HandshakeFailure {
     /// The alert the peer ended the handshake with, if it sent one.
     pub fn alert(&self) -> Option<u8> {
         self.alert
+    }
+
+    /// What the server selected that the ClientHello only offered (see
+    /// [`TlsOptions::offered_cipher_suites`](crate::tls::TlsOptions::offered_cipher_suites)),
+    /// e.g. `cipher suite 0041`, if that ended the handshake.
+    pub fn offer_only_selection(&self) -> Option<&str> {
+        self.error.ssl_error()?.errors().iter().find_map(|error| {
+            (error.library_reason(btls_sys::ERR_LIB_SSL)?
+                == btls_sys::SSL_R_OFFER_ONLY_VALUE_SELECTED)
+                .then(|| error.data().unwrap_or_default())
+        })
     }
 
     /// Why the peer's certificate failed verification, if it did: the `X509_V_ERR_*` code
