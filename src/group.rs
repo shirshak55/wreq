@@ -192,12 +192,15 @@ pub struct ConnectionScope(Arc<(u64, watch::Sender<()>, Arc<Connections>)>);
 
 /// The HTTP/2 connections open in a scope, each by an id, able to send frames of the
 /// caller's choosing, the first connection opened in it, once one is: the [`Control`] of
-/// an HTTP/2 one, `None` for an HTTP/1 one, and how they end (a [`ConnectionEnd`]).
+/// an HTTP/2 one, `None` for an HTTP/1 one, how they end (a [`ConnectionEnd`]), and what
+/// the caller sent them before the first opened, which that one sends should it speak
+/// HTTP/2.
 #[derive(Default)]
 struct Connections {
     http2: Mutex<Vec<(u64, Control)>>,
     first: watch::Sender<Option<Option<Control>>>,
     end: AtomicU8,
+    pending: Mutex<Vec<Box<dyn Fn(&Control) + Send>>>,
 }
 
 /// How a [`ConnectionScope`]'s connections end (see [`ConnectionScope::end_with`]).
@@ -259,38 +262,84 @@ impl ConnectionScope {
     }
 
     /// Sends a SETTINGS frame of exactly `params`, `(identifier, value)` in order, on each
-    /// HTTP/2 connection open in this scope, once the previous one it sent was
-    /// acknowledged; the known parameters apply to it on the acknowledgement.
-    pub fn send_http2_settings(&self, params: &[(u16, u32)]) {
-        for (_, control) in self.0.2.http2.lock().iter() {
-            control.send_settings(params.iter().copied());
-        }
+    /// HTTP/2 connection open in this scope, following the request recorded as `after` (see
+    /// [`Control::after_request`]), once the previous one it sent was acknowledged; the
+    /// known parameters apply to it on the acknowledgement. Before the scope's first
+    /// connection opened, that one sends it, should it speak HTTP/2, as the frames below.
+    pub fn send_http2_settings(&self, after: u32, params: &[(u16, u32)]) {
+        let params = params.to_vec();
+        self.on_http2(move |control| {
+            control
+                .after_request(after)
+                .send_settings(params.iter().copied())
+        });
     }
 
-    /// Sends a PING carrying `payload` on each HTTP/2 connection open in this scope.
-    pub fn send_http2_ping(&self, payload: [u8; 8]) {
-        for (_, control) in self.0.2.http2.lock().iter() {
-            control.send_ping(payload);
-        }
+    /// Sends a PING carrying `payload` on each HTTP/2 connection open in this scope,
+    /// following the request recorded as `after` (see [`Control::after_request`]).
+    pub fn send_http2_ping(&self, after: u32, payload: [u8; 8]) {
+        self.on_http2(move |control| control.after_request(after).send_ping(payload));
     }
 
     /// Sends `priority`, a PRIORITY frame numbered as the connection requests were recorded
     /// on numbered streams, on each HTTP/2 connection open in this scope, as it numbers them
-    /// (see [`Control::send_priority`]).
-    pub fn send_http2_priority(&self, priority: &http2::frame::Priority) {
-        for (_, control) in self.0.2.http2.lock().iter() {
-            control.send_priority(priority.clone());
-        }
+    /// (see [`Control::send_priority`]), following the request recorded as `after` (see
+    /// [`Control::after_request`]).
+    pub fn send_http2_priority(&self, after: u32, priority: &http2::frame::Priority) {
+        let priority = priority.clone();
+        self.on_http2(move |control| control.after_request(after).send_priority(priority.clone()));
     }
 
     /// Sends a PRIORITY_UPDATE frame (RFC 9218) giving `stream_id`, numbered as the
     /// connection requests were recorded on numbered it, the priority `field_value` on each
     /// HTTP/2 connection open in this scope, as it numbers it (see
-    /// [`Control::send_priority_update`]).
-    pub fn send_http2_priority_update(&self, stream_id: u32, field_value: &[u8]) {
-        for (_, control) in self.0.2.http2.lock().iter() {
-            control.send_priority_update(stream_id, field_value);
+    /// [`Control::send_priority_update`]), following the request recorded as `after` (see
+    /// [`Control::after_request`]).
+    pub fn send_http2_priority_update(&self, after: u32, stream_id: u32, field_value: &[u8]) {
+        let field_value = field_value.to_vec();
+        self.on_http2(move |control| {
+            control
+                .after_request(after)
+                .send_priority_update(stream_id, &field_value)
+        });
+    }
+
+    /// Sends a WINDOW_UPDATE of `increment` for the connection (`stream_id` 0) or the
+    /// request recorded as `stream_id` on each HTTP/2 connection open in this scope, as it
+    /// numbers it (see [`Control::send_window_update`]), following the request recorded as
+    /// `after` (see [`Control::after_request`]).
+    pub fn send_http2_window_update(&self, after: u32, stream_id: u32, increment: u32) {
+        self.on_http2(move |control| {
+            control
+                .after_request(after)
+                .send_window_update(stream_id, increment)
+        });
+    }
+
+    /// Tells each HTTP/2 connection open in this scope that the request recorded as
+    /// `recorded` won't be sent on it unless it was (see [`Control::release_request`]).
+    pub fn release_http2_request(&self, recorded: u32) {
+        self.on_http2(move |control| control.release_request(recorded));
+    }
+
+    /// Runs `send` on each HTTP/2 connection open in this scope, or, before the scope's
+    /// first connection opened, on that one should it speak HTTP/2.
+    fn on_http2(&self, send: impl Fn(&Control) + Send + 'static) {
+        let http2 = self.0.2.http2.lock();
+        if self.0.2.first.borrow().is_none() {
+            self.0.2.pending.lock().push(Box::new(send));
+            return;
         }
+        for (_, control) in http2.iter() {
+            send(control);
+        }
+    }
+
+    /// Makes the receive window of the request recorded as `recorded`, on the HTTP/2
+    /// connection of this scope it was sent on, grow only by the WINDOW_UPDATEs
+    /// [`Self::send_http2_window_update`] sends (see [`Control::mirror_stream_window`]).
+    pub fn mirror_http2_stream_window(&self, recorded: u32) {
+        self.on_http2(move |control| control.mirror_stream_window(recorded));
     }
 
     /// Makes this scope's connections end as `end` says rather than gracefully: past
@@ -298,16 +347,6 @@ impl ConnectionScope {
     /// so once they close, as they do once the scope is dropped.
     pub fn end_with(&self, end: ConnectionEnd) {
         self.0.2.end.store(end as u8, Ordering::Release);
-    }
-
-    /// Sets when each HTTP/2 connection open in this scope sends a WINDOW_UPDATE: once
-    /// `connection`, for the connection, or `stream`, for the streams it opens from now on,
-    /// bytes of received data were released since the last, rather than once half the
-    /// window was (`None`).
-    pub fn set_http2_window_update_thresholds(&self, connection: Option<u32>, stream: Option<u32>) {
-        for (_, control) in self.0.2.http2.lock().iter() {
-            control.set_window_update_thresholds(connection, stream);
-        }
     }
 }
 
@@ -354,16 +393,24 @@ impl ScopeRef {
     pub(crate) fn register_http2(&self, control: Control) -> Http2Registration {
         static NEXT_ID: AtomicU64 = AtomicU64::new(0);
         let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
-        self.connections.http2.lock().push((id, control.clone()));
+        let mut http2 = self.connections.http2.lock();
+        for send in self.connections.pending.lock().drain(..) {
+            send(&control);
+        }
+        http2.push((id, control.clone()));
         self.connections.opened(Some(control));
+        drop(http2);
         Http2Registration {
             id,
             connections: self.connections.clone(),
         }
     }
 
-    /// Tells an HTTP/1 connection opened as the scope's first connection, should it be.
+    /// Tells an HTTP/1 connection opened as the scope's first connection, should it be,
+    /// dropping what the caller sent its HTTP/2 connections before.
     pub(crate) fn opened_http1(&self) {
+        let _http2 = self.connections.http2.lock();
+        self.connections.pending.lock().clear();
         self.connections.opened(None);
     }
 
