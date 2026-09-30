@@ -51,6 +51,10 @@ mod sealed {
         fn connected(&self) -> Connected {
             self.inner.connected()
         }
+
+        fn socket(&self) -> Option<socket2::SockRef<'_>> {
+            self.inner.socket()
+        }
     }
 
     impl<T: AsyncRead + AsyncWrite + Unpin> AsyncRead for Wrapper<T> {

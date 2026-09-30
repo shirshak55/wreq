@@ -2,6 +2,7 @@
 
 mod lazy;
 mod pool;
+mod scoped;
 
 use std::{
     error::Error as StdError,
@@ -21,7 +22,7 @@ use http::{
 };
 use http_body::Body;
 use pool::Ver;
-use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tower::{BoxError, util::Oneshot};
 use wreq_proto::{
     body::Incoming,
@@ -37,7 +38,10 @@ use {
     std::sync::Arc,
 };
 
-use self::lazy::{Started as Lazy, lazy};
+use self::{
+    lazy::{Started as Lazy, lazy},
+    scoped::ScopedIo,
+};
 use crate::{
     client::layer::config::RequestOptions,
     config::RequestConfig,
@@ -47,7 +51,7 @@ use crate::{
         proxy,
     },
     error::ProxyConnect,
-    group::ScopeRef,
+    group::{ConnectionEnd, ScopeRef},
     rt::{Executor, Timer},
 };
 
@@ -619,6 +623,7 @@ where
                         let is_h2 = is_ver_h2 || connected.is_negotiated_h2();
 
                         Either::Left(Box::pin(async move {
+                            let (io, dropped) = ScopedIo::new(io, scope.clone());
                             let tx = if is_h2 {
                                {
                                     let (mut tx, conn) =
@@ -634,6 +639,8 @@ where
                                         conn.map_err(|_e| debug!("client connection error: {}", _e))
                                             .map(move |_| drop(registration)),
                                         scope,
+                                        dropped,
+                                        true,
                                     ));
 
                                     // Wait for 'conn' to ready up before we
@@ -678,6 +685,8 @@ where
                                             })
                                             .map(|_| ()),
                                         scope,
+                                        dropped,
+                                        false,
                                     ));
 
                                     // Log that the client is waiting for the connection to be ready.
@@ -1131,13 +1140,33 @@ impl Error {
     }
 }
 
-/// Drives a connection until it ends or, for a scoped connection, its scope does.
-async fn scoped(conn: impl Future<Output = ()>, scope: Option<ScopeRef>) {
-    match scope {
-        Some(scope) => {
-            future::select(std::pin::pin!(conn), std::pin::pin!(scope.closed())).await;
+/// Drives a connection until it ends or, for a scoped connection, its scope does. An HTTP/1
+/// connection whose scope ends gracefully (see [`ConnectionEnd`]) then closes its transport,
+/// back once the connection dropped it (`dropped`), as a client done with it does; an HTTP/2
+/// one (`http2`) closes so itself.
+async fn scoped<T: AsyncWrite + Unpin>(
+    conn: impl Future<Output = ()>,
+    scope: Option<ScopeRef>,
+    dropped: tokio::sync::oneshot::Receiver<T>,
+    http2: bool,
+) {
+    let Some(scope) = scope else {
+        return conn.await;
+    };
+    {
+        let conn = std::pin::pin!(conn);
+        let closed = std::pin::pin!(scope.clone().closed());
+        if let Either::Left(_) = future::select(conn, closed).await {
+            return;
         }
-        None => conn.await,
+    }
+    if http2 || scope.end() != ConnectionEnd::Graceful {
+        return;
+    }
+    if let Ok(mut io) = dropped.await
+        && let Err(_e) = io.shutdown().await
+    {
+        debug!("closing a scoped connection failed: {}", _e);
     }
 }
 

@@ -23,7 +23,7 @@ use std::{
     hash::{Hash, Hasher},
     sync::{
         Arc,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicU8, AtomicU64, Ordering},
     },
 };
 
@@ -191,12 +191,27 @@ impl From<Box<str>> for Group {
 pub struct ConnectionScope(Arc<(u64, watch::Sender<()>, Arc<Connections>)>);
 
 /// The HTTP/2 connections open in a scope, each by an id, able to send frames of the
-/// caller's choosing, and the first connection opened in it, once one is: the
-/// [`Control`] of an HTTP/2 one, `None` for an HTTP/1 one.
+/// caller's choosing, the first connection opened in it, once one is: the [`Control`] of
+/// an HTTP/2 one, `None` for an HTTP/1 one, and how they end (a [`ConnectionEnd`]).
 #[derive(Default)]
 struct Connections {
     http2: Mutex<Vec<(u64, Control)>>,
     first: watch::Sender<Option<Option<Control>>>,
+    end: AtomicU8,
+}
+
+/// How a [`ConnectionScope`]'s connections end (see [`ConnectionScope::end_with`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[repr(u8)]
+pub enum ConnectionEnd {
+    /// As a client done with them ends them, once they close: an HTTP/2 connection's
+    /// GOAWAY, then TLS's close_notify, then a FIN.
+    #[default]
+    Graceful = 0,
+    /// With a FIN alone, sending nothing more: no GOAWAY, no close_notify.
+    Fin = 1,
+    /// With a TCP reset, sending nothing more.
+    Reset = 2,
 }
 
 impl Connections {
@@ -278,6 +293,13 @@ impl ConnectionScope {
         }
     }
 
+    /// Makes this scope's connections end as `end` says rather than gracefully: past
+    /// [`ConnectionEnd::Fin`] or [`ConnectionEnd::Reset`] they send nothing more, and end
+    /// so once they close, as they do once the scope is dropped.
+    pub fn end_with(&self, end: ConnectionEnd) {
+        self.0.2.end.store(end as u8, Ordering::Release);
+    }
+
     /// Sets when each HTTP/2 connection open in this scope sends a WINDOW_UPDATE: once
     /// `connection`, for the connection, or `stream`, for the streams it opens from now on,
     /// bytes of received data were released since the last, rather than once half the
@@ -343,6 +365,15 @@ impl ScopeRef {
     /// Tells an HTTP/1 connection opened as the scope's first connection, should it be.
     pub(crate) fn opened_http1(&self) {
         self.connections.opened(None);
+    }
+
+    /// How the scope's connections end (see [`ConnectionScope::end_with`]).
+    pub(crate) fn end(&self) -> ConnectionEnd {
+        match self.connections.end.load(Ordering::Acquire) {
+            1 => ConnectionEnd::Fin,
+            2 => ConnectionEnd::Reset,
+            _ => ConnectionEnd::Graceful,
+        }
     }
 
     /// Resolves once the scope is dropped.

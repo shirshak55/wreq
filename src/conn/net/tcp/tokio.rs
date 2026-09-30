@@ -52,6 +52,10 @@ impl Connection for TcpStream {
             connected
         }
     }
+
+    fn socket(&self) -> Option<socket2::SockRef<'_>> {
+        Some(socket2::SockRef::from(self))
+    }
 }
 
 impl TlsInfoFactory for TcpStream {}

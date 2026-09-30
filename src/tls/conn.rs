@@ -1183,6 +1183,13 @@ where
             MaybeHttpsStream::Https(s) => s.get_ref().connected(),
         }
     }
+
+    fn socket(&self) -> Option<socket2::SockRef<'_>> {
+        match self {
+            MaybeHttpsStream::Http(s) => s.socket(),
+            MaybeHttpsStream::Https(s) => s.get_ref().socket(),
+        }
+    }
 }
 
 impl<T> fmt::Debug for MaybeHttpsStream<T> {

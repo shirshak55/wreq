@@ -101,6 +101,11 @@ pin_project! {
 pub trait Connection {
     /// Return metadata describing the connection.
     fn connected(&self) -> Connected;
+
+    /// The TCP socket the connection runs over, if it runs over one.
+    fn socket(&self) -> Option<socket2::SockRef<'_>> {
+        None
+    }
 }
 
 /// Indicates the negotiated ALPN protocol.
@@ -175,6 +180,10 @@ impl Connection for Conn {
             connected
         }
     }
+
+    fn socket(&self) -> Option<socket2::SockRef<'_>> {
+        self.stream.socket()
+    }
 }
 
 impl AsyncRead for Conn {
@@ -241,6 +250,10 @@ where
         } else {
             connected
         }
+    }
+
+    fn socket(&self) -> Option<socket2::SockRef<'_>> {
+        self.stream.get_ref().socket()
     }
 }
 
