@@ -31,7 +31,7 @@ use tokio_btls::SslStream;
 use tower::{BoxError, Service};
 
 use crate::{
-    Error,
+    Error, Group,
     conn::{Connected, Connection, TlsInfoFactory, descriptor::ConnectionDescriptor},
     tls::{
         AlpnProtocol, AlpsProtocol, KeyShare, TlsInfo, TlsOptions, TlsVersion,
@@ -861,9 +861,16 @@ impl QuicTlsConnector {
     /// `sni`.
     ///
     /// With `origin` (an `https` URI with the origin's host and port), and a session store,
-    /// the connection offers the session the store gives for the origin, `name` and `sni`, if
-    /// any, and keeps those it receives there.
-    pub fn new_ssl(&self, name: &str, sni: bool, origin: Option<&Uri>) -> crate::Result<QuicSsl> {
+    /// the connection offers the session the store gives for the origin, `name`, `sni` and
+    /// `group` (which partitions the sessions as a request's [`Group`] does), if any, and
+    /// keeps those it receives there.
+    pub fn new_ssl(
+        &self,
+        name: &str,
+        sni: bool,
+        origin: Option<&Uri>,
+        group: Option<Group>,
+    ) -> crate::Result<QuicSsl> {
         let mut cfg = self
             .0
             .configure(self.0.alpn_offer(None).as_deref())
@@ -874,7 +881,7 @@ impl QuicTlsConnector {
         let name = TlsConnector::normalize_host(name);
         let mut resumed_transport_parameters = None;
         if let (Some(cache), Some(origin)) = (&self.0.cache, origin) {
-            let key = Key::quic(origin, name, sni);
+            let key = Key::quic(origin, name, sni, group);
             if let Some(TlsSession(session, params)) = cache.pop(&key) {
                 #[allow(unsafe_code)]
                 unsafe { cfg.set_session(&session) }.map_err(Error::tls)?;

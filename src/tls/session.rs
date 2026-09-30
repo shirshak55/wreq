@@ -80,13 +80,16 @@ struct Inner {
 
 impl Key {
     /// The key of the QUIC sessions of `origin` whose connections verify `name`, announcing it
-    /// when `sni`.
-    pub(super) fn quic(origin: &Uri, name: &str, sni: bool) -> Self {
+    /// when `sni`, and belong to the request group `request`.
+    pub(super) fn quic(origin: &Uri, name: &str, sni: bool, request: Option<Group>) -> Self {
         let mut group = Group::new(name.to_owned());
         group
             .uri(origin.clone())
             .version(Some(Version::HTTP_3))
             .server_name(sni.then(|| Box::from(name)));
+        if let Some(request) = request {
+            group.request(request);
+        }
         Key(ConnectionId::new(group))
     }
 }
