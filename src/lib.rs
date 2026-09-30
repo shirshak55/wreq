@@ -336,7 +336,7 @@ pub use self::{
     },
     error::{Error, Result},
     ext::{ResponseBuilderExt, ResponseExt},
-    group::{ConnectionEnd, ConnectionScope, Group},
+    group::{ConnectionEnd, ConnectionScope, Group, OnQueued},
     into_uri::IntoUri,
     proxy::{NoProxy, Proxy},
 };

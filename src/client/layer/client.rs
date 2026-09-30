@@ -51,7 +51,7 @@ use crate::{
         proxy,
     },
     error::ProxyConnect,
-    group::{ConnectionEnd, ScopeRef},
+    group::{ConnectionEnd, OnQueued, ScopeRef},
     rt::{Executor, Timer},
 };
 
@@ -386,7 +386,12 @@ where
             }
         }
 
-        let mut res = match pooled.try_send_request(req).await {
+        let on_queued = req.extensions().get::<OnQueued>().cloned();
+        let sent = pooled.try_send_request(req);
+        if let Some(on_queued) = on_queued {
+            on_queued.queued();
+        }
+        let mut res = match sent.await {
             Ok(res) => res,
             Err(mut err) => {
                 return if let Some(req) = err.take_message() {

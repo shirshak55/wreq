@@ -203,6 +203,22 @@ struct Connections {
     pending: Mutex<Vec<Box<dyn Fn(&Control) + Send>>>,
 }
 
+/// Called each time the request carrying it (as an extension) is queued on the connection
+/// sending it, which sends the requests queued on it in that order.
+#[derive(Clone)]
+pub struct OnQueued(Arc<dyn Fn() + Send + Sync>);
+
+impl OnQueued {
+    /// Calls `queued` each time the request is queued on its connection.
+    pub fn new(queued: impl Fn() + Send + Sync + 'static) -> Self {
+        Self(Arc::new(queued))
+    }
+
+    pub(crate) fn queued(&self) {
+        (self.0)();
+    }
+}
+
 /// How a [`ConnectionScope`]'s connections end (see [`ConnectionScope::end_with`]).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[repr(u8)]
