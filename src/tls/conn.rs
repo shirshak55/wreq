@@ -671,6 +671,7 @@ impl TlsConnectorBuilder {
 
         // Set whether the extension permutation is the whole extension list
         connector.set_strict_extension_order(opts.strict_extension_order);
+        connector.set_post_handshake_auth(opts.post_handshake_auth);
         connector.set_padding_length(opts.padding_length);
 
         // Set the ClientHello's offered lists

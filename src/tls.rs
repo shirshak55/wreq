@@ -564,6 +564,15 @@ pub struct TlsOptions {
     /// **Default:** `false`
     pub strict_extension_order: bool,
 
+    /// Whether TLS 1.3 connections offer post-handshake authentication (RFC 8446, section
+    /// 4.2.6) with a post_handshake_auth extension, placed where a strict extension order
+    /// lists [`ExtensionType::POST_HANDSHAKE_AUTH`]. The connection answers each
+    /// post-handshake CertificateRequest with its client certificate ([`Identity`]), or an
+    /// empty Certificate without one.
+    ///
+    /// **Default:** `false`
+    pub post_handshake_auth: bool,
+
     /// The cipher suite list the initial ClientHello writes, verbatim and in order, each GREASE
     /// value standing for the connection's GREASE value. It may offer suites BoringSSL does not
     /// implement or [`Self::cipher_list`] does not enable: only the enabled ones it offers are
@@ -882,6 +891,13 @@ impl TlsOptionsBuilder {
         self
     }
 
+    /// Sets whether TLS 1.3 connections offer post-handshake authentication.
+    #[inline]
+    pub fn post_handshake_auth(mut self, enabled: bool) -> Self {
+        self.config.post_handshake_auth = enabled;
+        self
+    }
+
     /// Sets the cipher suite list the initial ClientHello writes.
     #[inline]
     pub fn offered_cipher_suites<T>(mut self, suites: T) -> Self
@@ -1098,6 +1114,7 @@ impl Default for TlsOptions {
             extension_permutation: None,
             grease_signature_algorithms: false,
             strict_extension_order: false,
+            post_handshake_auth: false,
             offered_cipher_suites: None,
             offered_groups: None,
             offered_key_shares: None,
