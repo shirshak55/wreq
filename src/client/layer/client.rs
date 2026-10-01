@@ -630,7 +630,8 @@ where
                         let is_h2 = is_ver_h2 || connected.is_negotiated_h2();
 
                         Either::Left(Box::pin(async move {
-                            let (io, dropped) = ScopedIo::new(io, scope.clone());
+                            let (io, dropped) =
+                                ScopedIo::new(io, scope.clone(), is_h2, timer.clone());
                             let tx = if is_h2 {
                                {
                                     let (mut tx, conn) =

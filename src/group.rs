@@ -25,11 +25,13 @@ use std::{
         Arc,
         atomic::{AtomicU8, AtomicU64, Ordering},
     },
+    task::Waker,
 };
 
+use bytes::Bytes;
 use http::{Uri, Version};
 use name::GroupId;
-use tokio::sync::watch;
+use tokio::sync::{mpsc, watch};
 use wreq_proto::http2::Control;
 
 use crate::{conn::net::SocketBindOptions, proxy::Matcher, sync::Mutex};
@@ -192,15 +194,65 @@ pub struct ConnectionScope(Arc<(u64, watch::Sender<()>, Arc<Connections>)>);
 
 /// The HTTP/2 connections open in a scope, each by an id, able to send frames of the
 /// caller's choosing, the first connection opened in it, once one is: the [`Control`] of
-/// an HTTP/2 one, `None` for an HTTP/1 one, how they end (a [`ConnectionEnd`]), and what
-/// the caller sent them before the first opened, which that one sends should it speak
-/// HTTP/2.
+/// an HTTP/2 one, `None` for an HTTP/1 one, how they end (a [`ConnectionEnd`], 0 until
+/// told, else one past it) and the tasks waiting to be told, what the caller sent them
+/// before the first opened, which that one sends should it speak HTTP/2, and how their
+/// origins end the HTTP/2 ones.
 #[derive(Default)]
 struct Connections {
     http2: Mutex<Vec<(u64, Control)>>,
     first: watch::Sender<Option<Option<Control>>>,
     end: AtomicU8,
+    end_tasks: Mutex<Vec<Waker>>,
     pending: Mutex<Vec<Box<dyn Fn(&Control) + Send>>>,
+    origin_ends: OriginEnds,
+}
+
+/// How the origins of a scope's HTTP/2 connections end them, as they do, until the caller
+/// takes them (see [`ConnectionScope::http2_origin_ends`]).
+struct OriginEnds {
+    sender: mpsc::UnboundedSender<Http2OriginEnd>,
+    receiver: Mutex<Option<mpsc::UnboundedReceiver<Http2OriginEnd>>>,
+}
+
+impl Default for OriginEnds {
+    fn default() -> Self {
+        let (sender, receiver) = mpsc::unbounded_channel();
+        OriginEnds {
+            sender,
+            receiver: Mutex::new(Some(receiver)),
+        }
+    }
+}
+
+impl OriginEnds {
+    fn tell(&self, end: Http2OriginEnd) {
+        // Refused once the caller no longer listens.
+        let _ = self.sender.send(end);
+    }
+}
+
+/// How the origin of one of a scope's HTTP/2 connections ends it, in the order it does (see
+/// [`ConnectionScope::http2_origin_ends`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Http2OriginEnd {
+    /// It sent a GOAWAY: its last stream, numbered as the scope's requests were recorded on
+    /// numbered it (see [`Control::on_go_away`]), its error code and its debug data.
+    GoAway {
+        /// The last stream it processed.
+        last_stream_id: u32,
+        /// The error code.
+        error_code: u32,
+        /// The debug data.
+        debug_data: Bytes,
+    },
+    /// It closed the connection: with TLS's close_notify or not, by a TCP reset or not.
+    Closed {
+        /// Whether it sent its close_notify.
+        close_notify: bool,
+        /// Whether it reset the connection.
+        reset: bool,
+    },
 }
 
 /// Called each time the request carrying it (as an extension) is queued on the connection
@@ -219,16 +271,16 @@ impl OnQueued {
     }
 }
 
-/// How a [`ConnectionScope`]'s connections end (see [`ConnectionScope::end_with`]).
+/// How a [`ConnectionScope`]'s connections end (see [`ConnectionScope::end_with`]). An
+/// HTTP/2 one sends no GOAWAY of its own: only those
+/// [`ConnectionScope::send_http2_go_away`] sends.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[repr(u8)]
 pub enum ConnectionEnd {
-    /// As a client done with them ends them, once they close: an HTTP/2 connection's
-    /// GOAWAY, unless [`ConnectionScope::send_http2_go_away`] sent one, then TLS's
-    /// close_notify, then a FIN.
+    /// With TLS's close_notify, then a FIN, once they close.
     #[default]
     Graceful = 0,
-    /// With a FIN alone, sending nothing more: no GOAWAY of their own, no close_notify.
+    /// With a FIN alone, sending nothing more: no close_notify.
     Fin = 1,
     /// With a TCP reset, sending nothing more.
     Reset = 2,
@@ -360,6 +412,12 @@ impl ConnectionScope {
         });
     }
 
+    /// How the origins of this scope's HTTP/2 connections end them, as they do: each GOAWAY
+    /// they send, then how they close. Taken by the first call, `None` after it.
+    pub fn http2_origin_ends(&self) -> Option<mpsc::UnboundedReceiver<Http2OriginEnd>> {
+        self.0.2.origin_ends.receiver.lock().take()
+    }
+
     /// Resolves once each HTTP/2 connection open in this scope sent the frames this scope had
     /// it send, or ended (see [`Control::sent`]).
     pub async fn http2_sent(&self) {
@@ -389,11 +447,16 @@ impl ConnectionScope {
         self.on_http2(move |control| control.mirror_stream_window(recorded));
     }
 
-    /// Makes this scope's connections end as `end` says rather than gracefully: past
-    /// [`ConnectionEnd::Fin`] or [`ConnectionEnd::Reset`] they send nothing more, and end
-    /// so once they close, as they do once the scope is dropped.
+    /// Makes this scope's connections end as `end` says: past [`ConnectionEnd::Fin`] or
+    /// [`ConnectionEnd::Reset`] they send nothing more, and end so once they close, as they
+    /// do once the scope is dropped. An HTTP/2 connection whose origin closed it first
+    /// waits a moment for it before closing, else ends with a FIN alone; one closing
+    /// otherwise before it ends gracefully.
     pub fn end_with(&self, end: ConnectionEnd) {
-        self.0.2.end.store(end as u8, Ordering::Release);
+        self.0.2.end.store(end as u8 + 1, Ordering::Release);
+        for task in self.0.2.end_tasks.lock().drain(..) {
+            task.wake();
+        }
     }
 }
 
@@ -440,6 +503,17 @@ impl ScopeRef {
     pub(crate) fn register_http2(&self, control: Control) -> Http2Registration {
         static NEXT_ID: AtomicU64 = AtomicU64::new(0);
         let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
+        control.leave_close_to_caller();
+        let connections = Arc::downgrade(&self.connections);
+        control.on_go_away(move |last_stream_id, reason, debug_data| {
+            if let Some(connections) = connections.upgrade() {
+                connections.origin_ends.tell(Http2OriginEnd::GoAway {
+                    last_stream_id,
+                    error_code: reason.into(),
+                    debug_data,
+                });
+            }
+        });
         let mut http2 = self.connections.http2.lock();
         for send in self.connections.pending.lock().drain(..) {
             send(&control);
@@ -463,11 +537,35 @@ impl ScopeRef {
 
     /// How the scope's connections end (see [`ConnectionScope::end_with`]).
     pub(crate) fn end(&self) -> ConnectionEnd {
+        self.ended().unwrap_or_default()
+    }
+
+    /// How the scope's connections end, once told (see [`ConnectionScope::end_with`]).
+    pub(crate) fn ended(&self) -> Option<ConnectionEnd> {
         match self.connections.end.load(Ordering::Acquire) {
-            1 => ConnectionEnd::Fin,
-            2 => ConnectionEnd::Reset,
-            _ => ConnectionEnd::Graceful,
+            0 => None,
+            2 => Some(ConnectionEnd::Fin),
+            3 => Some(ConnectionEnd::Reset),
+            _ => Some(ConnectionEnd::Graceful),
         }
+    }
+
+    /// Wakes `task` once the scope is told how its connections end, unless it was already.
+    pub(crate) fn wake_on_end(&self, task: &Waker) -> Option<ConnectionEnd> {
+        let mut tasks = self.connections.end_tasks.lock();
+        let ended = self.ended();
+        if ended.is_none() && !tasks.iter().any(|waiting| waiting.will_wake(task)) {
+            tasks.push(task.clone());
+        }
+        ended
+    }
+
+    /// Tells the scope how the origin of one of its HTTP/2 connections closed it.
+    pub(crate) fn origin_closed(&self, close_notify: bool, reset: bool) {
+        self.connections.origin_ends.tell(Http2OriginEnd::Closed {
+            close_notify,
+            reset,
+        });
     }
 
     /// Resolves once the scope is dropped.

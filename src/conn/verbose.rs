@@ -55,6 +55,10 @@ mod sealed {
         fn socket(&self) -> Option<socket2::SockRef<'_>> {
             self.inner.socket()
         }
+
+        fn close_notify_received(&self) -> bool {
+            self.inner.close_notify_received()
+        }
     }
 
     impl<T: AsyncRead + AsyncWrite + Unpin> AsyncRead for Wrapper<T> {

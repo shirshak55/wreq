@@ -106,6 +106,11 @@ pub trait Connection {
     fn socket(&self) -> Option<socket2::SockRef<'_>> {
         None
     }
+
+    /// Whether the peer ended the connection's TLS with its close_notify.
+    fn close_notify_received(&self) -> bool {
+        false
+    }
 }
 
 /// Indicates the negotiated ALPN protocol.
@@ -184,6 +189,10 @@ impl Connection for Conn {
     fn socket(&self) -> Option<socket2::SockRef<'_>> {
         self.stream.socket()
     }
+
+    fn close_notify_received(&self) -> bool {
+        self.stream.close_notify_received()
+    }
 }
 
 impl AsyncRead for Conn {
@@ -254,6 +263,10 @@ where
 
     fn socket(&self) -> Option<socket2::SockRef<'_>> {
         self.stream.get_ref().socket()
+    }
+
+    fn close_notify_received(&self) -> bool {
+        close_notify_received(self.stream.ssl())
     }
 }
 
