@@ -224,10 +224,11 @@ impl OnQueued {
 #[repr(u8)]
 pub enum ConnectionEnd {
     /// As a client done with them ends them, once they close: an HTTP/2 connection's
-    /// GOAWAY, then TLS's close_notify, then a FIN.
+    /// GOAWAY, unless [`ConnectionScope::send_http2_go_away`] sent one, then TLS's
+    /// close_notify, then a FIN.
     #[default]
     Graceful = 0,
-    /// With a FIN alone, sending nothing more: no GOAWAY, no close_notify.
+    /// With a FIN alone, sending nothing more: no GOAWAY of their own, no close_notify.
     Fin = 1,
     /// With a TCP reset, sending nothing more.
     Reset = 2,
@@ -336,6 +337,36 @@ impl ConnectionScope {
     /// `recorded` won't be sent on it unless it was (see [`Control::release_request`]).
     pub fn release_http2_request(&self, recorded: u32) {
         self.on_http2(move |control| control.release_request(recorded));
+    }
+
+    /// Sends a GOAWAY frame of `error_code` and `debug_data` naming `last_stream_id`, a
+    /// request's numbered as the connection numbers it (see [`Control::send_go_away`]), on
+    /// each HTTP/2 connection open in this scope, following the request recorded as `after`
+    /// (see [`Control::after_request`]); they then close without a GOAWAY of their own.
+    pub fn send_http2_go_away(
+        &self,
+        after: u32,
+        last_stream_id: u32,
+        error_code: u32,
+        debug_data: &[u8],
+    ) {
+        let debug_data = debug_data.to_vec();
+        self.on_http2(move |control| {
+            control.after_request(after).send_go_away(
+                last_stream_id,
+                error_code.into(),
+                &debug_data,
+            )
+        });
+    }
+
+    /// Resolves once each HTTP/2 connection open in this scope sent the frames this scope had
+    /// it send, or ended (see [`Control::sent`]).
+    pub async fn http2_sent(&self) {
+        let http2 = self.0.2.http2.lock().clone();
+        for (_, control) in http2 {
+            control.sent().await;
+        }
     }
 
     /// Runs `send` on each HTTP/2 connection open in this scope, or, before the scope's
