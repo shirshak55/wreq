@@ -35,6 +35,7 @@ pub struct TlsInfo {
     pub(crate) group: Option<u16>,
     pub(crate) hello_retry_request: bool,
     pub(crate) aia_fetches: Vec<trust::AiaFetch>,
+    pub(crate) verified_path: Option<Vec<Bytes>>,
     pub(crate) peer_ocsp: Option<Bytes>,
 }
 
@@ -301,6 +302,16 @@ impl TlsInfo {
         self.peer_certificate_chain
             .as_ref()
             .map(|v| v.iter().map(|b| b.as_ref()))
+    }
+
+    /// The certification path verifying the peer certificate built, leaf first (DER): from
+    /// the certificates the peer sent, and any issuers fetched, to the trust anchor it
+    /// reached, else as far as it got. `None` when the handshake verified none (a resumed
+    /// session).
+    pub fn verified_path(&self) -> Option<impl Iterator<Item = &[u8]>> {
+        self.verified_path
+            .as_ref()
+            .map(|path| path.iter().map(|cert| cert.as_ref()))
     }
 }
 

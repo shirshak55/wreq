@@ -40,6 +40,7 @@ pub(crate) struct RequestOptions {
     pub tls_server_name: Option<Option<Box<str>>>,
     pub tls_verify_name: Option<Box<str>>,
     pub accepted_certificate: Option<[u8; 32]>,
+    pub min_dhe_bits: Option<u16>,
     pub scope: Option<ScopeRef>,
     pub connect_to: Option<Authority>,
     #[cfg(feature = "tokio-rt")]

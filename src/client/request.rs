@@ -847,6 +847,19 @@ impl RequestBuilder {
         self
     }
 
+    /// Accepts, in the TLS 1.2 DHE handshake of a new connection this request opens, a
+    /// Diffie-Hellman group of at least `bits` bits instead of 2048 (never one below 512).
+    /// Connections accepting a smaller group serve only requests accepting the same; a
+    /// resumed session keeps the group of the handshake that established it.
+    pub fn min_dhe_bits(mut self, bits: u16) -> RequestBuilder {
+        if let Ok(ref mut req) = self.request {
+            req.config_mut::<RequestOptions>()
+                .get_or_insert_default()
+                .min_dhe_bits = Some(bits);
+        }
+        self
+    }
+
     /// Opens this request's connection to `authority` instead of the URI's (as curl's
     /// `--connect-to`): DNS, any proxy tunnel, and the pool key follow `authority`, while
     /// TLS still names the URI host (or [`tls_server_name`](Self::tls_server_name)) and

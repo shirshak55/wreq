@@ -37,6 +37,7 @@ pub(crate) fn tls_info_of(ssl: &btls::ssl::SslRef) -> TlsInfo {
         group: ssl.curve(),
         hello_retry_request: ssl.used_hello_retry_request(),
         aia_fetches: crate::tls::trust::aia::fetches(ssl),
+        verified_path: crate::tls::trust::aia::verified_path(ssl),
         peer_ocsp: ssl.ocsp_status().map(Bytes::copy_from_slice),
         peer_certificate: ssl
             .peer_certificate()

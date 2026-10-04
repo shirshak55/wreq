@@ -334,7 +334,8 @@ impl TlsConnector {
     }
 
     /// `cfg` made to open `descriptor`'s connection: announcing its name unless it
-    /// announces none, accepting the leaf certificate it pins should verification fail, and
+    /// announces none, accepting the DHE groups it accepts and the leaf certificate it pins
+    /// should verification fail, and
     /// offering and keeping the session cached for its connections. Returns the name it
     /// verifies and whether it announces it.
     fn for_descriptor<'a>(
@@ -345,6 +346,10 @@ impl TlsConnector {
         let (host, sni) = Self::verified_name(descriptor)?;
         if !sni {
             cfg.set_use_server_name_indication(false);
+        }
+
+        if let Some(bits) = descriptor.min_dhe_bits() {
+            cfg.set_min_dhe_bits(bits)?;
         }
 
         // Every verification failure, the name's included, goes through the callback.
@@ -1016,6 +1021,7 @@ pub struct HandshakeFailure {
     group: Option<u16>,
     hello_retry_request: bool,
     aia_fetches: Vec<AiaFetch>,
+    verified_path: Vec<Bytes>,
     server_flight: Option<crate::tls::ServerFlight>,
     peer_ocsp: Option<Bytes>,
 }
@@ -1053,6 +1059,7 @@ impl HandshakeFailure {
             group: ssl.curve(),
             hello_retry_request: ssl.used_hello_retry_request(),
             aia_fetches: aia::fetches(ssl),
+            verified_path: aia::verified_path(ssl).unwrap_or_default(),
             server_flight: server_flight_index()
                 .ok()
                 .and_then(|index| ssl.ex_data(index))
@@ -1128,6 +1135,12 @@ impl HandshakeFailure {
     /// [`AiaCache`]), in the order it needed them.
     pub fn aia_fetches(&self) -> &[AiaFetch] {
         &self.aia_fetches
+    }
+
+    /// The certification path verifying the server certificate built, leaf first (DER), as
+    /// far as it got; empty when verification never ran.
+    pub fn verified_path(&self) -> impl Iterator<Item = &[u8]> {
+        self.verified_path.iter().map(|cert| cert.as_ref())
     }
 }
 

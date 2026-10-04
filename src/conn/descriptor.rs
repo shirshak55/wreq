@@ -42,6 +42,7 @@ pub(crate) struct ConnectionDescriptor {
     scope: Option<ScopeRef>,
     tls_name: Option<(Box<str>, bool)>,
     accepted_certificate: Option<[u8; 32]>,
+    min_dhe_bits: Option<u16>,
     #[cfg(feature = "tokio-rt")]
     preconnected: Option<Preconnected>,
     connection_id: ConnectionId,
@@ -138,6 +139,7 @@ impl ConnectionDescriptor {
             scope,
             tls_name: None,
             accepted_certificate: None,
+            min_dhe_bits: None,
             #[cfg(feature = "tokio-rt")]
             preconnected: None,
             connection_id,
@@ -157,6 +159,24 @@ impl ConnectionDescriptor {
     /// when verification fails.
     pub(crate) fn with_accepted_certificate(mut self, leaf_sha256: Option<[u8; 32]>) -> Self {
         self.accepted_certificate = leaf_sha256;
+        self
+    }
+
+    /// Sets the size, in bits, of the smallest DHE group a new connection's TLS 1.2 handshake
+    /// accepts instead of BoringSSL's 2048. Its connections serve only requests setting the
+    /// same, while TLS sessions resume across.
+    pub(crate) fn with_min_dhe_bits(mut self, bits: Option<u16>) -> Self {
+        if let Some(bits) = bits {
+            for id in [Some(&mut self.connection_id), self.unversioned_id.as_mut()]
+                .into_iter()
+                .flatten()
+            {
+                let mut group = id.0.0.clone();
+                group.min_dhe_bits(bits);
+                *id = ConnectionId::new(group);
+            }
+        }
+        self.min_dhe_bits = bits;
         self
     }
 
@@ -213,19 +233,27 @@ impl ConnectionDescriptor {
         self.accepted_certificate
     }
 
+    /// Returns the size, in bits, of the smallest DHE group the TLS handshake accepts, if
+    /// set.
+    #[inline]
+    pub(crate) fn min_dhe_bits(&self) -> Option<u16> {
+        self.min_dhe_bits
+    }
+
     /// Returns a reference to the [`Uri`].
     #[inline]
     pub(crate) fn uri(&self) -> &Uri {
         &self.uri
     }
 
-    /// Opens the connection to `uri` itself (a proxy), whose TLS then names its host and
-    /// accepts no certificate failing verification.
+    /// Opens the connection to `uri` itself (a proxy), whose TLS then names its host,
+    /// accepts no certificate failing verification and no DHE group below 2048 bits.
     #[inline]
     pub(crate) fn set_uri(&mut self, uri: Uri) {
         self.uri = uri;
         self.tls_name = None;
         self.accepted_certificate = None;
+        self.min_dhe_bits = None;
     }
 
     /// Return the negotiated HTTP version, if any.

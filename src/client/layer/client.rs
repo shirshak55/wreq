@@ -220,6 +220,7 @@ where
                 tls_server_name,
                 tls_verify_name,
                 accepted_certificate,
+                min_dhe_bits,
                 scope,
                 connect_to,
                 #[cfg(feature = "tokio-rt")]
@@ -268,7 +269,8 @@ where
                 socket_bind_options,
             )
             .with_tls_name(tls_name)
-            .with_accepted_certificate(accepted_certificate);
+            .with_accepted_certificate(accepted_certificate)
+            .with_min_dhe_bits(min_dhe_bits);
             #[cfg(feature = "tokio-rt")]
             let descriptor = descriptor.with_preconnected(preconnected);
             descriptor

@@ -18,6 +18,7 @@ use btls::{
     stack::Stack,
     x509::{GeneralNameRef, X509, X509Ref, X509StoreContext, X509VerifyError, X509VerifyResult},
 };
+use bytes::Bytes;
 use foreign_types::{ForeignType, ForeignTypeRef};
 use futures_util::future::{FutureExt, Shared};
 use lru::LruCache;
@@ -119,6 +120,8 @@ struct State {
     pending: Option<Fetching>,
     /// Why its last verification failed.
     error: Option<X509VerifyError>,
+    /// The certification path its last verification built, leaf first (DER).
+    path: Vec<Bytes>,
     /// Whether the handshake paused for its ALPS gate, and the settings the gate
     /// supplied, to send once the verification is retried.
     alps_paused: bool,
@@ -197,7 +200,7 @@ impl AiaCache {
 
         let internal = |_| SslVerifyError::Invalid(SslAlert::INTERNAL_ERROR);
         let mut untrusted = Vec::new();
-        let (mut verified, mut result, mut current) =
+        let (mut verified, mut result, mut current, mut path) =
             verify_chain(ssl, &untrusted).map_err(internal)?;
         for _ in 0..MAX_LEVELS {
             if verified || !issuer_missing(result) {
@@ -214,7 +217,7 @@ impl AiaCache {
                 }
                 Lookup::None => break,
             }
-            (verified, result, current) = verify_chain(ssl, &untrusted).map_err(internal)?;
+            (verified, result, current, path) = verify_chain(ssl, &untrusted).map_err(internal)?;
             // A certificate still lacking its issuer after its fetch has no other to try.
             if current
                 .as_ref()
@@ -224,6 +227,7 @@ impl AiaCache {
             }
         }
 
+        state.path = path;
         match result {
             // The verify callback may accept a chain despite an error.
             _ if verified => {
@@ -387,6 +391,17 @@ pub(crate) fn fetches(ssl: &SslRef) -> Vec<AiaFetch> {
         .unwrap_or_default()
 }
 
+/// The certification path a connection's certificate verification built, leaf first (DER):
+/// to the trust anchor it reached, else as far as it got; `None` when none ran (a resumed
+/// session).
+pub(crate) fn verified_path(ssl: &SslRef) -> Option<Vec<Bytes>> {
+    state_index()
+        .ok()
+        .and_then(|index| ssl.ex_data(index))
+        .map(|state| state.lock().path.clone())
+        .filter(|path| !path.is_empty())
+}
+
 /// Why a connection's certificate verification failed: BoringSSL reports a failed custom
 /// verification as `X509_V_ERR_APPLICATION_VERIFICATION`, so the error this cache's verification
 /// failed with, when it ran.
@@ -446,17 +461,17 @@ fn alert_of(raw: c_int) -> SslAlert {
 /// (`ssl_crypto_x509_session_verify_cert_chain`) — its context's trust store, the
 /// connection's verify parameters, ECH name override and verify callback — with
 /// `untrusted` added to the chain the peer sent. Returns whether it verified, the result,
-/// and the certificate an error concerns.
+/// the certificate an error concerns, and the certification path built (DER, leaf first).
 #[allow(unsafe_code)]
 fn verify_chain(
     ssl: &SslRef,
     untrusted: &[X509],
-) -> Result<(bool, X509VerifyResult, Option<X509>), ErrorStack> {
+) -> Result<(bool, X509VerifyResult, Option<X509>, Vec<Bytes>), ErrorStack> {
     let peer = ssl.peer_cert_chain();
     let Some(leaf) = peer.and_then(|chain| chain.iter().next()) else {
         // SAFETY: the code of an existing verification error.
         let error = unsafe { X509VerifyError::from_raw(btls_sys::X509_V_ERR_UNSPECIFIED as c_int) };
-        return Ok((false, error, None));
+        return Ok((false, error, None, Vec::new()));
     };
     let mut chain = Stack::new()?;
     for cert in peer
@@ -493,10 +508,17 @@ fn verify_chain(
             }
         }
         let verified = ctx.verify_cert()?;
+        let path = ctx
+            .chain()
+            .into_iter()
+            .flatten()
+            .map(|cert| cert.to_der().map(Bytes::from))
+            .collect::<Result<_, _>>()?;
         Ok((
             verified,
             ctx.verify_result(),
             ctx.current_cert().map(ToOwned::to_owned),
+            path,
         ))
     })
 }

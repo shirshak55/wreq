@@ -61,6 +61,7 @@ impl_group_variants! {
     ServerName(Option<Box<str>>),
     VerifyName(Box<str>),
     AcceptedCertificate([u8; 32]),
+    MinDheBits(u16),
     Scope(ScopeRef),
 }
 
@@ -129,6 +130,12 @@ impl Group {
             GroupKey::AcceptedCertificate,
             leaf_sha256.map(GroupVariant::AcceptedCertificate),
         )
+    }
+
+    /// Groups the request by the smallest DHE group its TLS accepts.
+    #[inline]
+    pub(crate) fn min_dhe_bits(&mut self, bits: u16) -> &mut Self {
+        self.extend(GroupKey::MinDheBits, GroupVariant::MinDheBits(bits))
     }
 
     /// Confines the request's connections to a [`ConnectionScope`].
