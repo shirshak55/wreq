@@ -299,6 +299,13 @@ pub enum Http2OriginEnd {
         /// yet when it came, as recorded: a client of the origin gets them ahead of it.
         unread: Vec<u32>,
     },
+    /// It broke the protocol: the connection, detecting a connection error in what it
+    /// sent, ended with a GOAWAY carrying `error_code` (see
+    /// [`Control::on_connection_error`]).
+    Failed {
+        /// The GOAWAY's error code.
+        error_code: u32,
+    },
     /// It closed the connection: with TLS's close_notify or not, by a TCP reset or not.
     Closed {
         /// Whether it sent its close_notify.
@@ -694,6 +701,14 @@ impl ScopeRef {
         let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
         control.leave_close_to_caller();
         let connections = Arc::downgrade(&self.connections);
+        let failed = connections.clone();
+        control.on_connection_error(move |reason| {
+            if let Some(connections) = failed.upgrade() {
+                connections.origin_ends.tell(Http2OriginEnd::Failed {
+                    error_code: reason.into(),
+                });
+            }
+        });
         control.on_go_away(move |last_stream_id, reason, debug_data, refused, unread| {
             if let Some(connections) = connections.upgrade() {
                 connections.origin_ends.tell(Http2OriginEnd::GoAway {
