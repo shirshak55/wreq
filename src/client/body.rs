@@ -133,6 +133,39 @@ impl Default for Body {
     }
 }
 
+/// A request extension for a body that may turn out to have no frames at all, such as that
+/// of an HTTP/2 GET whose HEADERS didn't end its stream. An HTTP/1 connection frames a GET
+/// or HEAD body only when the request's `Transfer-Encoding` says how, so on one the body's
+/// first frame is read before the request goes, and a body without any goes as none, the
+/// request without its `Transfer-Encoding`. Any other connection sends the request at once.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ReadAheadOnHttp1;
+
+/// A request body whose first frame can be read ahead (see [`ReadAheadOnHttp1`]).
+pub(crate) trait ReadAhead: Sized {
+    /// This body with its first frame read ahead, or an ended one when it has none.
+    fn read_ahead(self) -> impl std::future::Future<Output = Self> + Send;
+}
+
+impl ReadAhead for Body {
+    async fn read_ahead(mut self) -> Body {
+        use futures_util::StreamExt;
+        use http_body_util::{BodyStream, StreamBody};
+
+        match self.frame().await {
+            Some(first) => Body::from(
+                StreamBody::new(
+                    futures_util::stream::once(std::future::ready(first))
+                        .chain(BodyStream::new(self)),
+                )
+                .map_err(BoxError::from)
+                .boxed(),
+            ),
+            None => Body::empty(),
+        }
+    }
+}
+
 impl From<BoxBody<Bytes, BoxError>> for Body {
     #[inline]
     fn from(body: BoxBody<Bytes, BoxError>) -> Self {

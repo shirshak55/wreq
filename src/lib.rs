@@ -328,7 +328,7 @@ pub use self::client::ws;
 pub use self::{
     client::{
         Client, ClientBuilder,
-        body::Body,
+        body::{Body, ReadAheadOnHttp1},
         emulate::{Emulation, EmulationBuilder, IntoEmulation},
         request::{Request, RequestBuilder},
         response::Response,

@@ -17,7 +17,7 @@ use bytes::Bytes;
 use futures_util::future::{self, BoxFuture, Either, FutureExt, TryFutureExt};
 use http::{
     HeaderValue, Method, Request, Response, Uri, Version,
-    header::{HOST, PROXY_AUTHORIZATION},
+    header::{HOST, PROXY_AUTHORIZATION, TRANSFER_ENCODING},
     uri::{Authority, PathAndQuery, Scheme},
 };
 use http_body::Body;
@@ -43,7 +43,10 @@ use self::{
     scoped::ScopedIo,
 };
 use crate::{
-    client::layer::config::RequestOptions,
+    client::{
+        body::{ReadAhead, ReadAheadOnHttp1},
+        layer::config::RequestOptions,
+    },
     config::RequestConfig,
     conn::{
         Connected, Connection,
@@ -147,7 +150,7 @@ where
     C::Response: AsyncRead + AsyncWrite + Connection + Unpin + Send + 'static,
     C::Error: Into<BoxError>,
     C::Future: Unpin + Send + 'static,
-    B: Body + Send + 'static + Unpin,
+    B: Body + ReadAhead + Send + 'static + Unpin,
     B::Data: Send,
     B::Error: Into<BoxError>,
 {
@@ -356,6 +359,15 @@ where
             }
         } else if req.method() == Method::CONNECT && !pooled.is_http2() {
             authority_form(req.uri_mut());
+        }
+
+        if pooled.is_http1() && req.extensions_mut().remove::<ReadAheadOnHttp1>().is_some() {
+            let (mut parts, body) = req.into_parts();
+            let body = body.read_ahead().await;
+            if body.is_end_stream() {
+                parts.headers.remove(TRANSFER_ENCODING);
+            }
+            req = Request::from_parts(parts, body);
         }
 
         #[cfg(feature = "cookies")]
@@ -774,7 +786,7 @@ where
     C::Response: AsyncRead + AsyncWrite + Connection + Unpin + Send + 'static,
     C::Error: Into<BoxError>,
     C::Future: Unpin + Send + 'static,
-    B: Body + Send + 'static + Unpin,
+    B: Body + ReadAhead + Send + 'static + Unpin,
     B::Data: Send,
     B::Error: Into<BoxError>,
 {
