@@ -36,12 +36,14 @@ use wreq_proto::http2::Control;
 
 use crate::{conn::net::SocketBindOptions, proxy::Matcher, sync::Mutex};
 
-/// How many frames a scope keeps for its first connection, before it opened: those past
-/// them go to no connection.
+/// How many frames a scope keeps for its first connection, before it opened, and the
+/// octets of their payloads, as a connection lets wait (see [`Control::backlogged`]):
+/// those past them go to no connection.
 const PENDING_HTTP2: usize = 4096;
+const PENDING_HTTP2_OCTETS: usize = 1 << 20;
 
-/// How many requests held or released a scope keeps for its first connection, before it
-/// opened: as many as a connection remembers (see [`Control::release_request`]).
+/// How many requests held, and released, a scope keeps for its first connection, before
+/// it opened: as many as a connection remembers (see [`Control::release_request`]).
 const PENDING_REQUESTS: usize = 256;
 
 macro_rules! impl_group_variants {
@@ -221,12 +223,36 @@ struct Connections {
     first: watch::Sender<Option<Option<Control>>>,
     end: AtomicU8,
     end_tasks: Mutex<Vec<Waker>>,
-    pending: Mutex<Vec<Box<dyn Fn(&Control) + Send>>>,
+    pending: Mutex<PendingHttp2>,
     pending_dropped: AtomicBool,
-    pending_requests: Mutex<VecDeque<(u32, bool)>>,
+    pending_requests: Mutex<PendingRequests>,
     origin_ends: OriginEnds,
     http1_open: AtomicUsize,
     http1_origin_closed: Notify,
+}
+
+/// The frames a scope had its HTTP/2 connections send before its first opened, and the
+/// octets of their payloads.
+#[derive(Default)]
+struct PendingHttp2 {
+    sends: Vec<Box<dyn Fn(&Control) + Send>>,
+    octets: usize,
+}
+
+impl PendingHttp2 {
+    /// Whether it holds as many as it may.
+    fn is_full(&self) -> bool {
+        self.sends.len() >= PENDING_HTTP2 || self.octets >= PENDING_HTTP2_OCTETS
+    }
+}
+
+/// The requests held, and released, before a scope's first connection opened, as a
+/// connection keeps them (see [`Control::hold_request`]): a release ends a hold, and each
+/// past [`PENDING_REQUESTS`] loses its oldest.
+#[derive(Default)]
+struct PendingRequests {
+    held: VecDeque<u32>,
+    released: VecDeque<u32>,
 }
 
 /// How the origins of a scope's HTTP/2 connections end them, as they do, until the caller
@@ -269,6 +295,9 @@ pub enum Http2OriginEnd {
         /// The open requests it carried past that stream, as recorded, which it leaves
         /// unprocessed; those of the scope's other connections went on regardless.
         refused: Vec<u32>,
+        /// The requests it carried whose response frames it sent before it weren't read
+        /// yet when it came, as recorded: a client of the origin gets them ahead of it.
+        unread: Vec<u32>,
     },
     /// It closed the connection: with TLS's close_notify or not, by a TCP reset or not.
     Closed {
@@ -361,7 +390,7 @@ impl ConnectionScope {
     /// connection opened, that one sends it, should it speak HTTP/2, as the frames below.
     pub fn send_http2_settings(&self, after: u32, params: &[(u16, u32)]) {
         let params = params.to_vec();
-        self.on_http2(move |control| {
+        self.on_http2(params.len() * 6, move |control| {
             control
                 .after_request(after)
                 .send_settings(params.iter().copied())
@@ -371,7 +400,9 @@ impl ConnectionScope {
     /// Sends a PING carrying `payload` on each HTTP/2 connection open in this scope,
     /// following the request recorded as `after` (see [`Control::after_request`]).
     pub fn send_http2_ping(&self, after: u32, payload: [u8; 8]) {
-        self.on_http2(move |control| control.after_request(after).send_ping(payload));
+        self.on_http2(0, move |control| {
+            control.after_request(after).send_ping(payload)
+        });
     }
 
     /// Sends `priority`, a PRIORITY frame numbered as the connection requests were recorded
@@ -380,7 +411,9 @@ impl ConnectionScope {
     /// [`Control::after_request`]).
     pub fn send_http2_priority(&self, after: u32, priority: &http2::frame::Priority) {
         let priority = priority.clone();
-        self.on_http2(move |control| control.after_request(after).send_priority(priority.clone()));
+        self.on_http2(0, move |control| {
+            control.after_request(after).send_priority(priority.clone())
+        });
     }
 
     /// Sends a PRIORITY_UPDATE frame (RFC 9218) giving `stream_id`, numbered as the
@@ -390,7 +423,7 @@ impl ConnectionScope {
     /// [`Control::after_request`]).
     pub fn send_http2_priority_update(&self, after: u32, stream_id: u32, field_value: &[u8]) {
         let field_value = field_value.to_vec();
-        self.on_http2(move |control| {
+        self.on_http2(field_value.len(), move |control| {
             control
                 .after_request(after)
                 .send_priority_update(stream_id, &field_value)
@@ -402,7 +435,7 @@ impl ConnectionScope {
     /// numbers it (see [`Control::send_window_update`]), following the request recorded as
     /// `after` (see [`Control::after_request`]).
     pub fn send_http2_window_update(&self, after: u32, stream_id: u32, increment: u32) {
-        self.on_http2(move |control| {
+        self.on_http2(0, move |control| {
             control
                 .after_request(after)
                 .send_window_update(stream_id, increment)
@@ -422,7 +455,7 @@ impl ConnectionScope {
         payload: &[u8],
     ) {
         let payload = payload.to_vec();
-        self.on_http2(move |control| {
+        self.on_http2(payload.len(), move |control| {
             control
                 .after_request(after)
                 .send_unknown(kind, flags, stream_id, &payload)
@@ -433,7 +466,9 @@ impl ConnectionScope {
     /// was sent on, reset with `error_code` rather than its own should it be dropped before
     /// it ends or reset (see [`Control::cancel_with`]): as its client reset it.
     pub fn send_http2_reset(&self, recorded: u32, error_code: u32) {
-        self.on_http2(move |control| control.cancel_with(recorded, error_code.into()));
+        self.on_http2(0, move |control| {
+            control.cancel_with(recorded, error_code.into())
+        });
     }
 
     /// Tells each HTTP/2 connection open in this scope that the request recorded as
@@ -454,7 +489,7 @@ impl ConnectionScope {
     pub fn drop_http2_pending(&self) {
         let _http2 = self.0.2.http2.lock();
         self.0.2.pending_dropped.store(true, Ordering::Release);
-        self.0.2.pending.lock().clear();
+        *self.0.2.pending.lock() = PendingHttp2::default();
     }
 
     /// Sends a GOAWAY frame of `error_code` and `debug_data` naming `last_stream_id`, a
@@ -469,7 +504,7 @@ impl ConnectionScope {
         debug_data: &[u8],
     ) {
         let debug_data = debug_data.to_vec();
-        self.on_http2(move |control| {
+        self.on_http2(debug_data.len(), move |control| {
             control.after_request(after).send_go_away(
                 last_stream_id,
                 error_code.into(),
@@ -481,7 +516,13 @@ impl ConnectionScope {
     /// Resolves once the origin of an HTTP/1 connection open in this scope closed it, with no
     /// other open: as a client's own connection to it would have closed.
     pub async fn http1_origin_closed(&self) {
-        self.0.2.http1_origin_closed.notified().await;
+        // The permit of a close told while none waited is stale once another opened since.
+        loop {
+            self.0.2.http1_origin_closed.notified().await;
+            if self.0.2.http1_open.load(Ordering::Acquire) == 0 {
+                return;
+            }
+        }
     }
 
     /// How the origins of this scope's HTTP/2 connections end them, as they do: each GOAWAY
@@ -491,9 +532,13 @@ impl ConnectionScope {
     }
 
     /// Whether the frames this scope had its HTTP/2 connections send lag behind on one: as
-    /// many as it lets await their turn (see [`Control::backlogged`]).
+    /// many as it lets await their turn (see [`Control::backlogged`]), or, before its first
+    /// connection opened, as many as it keeps for it.
     pub fn http2_backlogged(&self) -> bool {
         let http2 = self.0.2.http2.lock();
+        if self.0.2.first.borrow().is_none() {
+            return self.0.2.pending.lock().is_full();
+        }
         http2.iter().any(|(_, control)| control.backlogged())
     }
 
@@ -506,15 +551,24 @@ impl ConnectionScope {
         }
     }
 
-    /// Runs `send` on each HTTP/2 connection open in this scope, or, before the scope's
-    /// first connection opened, on that one should it speak HTTP/2.
-    fn on_http2(&self, send: impl Fn(&Control) + Send + 'static) {
+    /// Runs `send`, sending a frame whose payload takes `octets`, on each HTTP/2 connection
+    /// open in this scope, or, before the scope's first connection opened, on that one
+    /// should it speak HTTP/2.
+    fn on_http2(&self, octets: usize, send: impl Fn(&Control) + Send + 'static) {
         let http2 = self.0.2.http2.lock();
         if self.0.2.first.borrow().is_none() {
             let mut pending = self.0.2.pending.lock();
-            if !self.0.2.pending_dropped.load(Ordering::Acquire) && pending.len() < PENDING_HTTP2 {
-                pending.push(Box::new(send));
+            if self.0.2.pending_dropped.load(Ordering::Acquire) {
+                return;
             }
+            if pending.is_full() {
+                warn!(
+                    "an HTTP/2 frame sent before the scope's first connection opened, past as many as it keeps, goes to no connection"
+                );
+                return;
+            }
+            pending.sends.push(Box::new(send));
+            pending.octets += octets;
             return;
         }
         for (_, control) in http2.iter() {
@@ -529,10 +583,18 @@ impl ConnectionScope {
         let http2 = self.0.2.http2.lock();
         if self.0.2.first.borrow().is_none() {
             let mut pending = self.0.2.pending_requests.lock();
-            if pending.len() == PENDING_REQUESTS {
-                pending.pop_front();
+            if !held {
+                pending.held.retain(|kept| *kept != recorded);
             }
-            pending.push_back((recorded, held));
+            let kept = if held {
+                &mut pending.held
+            } else {
+                &mut pending.released
+            };
+            if kept.len() == PENDING_REQUESTS {
+                kept.pop_front();
+            }
+            kept.push_back(recorded);
             return;
         }
         for (_, control) in http2.iter() {
@@ -546,7 +608,7 @@ impl ConnectionScope {
     pub fn mirror_http2_stream_window(&self, recorded: u32) {
         // Before the scope's first connection opened, none sent it.
         if self.0.2.first.borrow().is_some() {
-            self.on_http2(move |control| control.mirror_stream_window(recorded));
+            self.on_http2(0, move |control| control.mirror_stream_window(recorded));
         }
     }
 
@@ -632,22 +694,28 @@ impl ScopeRef {
         let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
         control.leave_close_to_caller();
         let connections = Arc::downgrade(&self.connections);
-        control.on_go_away(move |last_stream_id, reason, debug_data, refused| {
+        control.on_go_away(move |last_stream_id, reason, debug_data, refused, unread| {
             if let Some(connections) = connections.upgrade() {
                 connections.origin_ends.tell(Http2OriginEnd::GoAway {
                     last_stream_id,
                     error_code: reason.into(),
                     debug_data,
                     refused: refused.to_vec(),
+                    unread: unread.to_vec(),
                 });
             }
         });
         let mut http2 = self.connections.http2.lock();
-        for send in self.connections.pending.lock().drain(..) {
+        for send in std::mem::take(&mut *self.connections.pending.lock()).sends {
             send(&control);
         }
-        for (recorded, held) in self.connections.pending_requests.lock().drain(..) {
-            tell_request(&control, recorded, held);
+        // Releases first: a request held again after its release stays held.
+        let requests = std::mem::take(&mut *self.connections.pending_requests.lock());
+        for recorded in requests.released {
+            control.release_request(recorded);
+        }
+        for recorded in requests.held {
+            control.hold_request(recorded);
         }
         http2.push((id, control.clone()));
         self.connections.opened(Some(control));
@@ -662,8 +730,8 @@ impl ScopeRef {
     /// dropping what the caller sent its HTTP/2 connections before.
     pub(crate) fn opened_http1(&self) {
         let _http2 = self.connections.http2.lock();
-        self.connections.pending.lock().clear();
-        self.connections.pending_requests.lock().clear();
+        *self.connections.pending.lock() = PendingHttp2::default();
+        *self.connections.pending_requests.lock() = PendingRequests::default();
         self.connections.opened(None);
     }
 
