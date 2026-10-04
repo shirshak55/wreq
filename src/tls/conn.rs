@@ -113,14 +113,16 @@ unsafe extern "C" fn record_handshake_message(
     let record = || bytes::Bytes::copy_from_slice(message);
     if let Some(flight) = ssl.ex_data(index) {
         let mut flight = flight.lock();
-        let late_request = message[0] == CERTIFICATE_REQUEST
-            && flight.iter().any(|msg| msg.first() == Some(&FINISHED));
+        let late = flight.iter().any(|msg| msg.first() == Some(&FINISHED));
         if keeps(&flight, message[0]) {
             flight.push(record());
         }
         drop(flight);
-        if late_request && let Some(gate) = aia::alps_gate(ssl) {
-            gate.note_late_certificate_request();
+        if late && let Some(gate) = aia::alps_gate(ssl) {
+            gate.note_post_handshake_message();
+            if message[0] == CERTIFICATE_REQUEST {
+                gate.note_late_certificate_request();
+            }
         }
     } else {
         ssl.set_ex_data(index, Arc::new(crate::sync::Mutex::new(vec![record()])));

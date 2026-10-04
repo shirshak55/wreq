@@ -68,16 +68,20 @@ pub struct ServerFlight {
 /// [`ClientBuilder::tls_aia`](crate::ClientBuilder::tls_aia)), for its caller: a proxy
 /// answering its own client meanwhile (see
 /// [`RequestBuilder::alps_gate`](crate::RequestBuilder::alps_gate)). The handshake pauses
-/// when the server negotiated application settings (ALPS), for the settings it sends, and
+/// when the server negotiated application settings (ALPS), for the settings it sends,
 /// when its certificate failed verification (see [`TlsInfo::verify_error`]), for whether
-/// it goes on trusting that leaf certificate alone; [`AlpsGate::paused`] resolves with
+/// it goes on trusting that leaf certificate alone, and, unless it paused for either, when
+/// the server asks in its handshake for a client certificate the connection has none
+/// configured for, for whether it goes on without one; [`AlpsGate::paused`] resolves with
 /// what the server sent so far when it does. It also tells when the server asks for a
-/// client certificate past the handshake (see [`AlpsGate::late_certificate_request`]).
+/// client certificate past the handshake (see [`AlpsGate::late_certificate_request`]), and
+/// when it sends anything past its handshake (see [`AlpsGate::post_handshake_message`]).
 #[derive(Clone, Debug)]
 pub struct AlpsGate {
     paused: tokio::sync::watch::Sender<Option<TlsInfo>>,
     verdict: tokio::sync::watch::Sender<Option<Verdict>>,
     late_certificate_request: tokio::sync::watch::Sender<bool>,
+    post_handshake_message: tokio::sync::watch::Sender<bool>,
 }
 
 /// What a paused handshake does once its [`AlpsGate`]'s caller decides.
@@ -85,8 +89,8 @@ pub struct AlpsGate {
 pub(crate) enum Verdict {
     /// Goes on, sending these application settings (none: the ones configured).
     Accept(Option<Vec<u8>>),
-    /// Ends, rejecting the server's certificate.
-    Reject,
+    /// Ends, rejecting the server's certificate with this alert (none: BoringSSL's).
+    Reject(Option<u8>),
 }
 
 impl Default for AlpsGate {
@@ -102,6 +106,7 @@ impl AlpsGate {
             paused: tokio::sync::watch::Sender::new(None),
             verdict: tokio::sync::watch::Sender::new(None),
             late_certificate_request: tokio::sync::watch::Sender::new(false),
+            post_handshake_message: tokio::sync::watch::Sender::new(false),
         }
     }
 
@@ -125,10 +130,12 @@ impl AlpsGate {
         self.verdict.send_replace(Some(Verdict::Accept(settings)));
     }
 
-    /// Ends the handshake, rejecting the server's certificate with the alert BoringSSL
-    /// sends for its verification failure (`certificate_unknown` for one that verified).
-    pub fn reject(&self) {
-        self.verdict.send_replace(Some(Verdict::Reject));
+    /// Ends the handshake, rejecting the server's certificate with `alert`, or the one
+    /// BoringSSL sends for its verification failure (`certificate_unknown` for one that
+    /// verified). A handshake paused for a client certificate ends with
+    /// `internal_error`.
+    pub fn reject(&self, alert: Option<u8>) {
+        self.verdict.send_replace(Some(Verdict::Reject(alert)));
     }
 
     /// Resolves with `true` once the server asks for a client certificate past the
@@ -142,6 +149,19 @@ impl AlpsGate {
 
     pub(crate) fn note_late_certificate_request(&self) {
         self.late_certificate_request.send_replace(true);
+    }
+
+    /// Resolves with `true` once the server sends a handshake message past its handshake
+    /// (a NewSessionTicket, KeyUpdate or CertificateRequest), read as the connection is,
+    /// or with `false` once the connection, and every clone of this gate, is gone without
+    /// it sending one.
+    pub fn post_handshake_message(&self) -> impl Future<Output = bool> + Send + 'static {
+        let mut sent = self.post_handshake_message.subscribe();
+        async move { sent.wait_for(|sent| *sent).await.is_ok() }
+    }
+
+    pub(crate) fn note_post_handshake_message(&self) {
+        self.post_handshake_message.send_replace(true);
     }
 
     pub(crate) fn pause(&self, info: TlsInfo) {

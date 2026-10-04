@@ -2,7 +2,7 @@ use std::{
     future::Future,
     io,
     num::NonZeroUsize,
-    os::raw::c_int,
+    os::raw::{c_int, c_void},
     pin::Pin,
     ptr,
     sync::{Arc, LazyLock},
@@ -137,11 +137,53 @@ fn gate_index() -> Result<Index<Ssl, AlpsGate>, ErrorStack> {
     IDX.clone()
 }
 
-/// Makes `ssl`'s handshake wait on `gate` for its application settings (see
-/// [`AlpsGate`]).
+/// Makes `ssl`'s handshake wait on `gate` for its application settings, and for the
+/// other decisions its caller takes (see [`AlpsGate`]).
 pub(crate) fn set_alps_gate(ssl: &mut Ssl, gate: AlpsGate) -> Result<(), ErrorStack> {
     ssl.set_ex_data(gate_index()?, gate);
+    // SAFETY: `ssl` is a live `SSL`, and the callback takes no argument.
+    #[allow(unsafe_code)]
+    unsafe {
+        btls_sys::SSL_set_cert_cb(ssl.as_ptr(), Some(certificate_request), ptr::null_mut());
+    }
     Ok(())
+}
+
+/// The client certificate callback of a connection with a gate, which BoringSSL runs on the
+/// server's CertificateRequest: in the handshake, for a connection with no certificate
+/// configured, it pauses the handshake on the gate, unless that paused it already, for
+/// whether it goes on without one (an empty Certificate) or ends (see [`handshake`]).
+#[allow(unsafe_code)]
+unsafe extern "C" fn certificate_request(ssl: *mut btls_sys::SSL, _arg: *mut c_void) -> c_int {
+    // SAFETY: BoringSSL passes the live `SSL` whose handshake runs the callback.
+    let ssl = unsafe { SslRef::from_ptr_mut(ssl) };
+    // SAFETY: `ssl` is a live `SSL`.
+    let renegotiating = unsafe { btls_sys::SSL_total_renegotiations(ssl.as_ptr()) } > 0;
+    if ssl.is_init_finished() || renegotiating || ssl.certificate().is_some() {
+        return 1;
+    }
+    let (Ok(index), Some(gate)) = (state_index(), alps_gate(ssl).cloned()) else {
+        return 1;
+    };
+    if ssl.ex_data(index).is_none() {
+        ssl.set_ex_data(index, Mutex::new(State::default()));
+    }
+    let ssl: &SslRef = ssl;
+    let Some(state) = ssl.ex_data(index) else {
+        return 0;
+    };
+    let mut state = state.lock();
+    match state.verdict {
+        Some(Verdict::Reject(_)) => 0,
+        Some(Verdict::Accept(_)) => 1,
+        None => {
+            state.paused = true;
+            // Reading the connection's TLS takes this state's lock again.
+            drop(state);
+            gate.pause(crate::conn::tls_info_of(ssl));
+            -1
+        }
+    }
 }
 
 pub(crate) fn alps_gate(ssl: &SslRef) -> Option<&AlpsGate> {
@@ -241,7 +283,7 @@ impl AiaCache {
         let gate = alps_gate(ssl).filter(|_| !state.paused && !renegotiating);
         match result {
             // The verify callback may accept a chain despite an error.
-            _ if verified && !matches!(state.verdict, Some(Verdict::Reject)) => {
+            _ if verified && !matches!(state.verdict, Some(Verdict::Reject(_))) => {
                 state.error = None;
                 if let Some(gate) = gate
                     && ssl.peer_application_settings().is_some()
@@ -267,11 +309,14 @@ impl AiaCache {
                     gate.pause(crate::conn::tls_info_of(ssl));
                     return Err(SslVerifyError::Retry);
                 }
-                if matches!(state.verdict, Some(Verdict::Accept(_)))
-                    && leaf.is_some()
-                    && leaf == state.failed_leaf
-                {
-                    return Ok(());
+                match &state.verdict {
+                    Some(Verdict::Accept(_)) if leaf.is_some() && leaf == state.failed_leaf => {
+                        return Ok(());
+                    }
+                    Some(Verdict::Reject(Some(alert))) => {
+                        return Err(SslVerifyError::Invalid(SslAlert::from_raw((*alert).into())));
+                    }
+                    _ => {}
                 }
                 let raw = error.map_or(btls_sys::X509_V_ERR_UNSPECIFIED as c_int, |error| {
                     error.as_raw()
@@ -371,41 +416,52 @@ impl AiaCache {
 }
 
 /// Runs `stream`'s client handshake, waiting out the issuer fetches its certificate
-/// verification pauses it for (see [`AiaCache`]).
+/// verification pauses it for (see [`AiaCache`]), and the decisions of the gate it pauses
+/// on (see [`AlpsGate`]).
 pub(crate) async fn handshake<S>(stream: &mut SslStream<S>) -> Result<(), btls::ssl::Error>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
     loop {
-        match Pin::new(&mut *stream).connect().await {
+        let error = match Pin::new(&mut *stream).connect().await {
             Err(error) if error.code() == btls::ssl::ErrorCode::WANT_CERTIFICATE_VERIFY => {
-                let state = state_index()
+                let pending = state_index()
                     .ok()
-                    .and_then(|index| stream.ssl().ex_data(index));
-                let pending = state.and_then(|state| state.lock().pending.take());
-                match pending {
-                    Some(fetch) => {
-                        let _ = fetch.await;
-                    }
-                    None => {
-                        let gate = alps_gate(stream.ssl());
-                        let waiting = state.is_some_and(|state| {
-                            let state = state.lock();
-                            state.paused && state.verdict.is_none()
-                        });
-                        match (state, gate) {
-                            (Some(state), Some(gate)) if waiting => {
-                                let verdict = gate.verdict().await;
-                                state.lock().verdict = Some(verdict);
-                            }
-                            _ => return Err(error),
-                        }
-                    }
+                    .and_then(|index| stream.ssl().ex_data(index))
+                    .and_then(|state| state.lock().pending.take());
+                if let Some(fetch) = pending {
+                    let _ = fetch.await;
+                    continue;
                 }
+                error
             }
+            Err(error) if error.code() == btls::ssl::ErrorCode::WANT_X509_LOOKUP => error,
             result => return result,
+        };
+        if !wait_for_verdict(stream.ssl()).await {
+            return Err(error);
         }
     }
+}
+
+/// Waits for the verdict of the gate `ssl`'s handshake paused on, should it have paused
+/// on one that decided nothing yet, and records it for the handshake to act on: whether
+/// it waited.
+async fn wait_for_verdict(ssl: &SslRef) -> bool {
+    let state = state_index().ok().and_then(|index| ssl.ex_data(index));
+    let (Some(state), Some(gate)) = (state, alps_gate(ssl)) else {
+        return false;
+    };
+    let waiting = {
+        let state = state.lock();
+        state.paused && state.verdict.is_none()
+    };
+    if !waiting {
+        return false;
+    }
+    let verdict = gate.verdict().await;
+    state.lock().verdict = Some(verdict);
+    true
 }
 
 /// The caIssuers URLs a connection's certificate verification needed.
