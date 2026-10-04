@@ -19,11 +19,11 @@
 //!    boundaries, ensuring that resources are never leaked across different request groups.
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, VecDeque},
     hash::{Hash, Hasher},
     sync::{
         Arc,
-        atomic::{AtomicU8, AtomicU64, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering},
     },
     task::Waker,
 };
@@ -36,9 +36,13 @@ use wreq_proto::http2::Control;
 
 use crate::{conn::net::SocketBindOptions, proxy::Matcher, sync::Mutex};
 
-/// How many sends a scope keeps for its first connection, before it opened, ere it lags
-/// behind (see [`ConnectionScope::http2_backlogged`]).
+/// How many frames a scope keeps for its first connection, before it opened: those past
+/// them go to no connection.
 const PENDING_HTTP2: usize = 4096;
+
+/// How many requests held or released a scope keeps for its first connection, before it
+/// opened: as many as a connection remembers (see [`Control::release_request`]).
+const PENDING_REQUESTS: usize = 256;
 
 macro_rules! impl_group_variants {
     ($($name:ident $(($ty:ty))?,)*) => {
@@ -207,7 +211,8 @@ pub struct ConnectionScope(Arc<(u64, watch::Sender<()>, Arc<Connections>)>);
 /// caller's choosing, the first connection opened in it, once one is: the [`Control`] of
 /// an HTTP/2 one, `None` for an HTTP/1 one, how they end (a [`ConnectionEnd`], 0 until
 /// told, else one past it) and the tasks waiting to be told, what the caller sent them
-/// before the first opened, which that one sends should it speak HTTP/2, how their
+/// before the first opened, which that one sends should it speak HTTP/2 (the frames, unless
+/// the caller dropped them, and the requests held, `true`, or released), how their
 /// origins end the HTTP/2 ones, and how many HTTP/1 ones are open, told once an origin
 /// closed the last.
 #[derive(Default)]
@@ -217,6 +222,8 @@ struct Connections {
     end: AtomicU8,
     end_tasks: Mutex<Vec<Waker>>,
     pending: Mutex<Vec<Box<dyn Fn(&Control) + Send>>>,
+    pending_dropped: AtomicBool,
+    pending_requests: Mutex<VecDeque<(u32, bool)>>,
     origin_ends: OriginEnds,
     http1_open: AtomicUsize,
     http1_origin_closed: Notify,
@@ -432,7 +439,22 @@ impl ConnectionScope {
     /// Tells each HTTP/2 connection open in this scope that the request recorded as
     /// `recorded` won't be sent on it unless it was (see [`Control::release_request`]).
     pub fn release_http2_request(&self, recorded: u32) {
-        self.on_http2(move |control| control.release_request(recorded));
+        self.on_http2_request(recorded, false);
+    }
+
+    /// Tells each HTTP/2 connection open in this scope that the request recorded as
+    /// `recorded` is held before it goes out (see [`Control::hold_request`]).
+    pub fn hold_http2_request(&self, recorded: u32) {
+        self.on_http2_request(recorded, true);
+    }
+
+    /// Drops the frames this scope had its HTTP/2 connections send before its first one
+    /// opened, and keeps none from now on: they go to no connection. The requests held or
+    /// released before still go to it.
+    pub fn drop_http2_pending(&self) {
+        let _http2 = self.0.2.http2.lock();
+        self.0.2.pending_dropped.store(true, Ordering::Release);
+        self.0.2.pending.lock().clear();
     }
 
     /// Sends a GOAWAY frame of `error_code` and `debug_data` naming `last_stream_id`, a
@@ -468,14 +490,10 @@ impl ConnectionScope {
         self.0.2.origin_ends.receiver.lock().take()
     }
 
-    /// Whether the frames this scope had its HTTP/2 connections send lag behind: as many as
-    /// one lets await their turn (see [`Control::backlogged`]), or, before the scope's first
-    /// connection opened, 4,096 of them.
+    /// Whether the frames this scope had its HTTP/2 connections send lag behind on one: as
+    /// many as it lets await their turn (see [`Control::backlogged`]).
     pub fn http2_backlogged(&self) -> bool {
         let http2 = self.0.2.http2.lock();
-        if self.0.2.first.borrow().is_none() {
-            return self.0.2.pending.lock().len() >= PENDING_HTTP2;
-        }
         http2.iter().any(|(_, control)| control.backlogged())
     }
 
@@ -493,7 +511,10 @@ impl ConnectionScope {
     fn on_http2(&self, send: impl Fn(&Control) + Send + 'static) {
         let http2 = self.0.2.http2.lock();
         if self.0.2.first.borrow().is_none() {
-            self.0.2.pending.lock().push(Box::new(send));
+            let mut pending = self.0.2.pending.lock();
+            if !self.0.2.pending_dropped.load(Ordering::Acquire) && pending.len() < PENDING_HTTP2 {
+                pending.push(Box::new(send));
+            }
             return;
         }
         for (_, control) in http2.iter() {
@@ -501,11 +522,32 @@ impl ConnectionScope {
         }
     }
 
+    /// Tells each HTTP/2 connection open in this scope that the request recorded as
+    /// `recorded` is held, or released, or, before the scope's first connection opened,
+    /// that one should it speak HTTP/2.
+    fn on_http2_request(&self, recorded: u32, held: bool) {
+        let http2 = self.0.2.http2.lock();
+        if self.0.2.first.borrow().is_none() {
+            let mut pending = self.0.2.pending_requests.lock();
+            if pending.len() == PENDING_REQUESTS {
+                pending.pop_front();
+            }
+            pending.push_back((recorded, held));
+            return;
+        }
+        for (_, control) in http2.iter() {
+            tell_request(control, recorded, held);
+        }
+    }
+
     /// Makes the receive window of the request recorded as `recorded`, on the HTTP/2
     /// connection of this scope it was sent on, grow only by the WINDOW_UPDATEs
     /// [`Self::send_http2_window_update`] sends (see [`Control::mirror_stream_window`]).
     pub fn mirror_http2_stream_window(&self, recorded: u32) {
-        self.on_http2(move |control| control.mirror_stream_window(recorded));
+        // Before the scope's first connection opened, none sent it.
+        if self.0.2.first.borrow().is_some() {
+            self.on_http2(move |control| control.mirror_stream_window(recorded));
+        }
     }
 
     /// Makes this scope's connections end as `end` says: past [`ConnectionEnd::Fin`] or
@@ -540,6 +582,15 @@ pub(crate) struct ScopeRef {
     id: u64,
     closed: watch::Receiver<()>,
     connections: Arc<Connections>,
+}
+
+/// Tells `control` that the request recorded as `recorded` is held, or released.
+fn tell_request(control: &Control, recorded: u32, held: bool) {
+    if held {
+        control.hold_request(recorded);
+    } else {
+        control.release_request(recorded);
+    }
 }
 
 /// An HTTP/2 connection's place among its scope's, which it leaves when dropped.
@@ -595,6 +646,9 @@ impl ScopeRef {
         for send in self.connections.pending.lock().drain(..) {
             send(&control);
         }
+        for (recorded, held) in self.connections.pending_requests.lock().drain(..) {
+            tell_request(&control, recorded, held);
+        }
         http2.push((id, control.clone()));
         self.connections.opened(Some(control));
         drop(http2);
@@ -609,6 +663,7 @@ impl ScopeRef {
     pub(crate) fn opened_http1(&self) {
         let _http2 = self.connections.http2.lock();
         self.connections.pending.lock().clear();
+        self.connections.pending_requests.lock().clear();
         self.connections.opened(None);
     }
 
