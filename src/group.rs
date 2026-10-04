@@ -36,6 +36,10 @@ use wreq_proto::http2::Control;
 
 use crate::{conn::net::SocketBindOptions, proxy::Matcher, sync::Mutex};
 
+/// How many sends a scope keeps for its first connection, before it opened, ere it lags
+/// behind (see [`ConnectionScope::http2_backlogged`]).
+const PENDING_HTTP2: usize = 4096;
+
 macro_rules! impl_group_variants {
     ($($name:ident $(($ty:ty))?,)*) => {
         #[derive(Debug, Clone, Copy, Hash, PartialEq, Eq, PartialOrd, Ord)]
@@ -255,6 +259,9 @@ pub enum Http2OriginEnd {
         error_code: u32,
         /// The debug data.
         debug_data: Bytes,
+        /// The open requests it carried past that stream, as recorded, which it leaves
+        /// unprocessed; those of the scope's other connections went on regardless.
+        refused: Vec<u32>,
     },
     /// It closed the connection: with TLS's close_notify or not, by a TCP reset or not.
     Closed {
@@ -461,6 +468,17 @@ impl ConnectionScope {
         self.0.2.origin_ends.receiver.lock().take()
     }
 
+    /// Whether the frames this scope had its HTTP/2 connections send lag behind: as many as
+    /// one lets await their turn (see [`Control::backlogged`]), or, before the scope's first
+    /// connection opened, 4,096 of them.
+    pub fn http2_backlogged(&self) -> bool {
+        let http2 = self.0.2.http2.lock();
+        if self.0.2.first.borrow().is_none() {
+            return self.0.2.pending.lock().len() >= PENDING_HTTP2;
+        }
+        http2.iter().any(|(_, control)| control.backlogged())
+    }
+
     /// Resolves once each HTTP/2 connection open in this scope sent the frames this scope had
     /// it send, or ended (see [`Control::sent`]).
     pub async fn http2_sent(&self) {
@@ -563,12 +581,13 @@ impl ScopeRef {
         let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
         control.leave_close_to_caller();
         let connections = Arc::downgrade(&self.connections);
-        control.on_go_away(move |last_stream_id, reason, debug_data| {
+        control.on_go_away(move |last_stream_id, reason, debug_data, refused| {
             if let Some(connections) = connections.upgrade() {
                 connections.origin_ends.tell(Http2OriginEnd::GoAway {
                     last_stream_id,
                     error_code: reason.into(),
                     debug_data,
+                    refused: refused.to_vec(),
                 });
             }
         });

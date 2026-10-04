@@ -364,6 +364,11 @@ where
         }
 
         if pooled.is_http1() && req.extensions_mut().remove::<ReadAheadOnHttp1>().is_some() {
+            // The connection is the request's alone: it counts as queued before its body is
+            // read ahead.
+            if let Some(on_queued) = req.extensions().get::<OnQueued>() {
+                on_queued.queued();
+            }
             let (mut parts, body) = req.into_parts();
             let body = body.read_ahead().await;
             if body.is_end_stream() {
