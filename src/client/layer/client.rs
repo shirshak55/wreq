@@ -616,6 +616,10 @@ where
                     return Either::Right(futures_util::future::err(e!(Canceled)));
                 }
             };
+            let http1 = scope
+                .as_ref()
+                .filter(|_| !is_ver_h2)
+                .map(ScopeRef::http1_opened);
             Either::Left(
                 Oneshot::new(connector, descriptor)
                     .map_err(|src| Error::new(ErrorKind::Connect, src))
@@ -646,7 +650,7 @@ where
                         Either::Left(Box::pin(async move {
                             let in_scope = scope.is_some();
                             let (io, dropped) =
-                                ScopedIo::new(io, scope.clone(), is_h2, timer.clone());
+                                ScopedIo::new(io, scope.clone(), http1, is_h2, timer.clone());
                             let tx = if is_h2 {
                                {
                                     let (mut tx, conn) =

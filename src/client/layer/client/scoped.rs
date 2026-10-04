@@ -16,7 +16,7 @@ use wreq_proto::rt::{Sleep, Timer as _};
 
 use crate::{
     conn::Connection,
-    group::{ConnectionEnd, ScopeRef},
+    group::{ConnectionEnd, Http1Open, ScopeRef},
     rt::Timer,
 };
 
@@ -29,7 +29,7 @@ const SCOPE_END_WAIT: Duration = Duration::from_secs(2);
 /// nothing more, and it closes so once dropped. Dropped, it goes to the receiver
 /// [`ScopedIo::new`] returned, if that is still there.
 ///
-/// An HTTP/1 one is counted open in its scope (see
+/// An HTTP/1 one is counted open in its scope from its connect on (see
 /// [`ConnectionScope::http1_origin_closed`](crate::ConnectionScope::http1_origin_closed)).
 /// An HTTP/2 one tells its scope how its origin closed it, and closes as its scope ends,
 /// waiting up to [`SCOPE_END_WAIT`] for that, as the origin's close ends the scope's
@@ -37,6 +37,7 @@ const SCOPE_END_WAIT: Duration = Duration::from_secs(2);
 pub(super) struct ScopedIo<T: Connection> {
     io: Option<T>,
     scope: Option<ScopeRef>,
+    http1: Option<Http1Open>,
     dropped: Option<oneshot::Sender<T>>,
     http2: bool,
     /// Whether its origin ended its side: a read ended, or failed.
@@ -48,20 +49,20 @@ pub(super) struct ScopedIo<T: Connection> {
 
 impl<T: Connection + Unpin> ScopedIo<T> {
     /// Wraps `io`, the transport of a connection confined to `scope`, if any, speaking
-    /// HTTP/2 when `http2`, `timer` bounding its wait for the scope's end.
+    /// HTTP/2 when `http2`, `timer` bounding its wait for the scope's end. `http1` counted it
+    /// open in its scope as its connect began, if it might speak HTTP/1.
     pub(super) fn new(
         io: T,
         scope: Option<ScopeRef>,
+        http1: Option<Http1Open>,
         http2: bool,
         timer: Timer,
     ) -> (Self, oneshot::Receiver<T>) {
         let (dropped, dropped_rx) = oneshot::channel();
-        if let (false, Some(scope)) = (http2, &scope) {
-            scope.http1_opened();
-        }
         let scoped = ScopedIo {
             io: Some(io),
             scope,
+            http1: http1.filter(|_| !http2),
             dropped: Some(dropped),
             http2,
             origin_ended: false,
@@ -146,8 +147,8 @@ impl<T: AsyncRead + Connection + Unpin> ScopedIo<T> {
 
 impl<T: Connection> Drop for ScopedIo<T> {
     fn drop(&mut self) {
-        if let (false, Some(scope)) = (self.http2, &self.scope) {
-            scope.http1_closed(self.origin_ended);
+        if let Some(http1) = &mut self.http1 {
+            http1.by_origin = self.origin_ended;
         }
         let Some(io) = self.io.take() else {
             return;

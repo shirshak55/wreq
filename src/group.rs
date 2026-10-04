@@ -539,6 +539,21 @@ impl Drop for Http2Registration {
     }
 }
 
+/// An HTTP/1 connection counted open in its scope until dropped, closed by its origin when
+/// `by_origin`.
+pub(crate) struct Http1Open {
+    connections: Arc<Connections>,
+    pub(crate) by_origin: bool,
+}
+
+impl Drop for Http1Open {
+    fn drop(&mut self) {
+        if self.connections.http1_open.fetch_sub(1, Ordering::AcqRel) == 1 && self.by_origin {
+            self.connections.http1_origin_closed.notify_one();
+        }
+    }
+}
+
 impl ScopeRef {
     /// Makes the scope's HTTP/2 frames go on the connection `control` sends on, until the
     /// registration returned is dropped, and tells it as the scope's first connection
@@ -603,15 +618,13 @@ impl ScopeRef {
         ended
     }
 
-    /// Counts an HTTP/1 connection open in the scope, until [`Self::http1_closed`].
-    pub(crate) fn http1_opened(&self) {
+    /// Counts an HTTP/1 connection open in the scope, from its connect on, until the
+    /// [`Http1Open`] returned is dropped.
+    pub(crate) fn http1_opened(&self) -> Http1Open {
         self.connections.http1_open.fetch_add(1, Ordering::AcqRel);
-    }
-
-    /// Uncounts an HTTP/1 connection that closed, by its origin when `by_origin`.
-    pub(crate) fn http1_closed(&self, by_origin: bool) {
-        if self.connections.http1_open.fetch_sub(1, Ordering::AcqRel) == 1 && by_origin {
-            self.connections.http1_origin_closed.notify_one();
+        Http1Open {
+            connections: self.connections.clone(),
+            by_origin: false,
         }
     }
 
