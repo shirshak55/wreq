@@ -286,8 +286,8 @@ impl TlsConnector {
 
     /// Whether `stream` can serve `descriptor`'s requests as the connection this connector
     /// would open for it: opened by it, verifying and announcing the same name, accepting
-    /// the same leaf certificate should verification fail and the same DHE groups, and
-    /// speaking an HTTP version the
+    /// the same leaf certificate should verification fail, with a DHE group, if its session
+    /// has one, of a size the request accepts, and speaking an HTTP version the
     /// request allows — HTTP/2 when its ALPN chose `h2` and the request forces no version,
     /// HTTP/1 when it chose `http/1.1`, `http/1.0` or nothing and the request doesn't force
     /// HTTP/2 or HTTP/3.
@@ -311,7 +311,12 @@ impl TlsConnector {
                 && *stream.name == *name
                 && stream.sni == (sni && self.settings.tls_sni)
                 && stream.accepted_certificate == descriptor.accepted_certificate()
-                && stream.min_dhe_bits == descriptor.min_dhe_bits()
+                && stream
+                    .stream
+                    .ssl()
+                    .session()
+                    .and_then(|session| session.dhe_bits())
+                    .is_none_or(|bits| bits >= descriptor.min_dhe_bits().unwrap_or(2048))
                 && speaks,
         )
     }
@@ -458,7 +463,6 @@ impl TlsConnector {
             stream,
             name: Box::from(name),
             sni: sni && self.settings.tls_sni,
-            min_dhe_bits: descriptor.min_dhe_bits(),
         })
     }
 
@@ -1023,9 +1027,6 @@ pub struct TlsStream<IO> {
     /// The SHA-256 of the leaf certificate it accepts should verification fail.
     #[cfg_attr(not(feature = "tokio-rt"), allow(dead_code))]
     accepted_certificate: Option<[u8; 32]>,
-    /// The size of the smallest DHE group it accepts, if not 2048 bits.
-    #[cfg_attr(not(feature = "tokio-rt"), allow(dead_code))]
-    min_dhe_bits: Option<u16>,
 }
 
 impl<IO> TlsStream<IO> {
