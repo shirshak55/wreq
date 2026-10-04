@@ -144,25 +144,27 @@ pub struct ReadAheadOnHttp1;
 /// A request body whose first frame can be read ahead (see [`ReadAheadOnHttp1`]).
 pub(crate) trait ReadAhead: Sized {
     /// This body with its first frame read ahead, or an ended one when it has none.
-    fn read_ahead(self) -> impl std::future::Future<Output = Self> + Send;
+    fn read_ahead(self) -> futures_util::future::BoxFuture<'static, Self>;
 }
 
 impl ReadAhead for Body {
-    async fn read_ahead(mut self) -> Body {
+    fn read_ahead(mut self) -> futures_util::future::BoxFuture<'static, Body> {
         use futures_util::StreamExt;
         use http_body_util::{BodyStream, StreamBody};
 
-        match self.frame().await {
-            Some(first) => Body::from(
-                StreamBody::new(
-                    futures_util::stream::once(std::future::ready(first))
-                        .chain(BodyStream::new(self)),
-                )
-                .map_err(BoxError::from)
-                .boxed(),
-            ),
-            None => Body::empty(),
-        }
+        Box::pin(async move {
+            match self.frame().await {
+                Some(first) => Body::from(
+                    StreamBody::new(
+                        futures_util::stream::once(std::future::ready(first))
+                            .chain(BodyStream::new(self)),
+                    )
+                    .map_err(BoxError::from)
+                    .boxed(),
+                ),
+                None => Body::empty(),
+            }
+        })
     }
 }
 
