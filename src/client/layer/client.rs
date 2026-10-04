@@ -642,6 +642,7 @@ where
                         let is_h2 = is_ver_h2 || connected.is_negotiated_h2();
 
                         Either::Left(Box::pin(async move {
+                            let in_scope = scope.is_some();
                             let (io, dropped) =
                                 ScopedIo::new(io, scope.clone(), is_h2, timer.clone());
                             let tx = if is_h2 {
@@ -771,6 +772,7 @@ where
                                 PoolClient {
                                     conn_info: connected,
                                     tx,
+                                    scoped: in_scope,
                                 },
                             ))
                         }))
@@ -823,6 +825,8 @@ impl<C: Clone, B> Clone for HttpClient<C, B> {
 struct PoolClient<B> {
     conn_info: Connected,
     tx: PoolTx<B>,
+    /// Whether it is confined to a scope, which closes it.
+    scoped: bool,
 }
 
 enum PoolTx<B> {
@@ -899,16 +903,19 @@ where
             PoolTx::Http1(tx) => pool::Reservation::Unique(PoolClient {
                 conn_info: self.conn_info,
                 tx: PoolTx::Http1(tx),
+                scoped: self.scoped,
             }),
 
             PoolTx::Http2(tx) => {
                 let b = PoolClient {
                     conn_info: self.conn_info.clone(),
                     tx: PoolTx::Http2(tx.clone()),
+                    scoped: self.scoped,
                 };
                 let a = PoolClient {
                     conn_info: self.conn_info,
                     tx: PoolTx::Http2(tx),
+                    scoped: self.scoped,
                 };
                 pool::Reservation::Shared(a, b)
             }
@@ -918,6 +925,11 @@ where
     #[inline]
     fn can_share(&self) -> bool {
         self.is_http2()
+    }
+
+    #[inline]
+    fn outlives_idle_timeout(&self) -> bool {
+        self.scoped
     }
 }
 

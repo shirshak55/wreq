@@ -23,7 +23,7 @@ use std::{
     hash::{Hash, Hasher},
     sync::{
         Arc,
-        atomic::{AtomicU8, AtomicU64, Ordering},
+        atomic::{AtomicU8, AtomicU64, AtomicUsize, Ordering},
     },
     task::Waker,
 };
@@ -31,7 +31,7 @@ use std::{
 use bytes::Bytes;
 use http::{Uri, Version};
 use name::GroupId;
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{Notify, mpsc, watch};
 use wreq_proto::http2::Control;
 
 use crate::{conn::net::SocketBindOptions, proxy::Matcher, sync::Mutex};
@@ -196,8 +196,9 @@ pub struct ConnectionScope(Arc<(u64, watch::Sender<()>, Arc<Connections>)>);
 /// caller's choosing, the first connection opened in it, once one is: the [`Control`] of
 /// an HTTP/2 one, `None` for an HTTP/1 one, how they end (a [`ConnectionEnd`], 0 until
 /// told, else one past it) and the tasks waiting to be told, what the caller sent them
-/// before the first opened, which that one sends should it speak HTTP/2, and how their
-/// origins end the HTTP/2 ones.
+/// before the first opened, which that one sends should it speak HTTP/2, how their
+/// origins end the HTTP/2 ones, and how many HTTP/1 ones are open, told once an origin
+/// closed the last.
 #[derive(Default)]
 struct Connections {
     http2: Mutex<Vec<(u64, Control)>>,
@@ -206,6 +207,8 @@ struct Connections {
     end_tasks: Mutex<Vec<Waker>>,
     pending: Mutex<Vec<Box<dyn Fn(&Control) + Send>>>,
     origin_ends: OriginEnds,
+    http1_open: AtomicUsize,
+    http1_origin_closed: Notify,
 }
 
 /// How the origins of a scope's HTTP/2 connections end them, as they do, until the caller
@@ -439,6 +442,12 @@ impl ConnectionScope {
         });
     }
 
+    /// Resolves once the origin of an HTTP/1 connection open in this scope closed it, with no
+    /// other open: as a client's own connection to it would have closed.
+    pub async fn http1_origin_closed(&self) {
+        self.0.2.http1_origin_closed.notified().await;
+    }
+
     /// How the origins of this scope's HTTP/2 connections end them, as they do: each GOAWAY
     /// they send, then how they close. Taken by the first call, `None` after it.
     pub fn http2_origin_ends(&self) -> Option<mpsc::UnboundedReceiver<Http2OriginEnd>> {
@@ -585,6 +594,18 @@ impl ScopeRef {
             tasks.push(task.clone());
         }
         ended
+    }
+
+    /// Counts an HTTP/1 connection open in the scope, until [`Self::http1_closed`].
+    pub(crate) fn http1_opened(&self) {
+        self.connections.http1_open.fetch_add(1, Ordering::AcqRel);
+    }
+
+    /// Uncounts an HTTP/1 connection that closed, by its origin when `by_origin`.
+    pub(crate) fn http1_closed(&self, by_origin: bool) {
+        if self.connections.http1_open.fetch_sub(1, Ordering::AcqRel) == 1 && by_origin {
+            self.connections.http1_origin_closed.notify_one();
+        }
     }
 
     /// Tells the scope how the origin of one of its HTTP/2 connections closed it.

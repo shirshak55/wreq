@@ -29,6 +29,8 @@ const SCOPE_END_WAIT: Duration = Duration::from_secs(2);
 /// nothing more, and it closes so once dropped. Dropped, it goes to the receiver
 /// [`ScopedIo::new`] returned, if that is still there.
 ///
+/// An HTTP/1 one is counted open in its scope (see
+/// [`ConnectionScope::http1_origin_closed`](crate::ConnectionScope::http1_origin_closed)).
 /// An HTTP/2 one tells its scope how its origin closed it, and closes as its scope ends,
 /// waiting up to [`SCOPE_END_WAIT`] for that, as the origin's close ends the scope's
 /// client soon after; past it, after its origin's close, it closes with a FIN alone.
@@ -54,6 +56,9 @@ impl<T: Connection + Unpin> ScopedIo<T> {
         timer: Timer,
     ) -> (Self, oneshot::Receiver<T>) {
         let (dropped, dropped_rx) = oneshot::channel();
+        if let (false, Some(scope)) = (http2, &scope) {
+            scope.http1_opened();
+        }
         let scoped = ScopedIo {
             io: Some(io),
             scope,
@@ -87,6 +92,9 @@ impl<T: Connection + Unpin> ScopedIo<T> {
         let reset = match read {
             Poll::Ready(Ok(())) if empty => false,
             Poll::Ready(Err(e)) if e.kind() == io::ErrorKind::ConnectionReset => true,
+            // An HTTP/1 one's origin ended its side on any failed read: a TLS close without
+            // its close_notify, say.
+            Poll::Ready(Err(_)) if !self.http2 => false,
             _ => return,
         };
         if std::mem::replace(&mut self.origin_ended, true) {
@@ -138,6 +146,9 @@ impl<T: AsyncRead + Connection + Unpin> ScopedIo<T> {
 
 impl<T: Connection> Drop for ScopedIo<T> {
     fn drop(&mut self) {
+        if let (false, Some(scope)) = (self.http2, &self.scope) {
+            scope.http1_closed(self.origin_ended);
+        }
         let Some(io) = self.io.take() else {
             return;
         };
