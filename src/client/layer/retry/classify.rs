@@ -1,6 +1,6 @@
 use std::{error::Error as StdError, sync::Arc};
 
-use http::{Method, StatusCode, Uri};
+use http::{Extensions, Method, StatusCode, Uri};
 
 use super::{Req, Res};
 use crate::error::BoxError;
@@ -39,6 +39,11 @@ impl ReqRep<'_> {
     /// Returns the URI of the request.
     pub fn uri(&self) -> &Uri {
         self.0.uri()
+    }
+
+    /// Returns the request's extensions.
+    pub fn extensions(&self) -> &Extensions {
+        self.0.extensions()
     }
 
     /// Returns the HTTP status code if the response was successful.
