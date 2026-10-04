@@ -91,6 +91,8 @@ pub(crate) enum Verdict {
     Accept(Option<Vec<u8>>),
     /// Ends, rejecting the server's certificate with this alert (none: BoringSSL's).
     Reject(Option<u8>),
+    /// Ends without an alert, the connection closed once what the server sent is read.
+    Close,
 }
 
 impl Default for AlpsGate {
@@ -136,6 +138,13 @@ impl AlpsGate {
     /// `internal_error`.
     pub fn reject(&self, alert: Option<u8>) {
         self.verdict.send_replace(Some(Verdict::Reject(alert)));
+    }
+
+    /// Ends the handshake without an alert, as a client closing its connection does: what
+    /// the server sent so far is read first, so the connection ends with a FIN, not the
+    /// reset a socket closed with unread data sends.
+    pub fn close(&self) {
+        self.verdict.send_replace(Some(Verdict::Close));
     }
 
     /// Resolves with `true` once the server asks for a client certificate past the

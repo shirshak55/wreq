@@ -6,6 +6,7 @@ use std::{
     pin::Pin,
     ptr,
     sync::{Arc, LazyLock},
+    task::{Context, Poll, Waker},
     time::{Duration, Instant},
 };
 
@@ -23,7 +24,7 @@ use bytes::Bytes;
 use foreign_types::{ForeignType, ForeignTypeRef};
 use futures_util::future::{FutureExt, Shared};
 use lru::LruCache;
-use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio_btls::SslStream;
 
 use crate::sync::Mutex;
@@ -174,7 +175,7 @@ unsafe extern "C" fn certificate_request(ssl: *mut btls_sys::SSL, _arg: *mut c_v
     };
     let mut state = state.lock();
     match state.verdict {
-        Some(Verdict::Reject(_)) => 0,
+        Some(Verdict::Reject(_) | Verdict::Close) => 0,
         Some(Verdict::Accept(_)) => 1,
         None => {
             state.paused = true;
@@ -438,30 +439,49 @@ where
             Err(error) if error.code() == btls::ssl::ErrorCode::WANT_X509_LOOKUP => error,
             result => return result,
         };
-        if !wait_for_verdict(stream.ssl()).await {
-            return Err(error);
+        match wait_for_verdict(stream.ssl()).await {
+            None => return Err(error),
+            Some(Verdict::Close) => {
+                drain(stream.get_mut());
+                return Err(error);
+            }
+            Some(_) => {}
         }
     }
 }
 
 /// Waits for the verdict of the gate `ssl`'s handshake paused on, should it have paused
-/// on one that decided nothing yet, and records it for the handshake to act on: whether
-/// it waited.
-async fn wait_for_verdict(ssl: &SslRef) -> bool {
+/// on one that decided nothing yet, and records it for the handshake to act on: the
+/// verdict, if it waited for one.
+async fn wait_for_verdict(ssl: &SslRef) -> Option<Verdict> {
     let state = state_index().ok().and_then(|index| ssl.ex_data(index));
     let (Some(state), Some(gate)) = (state, alps_gate(ssl)) else {
-        return false;
+        return None;
     };
     let waiting = {
         let state = state.lock();
         state.paused && state.verdict.is_none()
     };
     if !waiting {
-        return false;
+        return None;
     }
     let verdict = gate.verdict().await;
-    state.lock().verdict = Some(verdict);
-    true
+    state.lock().verdict = Some(verdict.clone());
+    Some(verdict)
+}
+
+/// Reads what `stream` received, without waiting for more, so closing it sends a FIN, not
+/// the reset a socket closed with unread data sends.
+fn drain<S: AsyncRead + Unpin>(stream: &mut S) {
+    let mut chunk = [0; 4096];
+    loop {
+        let mut buf = ReadBuf::new(&mut chunk);
+        let read =
+            Pin::new(&mut *stream).poll_read(&mut Context::from_waker(Waker::noop()), &mut buf);
+        if !matches!(read, Poll::Ready(Ok(()))) || buf.filled().is_empty() {
+            break;
+        }
+    }
 }
 
 /// The caIssuers URLs a connection's certificate verification needed.
@@ -609,6 +629,11 @@ fn verify_chain(
             }
         }
         let verified = ctx.verify_cert()?;
+        // A failed check leaves its errors queued (a bad signature's), which BoringSSL would
+        // take for the handshake's own, failing it where the result decides.
+        if !verified {
+            let _ = ErrorStack::get();
+        }
         let path = ctx
             .chain()
             .into_iter()
