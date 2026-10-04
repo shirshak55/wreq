@@ -406,8 +406,8 @@ impl ConnectionScope {
     }
 
     /// Makes the request recorded as `recorded`, on the HTTP/2 connection of this scope it
-    /// was sent on, reset with `error_code` rather than CANCEL should it be dropped before
-    /// it ends (see [`Control::cancel_with`]): as its client reset it.
+    /// was sent on, reset with `error_code` rather than its own should it be dropped before
+    /// it ends or reset (see [`Control::cancel_with`]): as its client reset it.
     pub fn send_http2_reset(&self, recorded: u32, error_code: u32) {
         self.on_http2(move |control| control.cancel_with(recorded, error_code.into()));
     }
