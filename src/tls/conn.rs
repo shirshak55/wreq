@@ -852,6 +852,19 @@ pub struct QuicSsl {
     /// connection that received it, as it encoded them: a client sending 0-RTT data keeps to
     /// them.
     pub resumed_transport_parameters: Option<Bytes>,
+    /// The server flight `ssl`'s handshake receives.
+    pub server_flight: QuicServerFlight,
+}
+
+/// The server flight a QUIC connection's handshake received so far (see [`QuicSsl`]).
+#[derive(Clone)]
+pub struct QuicServerFlight(SharedFlight);
+
+impl QuicServerFlight {
+    /// The messages received so far (see [`crate::tls::ServerFlight`]).
+    pub fn get(&self) -> crate::tls::ServerFlight {
+        crate::tls::ServerFlight::from(self.0.lock().clone())
+    }
 }
 
 /// Builds a [`QuicTlsConnector`].
@@ -895,10 +908,16 @@ impl QuicTlsConnector {
             }
             cfg.set_ex_data(key_index().map_err(Error::tls)?, key);
         }
+        let server_flight = SharedFlight::default();
+        cfg.set_ex_data(
+            server_flight_index().map_err(Error::tls)?,
+            Arc::clone(&server_flight),
+        );
         let ssl = cfg.into_ssl(name).map_err(Error::tls)?;
         Ok(QuicSsl {
             ssl,
             resumed_transport_parameters,
+            server_flight: QuicServerFlight(server_flight),
         })
     }
 }

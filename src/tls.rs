@@ -15,7 +15,10 @@ use std::borrow::Cow;
 pub use btls::ssl::{ExtensionType, KeyShare};
 use bytes::{BufMut, Bytes, BytesMut};
 use compress::CertificateCompressor;
-pub use conn::{HandshakeFailure, QuicSsl, QuicTlsConnector, QuicTlsConnectorBuilder, TlsStream};
+pub use conn::{
+    HandshakeFailure, QuicServerFlight, QuicSsl, QuicTlsConnector, QuicTlsConnectorBuilder,
+    TlsStream,
+};
 
 /// Http extension carrying extra TLS layer information.
 /// Made available to clients on responses when `tls_info` is set.
