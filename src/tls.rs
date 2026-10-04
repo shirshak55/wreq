@@ -487,6 +487,11 @@ pub struct TlsOptions {
     /// **Default:** `None`
     pub record_size_limit: Option<u16>,
 
+    /// Sets the max_fragment_length mode (RFC 6066) to send as given.
+    ///
+    /// **Default:** `None`
+    pub max_fragment_length: Option<u8>,
+
     /// Whether to skip session tickets when using PSK.
     ///
     /// **Default:** `false`
@@ -791,6 +796,13 @@ impl TlsOptionsBuilder {
     #[inline]
     pub fn record_size_limit<U: Into<Option<u16>>>(mut self, limit: U) -> Self {
         self.config.record_size_limit = limit.into();
+        self
+    }
+
+    /// Sets the max_fragment_length mode.
+    #[inline]
+    pub fn max_fragment_length<U: Into<Option<u8>>>(mut self, mode: U) -> Self {
+        self.config.max_fragment_length = mode.into();
         self
     }
 
@@ -1120,6 +1132,7 @@ impl Default for TlsOptions {
             enable_ocsp_stapling: false,
             enable_signed_cert_timestamps: false,
             record_size_limit: None,
+            max_fragment_length: None,
             psk_skip_session_ticket: false,
             key_shares: None,
             psk_dhe_ke: true,

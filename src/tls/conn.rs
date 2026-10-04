@@ -660,6 +660,9 @@ impl TlsConnectorBuilder {
         // Set TLS record size limit
         set_option!(opts, record_size_limit, connector, set_record_size_limit);
 
+        // Set TLS max fragment length
+        set_option!(opts, max_fragment_length, connector, set_max_fragment_length);
+
         // Set TLS aes hardware override
         set_option!(opts, aes_hw_override, connector, set_aes_hw_override);
 
