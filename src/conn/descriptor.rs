@@ -57,6 +57,14 @@ impl ConnectionId {
     pub(crate) fn new(group: Group) -> Self {
         ConnectionId(Arc::new((group, AtomicU64::new(u64::MIN))))
     }
+
+    /// The ID of the connections this one identifies once they also accept the leaf
+    /// certificate whose DER has the SHA-256 `leaf_sha256` should verification fail.
+    pub(crate) fn accepting(&self, leaf_sha256: [u8; 32]) -> Self {
+        let mut group = self.0.0.clone();
+        group.accepted_certificate(Some(leaf_sha256));
+        Self::new(group)
+    }
 }
 
 impl Hash for ConnectionId {

@@ -56,7 +56,8 @@ pub(crate) fn client_hello_index() -> Result<Index<Ssl, bytes::Bytes>, ErrorStac
 /// Where each connection keeps the origin's server-flight handshake messages, in the
 /// order received (see [`record_handshake_message`] and [`crate::tls::ServerFlight`]),
 /// shared with every [`crate::tls::TlsInfo`] taken of it, which reads it live: the
-/// NewSessionTickets arrive after the handshake, once the connection is in use.
+/// NewSessionTickets arrive after the handshake, once the connection is in use (see
+/// [`keeps`]).
 pub(crate) fn server_flight_index() -> Result<Index<Ssl, SharedFlight>, ErrorStack> {
     static IDX: LazyLock<Result<Index<Ssl, SharedFlight>, ErrorStack>> =
         LazyLock::new(Ssl::new_ex_index);
@@ -105,17 +106,51 @@ unsafe extern "C" fn record_handshake_message(
         }
         return;
     }
-    // The origin's server flight, kept in order. NewSessionTickets arrive after the
-    // handshake completes, so this keeps appending for the connection's whole life.
+    // The origin's server flight, kept in order (see `keeps`).
     let Ok(index) = server_flight_index() else {
         return;
     };
-    let record = bytes::Bytes::copy_from_slice(message);
+    let record = || bytes::Bytes::copy_from_slice(message);
     if let Some(flight) = ssl.ex_data(index) {
-        flight.lock().push(record);
+        let mut flight = flight.lock();
+        let late_request = message[0] == CERTIFICATE_REQUEST
+            && flight.iter().any(|msg| msg.first() == Some(&FINISHED));
+        if keeps(&flight, message[0]) {
+            flight.push(record());
+        }
+        drop(flight);
+        if late_request && let Some(gate) = aia::alps_gate(ssl) {
+            gate.note_late_certificate_request();
+        }
     } else {
-        ssl.set_ex_data(index, Arc::new(crate::sync::Mutex::new(vec![record])));
+        ssl.set_ex_data(index, Arc::new(crate::sync::Mutex::new(vec![record()])));
     }
+}
+
+/// The most NewSessionTickets a server flight keeps: BoringSSL's servers send at most 16.
+const MAX_FLIGHT_TICKETS: usize = 16;
+
+const CERTIFICATE_REQUEST: u8 = 13;
+const FINISHED: u8 = 20;
+
+/// Whether a server `flight` keeps a handshake message of type `kind` the server sent next.
+/// Past its handshake (its Finished), a server may send handshake messages for the
+/// connection's whole life, so only the first NewSessionTickets and a CertificateRequest
+/// (post-handshake authentication, or a renegotiation's) if it has none are kept.
+fn keeps(flight: &[bytes::Bytes], kind: u8) -> bool {
+    const NEW_SESSION_TICKET: u8 = 4;
+    let count = |kind| {
+        flight
+            .iter()
+            .filter(|msg| msg.first() == Some(&kind))
+            .count()
+    };
+    count(FINISHED) == 0
+        || match kind {
+            NEW_SESSION_TICKET => count(NEW_SESSION_TICKET) < MAX_FLIGHT_TICKETS,
+            CERTIFICATE_REQUEST => count(CERTIFICATE_REQUEST) == 0,
+            _ => false,
+        }
 }
 
 /// A connection's server flight so far, shared with the `TlsInfo`s taken of it.
@@ -251,7 +286,8 @@ impl TlsConnector {
 
     /// Whether `stream` can serve `descriptor`'s requests as the connection this connector
     /// would open for it: opened by it, verifying and announcing the same name, accepting
-    /// the same leaf certificate should verification fail, and speaking an HTTP version the
+    /// the same leaf certificate should verification fail and the same DHE groups, and
+    /// speaking an HTTP version the
     /// request allows — HTTP/2 when its ALPN chose `h2` and the request forces no version,
     /// HTTP/1 when it chose `http/1.1`, `http/1.0` or nothing and the request doesn't force
     /// HTTP/2 or HTTP/3.
@@ -275,6 +311,7 @@ impl TlsConnector {
                 && *stream.name == *name
                 && stream.sni == (sni && self.settings.tls_sni)
                 && stream.accepted_certificate == descriptor.accepted_certificate()
+                && stream.min_dhe_bits == descriptor.min_dhe_bits()
                 && speaks,
         )
     }
@@ -415,10 +452,13 @@ impl TlsConnector {
         }
         forbid_http2_renegotiation(stream.ssl());
         Ok(TlsStream {
+            accepted_certificate: descriptor
+                .accepted_certificate()
+                .or_else(|| aia::accepted_certificate(stream.ssl())),
             stream,
             name: Box::from(name),
             sni: sni && self.settings.tls_sni,
-            accepted_certificate: descriptor.accepted_certificate(),
+            min_dhe_bits: descriptor.min_dhe_bits(),
         })
     }
 
@@ -777,8 +817,14 @@ impl TlsConnectorBuilder {
                 let cache = session_cache.clone();
                 move |ssl, session| {
                     if let Ok(Some(key)) = key_index().map(|idx| ssl.ex_data(idx)) {
+                        // A certificate failing verification that the connection's gate
+                        // accepted is trusted only by the connections accepting it.
+                        let key = match aia::accepted_certificate(ssl) {
+                            Some(leaf_sha256) => key.accepting(leaf_sha256),
+                            None => key.clone(),
+                        };
                         cache.put(
-                            key.clone(),
+                            key,
                             TlsSession(session, peer_quic_transport_parameters(ssl)),
                         );
                     }
@@ -977,6 +1023,9 @@ pub struct TlsStream<IO> {
     /// The SHA-256 of the leaf certificate it accepts should verification fail.
     #[cfg_attr(not(feature = "tokio-rt"), allow(dead_code))]
     accepted_certificate: Option<[u8; 32]>,
+    /// The size of the smallest DHE group it accepts, if not 2048 bits.
+    #[cfg_attr(not(feature = "tokio-rt"), allow(dead_code))]
+    min_dhe_bits: Option<u16>,
 }
 
 impl<IO> TlsStream<IO> {
@@ -1138,7 +1187,8 @@ impl HandshakeFailure {
     }
 
     /// The certification path verifying the server certificate built, leaf first (DER), as
-    /// far as it got; empty when verification never ran.
+    /// far as it got; empty when verification never ran or the client verifies without an
+    /// [`AiaCache`] (see [`ClientBuilder::tls_aia`](crate::ClientBuilder::tls_aia)).
     pub fn verified_path(&self) -> impl Iterator<Item = &[u8]> {
         self.verified_path.iter().map(|cert| cert.as_ref())
     }
@@ -1200,13 +1250,19 @@ impl<IO: AsyncRead + AsyncWrite + Unpin> AsyncWrite for TlsStream<IO> {
 /// The stream a TLS connection runs over, writing the records it sends before the
 /// server's first byte (its ClientHello) with `version` as their record version, rather
 /// than the TLS 1.0 BoringSSL writes them with, and the ClientHello in records of the
-/// `layout` lengths (see [`TlsOptions::hello_record_layout`]).
+/// `layout` lengths (see [`TlsOptions::hello_record_layout`]), the second one answering a
+/// HelloRetryRequest too, as a client fragments both alike.
 pub struct HelloRecords<IO> {
     io: IO,
     version: Option<[u8; 2]>,
     framing: Framing,
-    /// The ClientHello's record layout, until the ClientHello went out in it.
+    /// The ClientHello's record layout.
     layout: Option<Cow<'static, [u16]>>,
+    /// Whether the next ClientHello goes out in `layout`'s records: the first, and the
+    /// second once the server's first message was a HelloRetryRequest.
+    relaying: bool,
+    /// The server's first bytes, while they may yet show a HelloRetryRequest.
+    server_head: Option<Vec<u8>>,
     /// The ClientHello's records as written, held until the ClientHello is complete.
     held: Vec<u8>,
     /// Bytes accepted but not yet written to `io`, from `sent` on.
@@ -1252,20 +1308,47 @@ impl Framing {
 /// The largest fragment a TLS record carries (RFC 8446 §5.1).
 const MAX_FRAGMENT: usize = 1 << 14;
 
+/// The bytes of a server's first record up to the end of its ServerHello's random: the
+/// record header, the handshake header, the version and the random.
+const SERVER_HELLO_RANDOM_END: usize = 5 + 4 + 2 + 32;
+
 impl<IO> HelloRecords<IO> {
     fn new(io: IO, settings: &HandshakeSettings) -> Self {
+        let layout = settings
+            .hello_record_layout
+            .clone()
+            .filter(|layout| !layout.is_empty());
         Self {
             io,
             version: settings.hello_record_version.map(u16::to_be_bytes),
             framing: Framing::default(),
-            layout: settings
-                .hello_record_layout
-                .clone()
-                .filter(|layout| !layout.is_empty()),
+            relaying: layout.is_some(),
+            server_head: layout.as_ref().map(|_| Vec::new()),
+            layout,
             held: Vec::new(),
             pending: Vec::new(),
             sent: 0,
         }
+    }
+
+    /// Takes `read`, the server's next bytes, until they show whether its first message is a
+    /// HelloRetryRequest, which the second ClientHello answers.
+    fn read_server_head(&mut self, read: &[u8]) {
+        let Some(head) = &mut self.server_head else {
+            return;
+        };
+        let take = read.len().min(SERVER_HELLO_RANDOM_END - head.len());
+        head.extend_from_slice(&read[..take]);
+        if head.len() < SERVER_HELLO_RANDOM_END {
+            return;
+        }
+        // A handshake record carrying a whole ServerHello random.
+        let retry = head[0] == 0x16
+            && usize::from(u16::from_be_bytes([head[3], head[4]])) >= SERVER_HELLO_RANDOM_END - 5
+            && head[5] == 2
+            && head[11..] == crate::tls::ServerFlight::HRR_RANDOM;
+        self.relaying = retry;
+        self.server_head = None;
     }
 
     /// Moves `bytes`, records written after the ClientHello's, to `pending`, with
@@ -1278,14 +1361,24 @@ impl<IO> HelloRecords<IO> {
     }
 
     /// Once `held` carries the whole ClientHello, queues it in the layout's records (and
-    /// whatever was written after it as written) and ends the layout. A write `held` can't
-    /// be the ClientHello's records in goes out as written.
+    /// whatever was written before and after it as written). A write `held` can't be the
+    /// ClientHello's records in goes out as written.
     fn relayout(&mut self) {
         let Some(layout) = self.layout.as_deref() else {
             return;
         };
+        // Records ahead of the ClientHello (a ChangeCipherSpec before a second one).
+        let mut ahead = 0;
+        while let Some(header) = self.held.get(ahead..ahead + 5)
+            && header[0] != 0x16
+        {
+            ahead += 5 + usize::from(u16::from_be_bytes([header[3], header[4]]));
+        }
+        if ahead > self.held.len() {
+            return;
+        }
         let mut hello = Vec::new();
-        let mut at = 0;
+        let mut at = ahead;
         let mut record_version = [3, 1];
         let complete = loop {
             let Some(header) = self.held.get(at..at + 5) else {
@@ -1313,21 +1406,24 @@ impl<IO> HelloRecords<IO> {
             return;
         }
         let version = self.version.unwrap_or(record_version);
+        let mut records = Vec::new();
         let mut rest = hello.as_slice();
         let mut lengths = layout.iter().map(|&length| usize::from(length));
         while !rest.is_empty() {
             let length = lengths.next().unwrap_or(MAX_FRAGMENT).min(rest.len());
             let (fragment, after) = rest.split_at(length);
-            self.pending.push(0x16);
-            self.pending.extend_from_slice(&version);
-            self.pending
-                .extend_from_slice(&(length as u16).to_be_bytes());
-            self.pending.extend_from_slice(fragment);
+            records.push(0x16);
+            records.extend_from_slice(&version);
+            records.extend_from_slice(&(length as u16).to_be_bytes());
+            records.extend_from_slice(fragment);
             rest = after;
         }
-        self.layout = None;
+        self.relaying = false;
         let after = self.held.split_off(at);
-        self.held = Vec::new();
+        let mut ahead_records = std::mem::take(&mut self.held);
+        ahead_records.truncate(ahead);
+        self.pass(ahead_records);
+        self.pending.extend_from_slice(&records);
         self.pass(after);
     }
 
@@ -1371,6 +1467,7 @@ impl<IO: AsyncRead + Unpin> AsyncRead for HelloRecords<IO> {
         let read = Pin::new(&mut self.io).poll_read(cx, buf);
         if buf.filled().len() > filled {
             self.version = None;
+            self.read_server_head(&buf.filled()[filled..]);
         }
         read
     }
@@ -1383,7 +1480,7 @@ impl<IO: AsyncWrite + Unpin> AsyncWrite for HelloRecords<IO> {
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
         std::task::ready!(self.poll_send(cx))?;
-        if self.layout.is_some() {
+        if self.relaying {
             self.held.extend_from_slice(buf);
             self.relayout();
             return Poll::Ready(Ok(buf.len()));
@@ -1402,7 +1499,7 @@ impl<IO: AsyncWrite + Unpin> AsyncWrite for HelloRecords<IO> {
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         // A flush with the ClientHello still incomplete sends its records as written.
         if !self.held.is_empty() {
-            self.layout = None;
+            self.relaying = false;
             let held = std::mem::take(&mut self.held);
             self.pass(held);
         }

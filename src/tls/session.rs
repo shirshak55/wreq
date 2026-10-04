@@ -92,6 +92,12 @@ impl Key {
         }
         Key(ConnectionId::new(group))
     }
+
+    /// The key of the sessions of this key's connections also accepting the leaf certificate
+    /// whose DER has the SHA-256 `leaf_sha256` should verification fail.
+    pub(super) fn accepting(&self, leaf_sha256: [u8; 32]) -> Self {
+        Key(self.0.accepting(leaf_sha256))
+    }
 }
 
 // ===== impl TlsSession =====

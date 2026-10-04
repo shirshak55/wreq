@@ -39,6 +39,10 @@ pub(crate) fn tls_info_of(ssl: &btls::ssl::SslRef) -> TlsInfo {
         aia_fetches: crate::tls::trust::aia::fetches(ssl),
         verified_path: crate::tls::trust::aia::verified_path(ssl),
         peer_ocsp: ssl.ocsp_status().map(Bytes::copy_from_slice),
+        dhe_bits: ssl.session().and_then(|session| session.dhe_bits()),
+        verify_error: crate::tls::trust::aia::verify_result(ssl)
+            .err()
+            .map(|error| (error.as_raw(), error.error_string())),
         peer_certificate: ssl
             .peer_certificate()
             .and_then(|cert| cert.to_der().ok())

@@ -575,7 +575,8 @@ impl RequestBuilder {
     }
 
     /// Makes a connection [`Self::tls_connect`] opens wait on `gate` for the application
-    /// settings (ALPS) it sends (see [`AlpsGate`](crate::tls::AlpsGate)).
+    /// settings (ALPS) it sends, and for whether it trusts a certificate failing
+    /// verification (see [`AlpsGate`](crate::tls::AlpsGate)).
     pub fn alps_gate(mut self, gate: crate::tls::AlpsGate) -> RequestBuilder {
         if let Ok(ref mut req) = self.request {
             req.extensions_mut().insert(gate);

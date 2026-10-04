@@ -37,6 +37,8 @@ pub struct TlsInfo {
     pub(crate) aia_fetches: Vec<trust::AiaFetch>,
     pub(crate) verified_path: Option<Vec<Bytes>>,
     pub(crate) peer_ocsp: Option<Bytes>,
+    pub(crate) dhe_bits: Option<u16>,
+    pub(crate) verify_error: Option<(i32, &'static str)>,
 }
 
 /// The raw handshake messages an origin sent this connection (its server flight), in the
@@ -54,21 +56,37 @@ pub struct TlsInfo {
 ///
 /// Tickets arrive after the handshake completes, so the flight grows as the connection is
 /// read; take a snapshot once the response head is in hand for the tickets sent so far.
+/// Past the server's Finished, it keeps only its first 16 NewSessionTickets and its first
+/// CertificateRequest (post-handshake authentication, or a renegotiation's).
 #[derive(Debug, Clone, Default)]
 pub struct ServerFlight {
     messages: Vec<Bytes>,
 }
 
-/// Lets a client connection's handshake wait, once the server's flight is in and its
-/// certificate verified, for the application settings (ALPS) it sends: a proxy learning
-/// them from its own client mid-handshake supplies them then (see
+/// Lets a client connection's handshake wait, once the server's flight is in and an
+/// [`AiaCache`](trust::AiaCache) verified its certificate (see
+/// [`ClientBuilder::tls_aia`](crate::ClientBuilder::tls_aia)), for its caller: a proxy
+/// answering its own client meanwhile (see
 /// [`RequestBuilder::alps_gate`](crate::RequestBuilder::alps_gate)). The handshake pauses
-/// only when the server negotiated ALPS; [`AlpsGate::paused`] resolves with what the
-/// server sent so far when it does.
+/// when the server negotiated application settings (ALPS), for the settings it sends, and
+/// when its certificate failed verification (see [`TlsInfo::verify_error`]), for whether
+/// it goes on trusting that leaf certificate alone; [`AlpsGate::paused`] resolves with
+/// what the server sent so far when it does. It also tells when the server asks for a
+/// client certificate past the handshake (see [`AlpsGate::late_certificate_request`]).
 #[derive(Clone, Debug)]
 pub struct AlpsGate {
     paused: tokio::sync::watch::Sender<Option<TlsInfo>>,
-    settings: tokio::sync::watch::Sender<Option<Option<Vec<u8>>>>,
+    verdict: tokio::sync::watch::Sender<Option<Verdict>>,
+    late_certificate_request: tokio::sync::watch::Sender<bool>,
+}
+
+/// What a paused handshake does once its [`AlpsGate`]'s caller decides.
+#[derive(Clone, Debug)]
+pub(crate) enum Verdict {
+    /// Goes on, sending these application settings (none: the ones configured).
+    Accept(Option<Vec<u8>>),
+    /// Ends, rejecting the server's certificate.
+    Reject,
 }
 
 impl Default for AlpsGate {
@@ -82,7 +100,8 @@ impl AlpsGate {
     pub fn new() -> Self {
         Self {
             paused: tokio::sync::watch::Sender::new(None),
-            settings: tokio::sync::watch::Sender::new(None),
+            verdict: tokio::sync::watch::Sender::new(None),
+            late_certificate_request: tokio::sync::watch::Sender::new(false),
         }
     }
 
@@ -100,23 +119,43 @@ impl AlpsGate {
     }
 
     /// Supplies the settings the connection sends (none: the ones it was configured
-    /// with), resuming its handshake.
+    /// with), resuming its handshake, on the server's certificate should it have failed
+    /// verification.
     pub fn supply(&self, settings: Option<Vec<u8>>) {
-        self.settings.send_replace(Some(settings));
+        self.verdict.send_replace(Some(Verdict::Accept(settings)));
+    }
+
+    /// Ends the handshake, rejecting the server's certificate with the alert BoringSSL
+    /// sends for its verification failure (`certificate_unknown` for one that verified).
+    pub fn reject(&self) {
+        self.verdict.send_replace(Some(Verdict::Reject));
+    }
+
+    /// Resolves with `true` once the server asks for a client certificate past the
+    /// handshake (TLS 1.3 post-handshake authentication, or a TLS 1.2 renegotiation's), or
+    /// with `false` once the connection, and every clone of this gate, is gone without it
+    /// asking.
+    pub fn late_certificate_request(&self) -> impl Future<Output = bool> + Send + 'static {
+        let mut requested = self.late_certificate_request.subscribe();
+        async move { requested.wait_for(|requested| *requested).await.is_ok() }
+    }
+
+    pub(crate) fn note_late_certificate_request(&self) {
+        self.late_certificate_request.send_replace(true);
     }
 
     pub(crate) fn pause(&self, info: TlsInfo) {
         self.paused.send_replace(Some(info));
     }
 
-    pub(crate) async fn settings(&self) -> Option<Vec<u8>> {
-        let mut settings = self.settings.subscribe();
+    pub(crate) async fn verdict(&self) -> Verdict {
+        let mut verdict = self.verdict.subscribe();
         loop {
-            if let Some(settings) = settings.borrow_and_update().clone() {
-                return settings;
+            if let Some(verdict) = verdict.borrow_and_update().clone() {
+                return verdict;
             }
-            if settings.changed().await.is_err() {
-                return None;
+            if verdict.changed().await.is_err() {
+                std::future::pending::<()>().await;
             }
         }
     }
@@ -249,6 +288,19 @@ impl TlsInfo {
         self.hello_retry_request
     }
 
+    /// The size, in bits, of the prime of the TLS 1.2 DHE group the connection's session was
+    /// established with, by this handshake or the one it resumed, if it used one.
+    pub fn dhe_bits(&self) -> Option<u16> {
+        self.dhe_bits
+    }
+
+    /// Why the server's certificate failed verification, if it did (a handshake goes on past
+    /// that without verification, or as its [`AlpsGate`] decides): the `X509_V_ERR_*` code
+    /// and its description.
+    pub fn verify_error(&self) -> Option<(i32, &'static str)> {
+        self.verify_error
+    }
+
     /// The caIssuers URLs whose issuers the certificate verification needed (see
     /// [`AiaCache`](trust::AiaCache)), in the order it needed them.
     pub fn aia_fetches(&self) -> &[trust::AiaFetch] {
@@ -307,7 +359,8 @@ impl TlsInfo {
     /// The certification path verifying the peer certificate built, leaf first (DER): from
     /// the certificates the peer sent, and any issuers fetched, to the trust anchor it
     /// reached, else as far as it got. `None` when the handshake verified none (a resumed
-    /// session).
+    /// session) or its client verifies without an [`AiaCache`](trust::AiaCache) (see
+    /// [`ClientBuilder::tls_aia`](crate::ClientBuilder::tls_aia)).
     pub fn verified_path(&self) -> Option<impl Iterator<Item = &[u8]>> {
         self.verified_path
             .as_ref()
@@ -501,7 +554,8 @@ pub struct TlsOptions {
     /// **Default:** `None`
     pub record_size_limit: Option<u16>,
 
-    /// Sets the max_fragment_length mode (RFC 6066) to send as given.
+    /// Sets the max_fragment_length mode (RFC 6066) to send as given, an invalid one such as
+    /// zero included.
     ///
     /// **Default:** `None`
     pub max_fragment_length: Option<u8>,

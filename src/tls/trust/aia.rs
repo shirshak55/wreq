@@ -13,6 +13,7 @@ use btls::{
     asn1::Asn1ObjectRef,
     error::ErrorStack,
     ex_data::Index,
+    hash::MessageDigest,
     nid::Nid,
     ssl::{Ssl, SslAlert, SslRef, SslVerifyError},
     stack::Stack,
@@ -26,7 +27,7 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use tokio_btls::SslStream;
 
 use crate::sync::Mutex;
-use crate::tls::AlpsGate;
+use crate::tls::{AlpsGate, Verdict};
 
 /// How many missing issuers one verification fetches, one chain level each.
 const MAX_LEVELS: usize = 3;
@@ -122,10 +123,12 @@ struct State {
     error: Option<X509VerifyError>,
     /// The certification path its last verification built, leaf first (DER).
     path: Vec<Bytes>,
-    /// Whether the handshake paused for its ALPS gate, and the settings the gate
-    /// supplied, to send once the verification is retried.
-    alps_paused: bool,
-    alps_settings: Option<Option<Vec<u8>>>,
+    /// Whether the handshake paused for its gate, the leaf certificate (SHA-256) whose
+    /// failed verification paused it, if that did, and the gate's verdict, acted on once
+    /// the verification is retried.
+    paused: bool,
+    failed_leaf: Option<[u8; 32]>,
+    verdict: Option<Verdict>,
 }
 
 fn gate_index() -> Result<Index<Ssl, AlpsGate>, ErrorStack> {
@@ -141,7 +144,7 @@ pub(crate) fn set_alps_gate(ssl: &mut Ssl, gate: AlpsGate) -> Result<(), ErrorSt
     Ok(())
 }
 
-fn alps_gate(ssl: &SslRef) -> Option<&AlpsGate> {
+pub(crate) fn alps_gate(ssl: &SslRef) -> Option<&AlpsGate> {
     gate_index().ok().and_then(|index| ssl.ex_data(index))
 }
 
@@ -182,12 +185,15 @@ impl AiaCache {
         if ssl.ex_data(index).is_none() {
             ssl.set_ex_data(index, Mutex::new(State::default()));
         }
-        // The settings the ALPS gate supplied while the verification waited (see
-        // [`handshake`]) go on the connection before this retry finishes it.
+        // The settings the gate supplied while the verification waited (see [`handshake`])
+        // go on the connection before this retry finishes it.
         let supplied = ssl
             .ex_data(index)
-            .and_then(|state| state.lock().alps_settings.take());
-        if let Some(Some(settings)) = supplied {
+            .and_then(|state| match &state.lock().verdict {
+                Some(Verdict::Accept(settings)) => settings.clone(),
+                _ => None,
+            });
+        if let Some(settings) = supplied {
             // Failing here means the server negotiated no ALPS after all.
             let _ = ssl.set_pending_application_settings(&settings);
         }
@@ -228,15 +234,19 @@ impl AiaCache {
         }
 
         state.path = path;
+        // A renegotiation's verification, which no handshake waits on, doesn't pause.
+        // SAFETY: `ssl` is a live `SSL`.
+        #[allow(unsafe_code)]
+        let renegotiating = unsafe { btls_sys::SSL_total_renegotiations(ssl.as_ptr()) } > 0;
+        let gate = alps_gate(ssl).filter(|_| !state.paused && !renegotiating);
         match result {
             // The verify callback may accept a chain despite an error.
-            _ if verified => {
+            _ if verified && !matches!(state.verdict, Some(Verdict::Reject)) => {
                 state.error = None;
-                if let Some(gate) = alps_gate(ssl)
-                    && !state.alps_paused
+                if let Some(gate) = gate
                     && ssl.peer_application_settings().is_some()
                 {
-                    state.alps_paused = true;
+                    state.paused = true;
                     // Reading the connection's TLS takes this state's lock again.
                     drop(state);
                     gate.pause(crate::conn::tls_info_of(ssl));
@@ -247,6 +257,22 @@ impl AiaCache {
             result => {
                 let error = result.err();
                 state.error = error;
+                // A gate's caller decides whether the handshake goes on trusting the leaf
+                // certificate alone, which a renegotiation can't swap.
+                let leaf = leaf_sha256(ssl);
+                if let Some(gate) = gate {
+                    state.paused = true;
+                    state.failed_leaf = leaf;
+                    drop(state);
+                    gate.pause(crate::conn::tls_info_of(ssl));
+                    return Err(SslVerifyError::Retry);
+                }
+                if matches!(state.verdict, Some(Verdict::Accept(_)))
+                    && leaf.is_some()
+                    && leaf == state.failed_leaf
+                {
+                    return Ok(());
+                }
                 let raw = error.map_or(btls_sys::X509_V_ERR_UNSPECIFIED as c_int, |error| {
                     error.as_raw()
                 });
@@ -365,12 +391,12 @@ where
                         let gate = alps_gate(stream.ssl());
                         let waiting = state.is_some_and(|state| {
                             let state = state.lock();
-                            state.alps_paused && state.alps_settings.is_none()
+                            state.paused && state.verdict.is_none()
                         });
                         match (state, gate) {
                             (Some(state), Some(gate)) if waiting => {
-                                let settings = gate.settings().await;
-                                state.lock().alps_settings = Some(settings);
+                                let verdict = gate.verdict().await;
+                                state.lock().verdict = Some(verdict);
                             }
                             _ => return Err(error),
                         }
@@ -391,9 +417,28 @@ pub(crate) fn fetches(ssl: &SslRef) -> Vec<AiaFetch> {
         .unwrap_or_default()
 }
 
+/// The SHA-256 of the leaf certificate a connection's gate accepted despite its failed
+/// verification (see [`AlpsGate`]), if it did.
+pub(crate) fn accepted_certificate(ssl: &SslRef) -> Option<[u8; 32]> {
+    let state = state_index()
+        .ok()
+        .and_then(|index| ssl.ex_data(index))?
+        .lock();
+    state
+        .failed_leaf
+        .filter(|_| matches!(state.verdict, Some(Verdict::Accept(_))))
+}
+
+/// The SHA-256 of the leaf certificate `ssl`'s peer presented, if it presented one.
+fn leaf_sha256(ssl: &SslRef) -> Option<[u8; 32]> {
+    let leaf = ssl.peer_cert_chain()?.iter().next()?;
+    let digest = leaf.digest(MessageDigest::sha256()).ok()?;
+    <[u8; 32]>::try_from(&*digest).ok()
+}
+
 /// The certification path a connection's certificate verification built, leaf first (DER):
 /// to the trust anchor it reached, else as far as it got; `None` when none ran (a resumed
-/// session).
+/// session) or the connection verifies without this cache.
 pub(crate) fn verified_path(ssl: &SslRef) -> Option<Vec<Bytes>> {
     state_index()
         .ok()
