@@ -385,6 +385,33 @@ impl ConnectionScope {
         });
     }
 
+    /// Sends a frame of a type HTTP/2 doesn't define, of `kind`, `flags` and `payload`, on
+    /// the connection (`stream_id` 0) or the request recorded as `stream_id` on each HTTP/2
+    /// connection open in this scope, as it numbers it (see [`Control::send_unknown`]),
+    /// following the request recorded as `after` (see [`Control::after_request`]).
+    pub fn send_http2_unknown(
+        &self,
+        after: u32,
+        kind: u8,
+        flags: u8,
+        stream_id: u32,
+        payload: &[u8],
+    ) {
+        let payload = payload.to_vec();
+        self.on_http2(move |control| {
+            control
+                .after_request(after)
+                .send_unknown(kind, flags, stream_id, &payload)
+        });
+    }
+
+    /// Makes the request recorded as `recorded`, on the HTTP/2 connection of this scope it
+    /// was sent on, reset with `error_code` rather than CANCEL should it be dropped before
+    /// it ends (see [`Control::cancel_with`]): as its client reset it.
+    pub fn send_http2_reset(&self, recorded: u32, error_code: u32) {
+        self.on_http2(move |control| control.cancel_with(recorded, error_code.into()));
+    }
+
     /// Tells each HTTP/2 connection open in this scope that the request recorded as
     /// `recorded` won't be sent on it unless it was (see [`Control::release_request`]).
     pub fn release_http2_request(&self, recorded: u32) {
