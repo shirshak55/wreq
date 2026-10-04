@@ -209,6 +209,10 @@ cyper = { version = "0.9.0",  default-features = false, features = ["rustls", "s
 [patch.crates-io]
 btls = { git = "https://github.com/shirshak55/btls", rev = "e3a10c3d8b6131c138247e7fe318066e9eef253a" }
 btls-sys = { git = "https://github.com/shirshak55/btls", rev = "e3a10c3d8b6131c138247e7fe318066e9eef253a" }
+# The wreq-proto and http2 forks carrying the HTTP/2 controls (`Control`, frame logs and
+# relays) this fork's connection scopes use.
+http2 = { git = "https://github.com/shirshak55/http2", branch = "wiremason" }
+wreq-proto = { git = "https://github.com/shirshak55/wreq-proto", branch = "wiremason" }
 
 [profile.release]
 codegen-units = 1
