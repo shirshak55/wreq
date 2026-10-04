@@ -10,7 +10,7 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use tokio_btls::SslStream;
 use tower::{BoxError, Service};
 
-use super::{EstablishedConn, HelloRecords, HttpsConnector, MaybeHttpsStream};
+use super::{EstablishedConn, HandshakeSettings, HelloRecords, HttpsConnector, MaybeHttpsStream};
 use crate::{
     conn::{Connection, descriptor::ConnectionDescriptor},
     ext::UriExt,
@@ -21,12 +21,12 @@ type BoxFuture<T, E> = Pin<Box<dyn Future<Output = Result<T, E>> + Send>>;
 async fn perform_handshake<T>(
     ssl: btls::ssl::Ssl,
     conn: T,
-    hello_record_version: Option<u16>,
+    settings: &HandshakeSettings,
 ) -> Result<MaybeHttpsStream<T>, BoxError>
 where
     T: AsyncRead + AsyncWrite + Unpin,
 {
-    let mut stream = SslStream::new(ssl, HelloRecords::new(conn, hello_record_version))?;
+    let mut stream = SslStream::new(ssl, HelloRecords::new(conn, settings))?;
     crate::tls::trust::aia::handshake(&mut stream).await?;
     super::forbid_http2_renegotiation(stream.ssl());
     Ok(MaybeHttpsStream::Https(stream))
@@ -61,7 +61,7 @@ where
             }
 
             let ssl = tls.setup_ssl(uri)?;
-            perform_handshake(ssl, conn, tls.settings.hello_record_version).await
+            perform_handshake(ssl, conn, &tls.settings).await
         };
 
         Box::pin(f)
@@ -98,7 +98,7 @@ where
             }
 
             let ssl = tls.setup_ssl2(descriptor)?;
-            perform_handshake(ssl, conn, tls.settings.hello_record_version).await
+            perform_handshake(ssl, conn, &tls.settings).await
         };
 
         Box::pin(f)
@@ -131,7 +131,7 @@ where
             }
 
             let ssl = tls.setup_ssl2(conn.descriptor)?;
-            perform_handshake(ssl, conn.io, tls.settings.hello_record_version).await
+            perform_handshake(ssl, conn.io, &tls.settings).await
         };
 
         Box::pin(fut)

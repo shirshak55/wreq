@@ -653,6 +653,14 @@ pub struct TlsOptions {
     /// **Default:** `None`
     pub hello_record_version: Option<u16>,
 
+    /// The fragment lengths of the handshake records carrying the ClientHello, all but its
+    /// last: the ClientHello goes out in records of these lengths, while it lasts, and the
+    /// rest of it in one record (in records of at most 2^14 bytes, a longer rest), rather
+    /// than in the records BoringSSL writes.
+    ///
+    /// **Default:** `None`
+    pub hello_record_layout: Option<Cow<'static, [u16]>>,
+
     /// The length of the random payload of the GREASE ECH extension (see
     /// [`TlsOptions::enable_ech_grease`]), at least 1 byte. `None` picks a random multiple of
     /// 32 bytes from 128 to 224 plus the 16-byte AEAD tag.
@@ -1012,6 +1020,16 @@ impl TlsOptionsBuilder {
         self
     }
 
+    /// Sets the fragment lengths of the records carrying the ClientHello, all but its last.
+    #[inline]
+    pub fn hello_record_layout<T>(mut self, layout: T) -> Self
+    where
+        T: Into<Cow<'static, [u16]>>,
+    {
+        self.config.hello_record_layout = Some(layout.into());
+        self
+    }
+
     /// Sets the length of the GREASE ECH extension's random payload.
     #[inline]
     pub fn ech_grease_payload_length<T>(mut self, len: T) -> Self
@@ -1127,6 +1145,7 @@ impl Default for TlsOptions {
             trust_anchors: None,
             session_id_length: None,
             hello_record_version: None,
+            hello_record_layout: None,
             ech_grease_payload_length: None,
             ech_grease_cipher_suite: None,
             aes_hw_override: None,

@@ -135,6 +135,7 @@ pub struct HandshakeSettings {
     random_aes_hw_override: bool,
     renegotiation: bool,
     hello_record_version: Option<u16>,
+    hello_record_layout: Option<Cow<'static, [u16]>>,
 }
 
 /// A Connector using BoringSSL to support `http` and `https` schemes.
@@ -402,7 +403,7 @@ impl TlsConnector {
         if let Some(gate) = gate {
             aia::set_alps_gate(&mut ssl, gate)?;
         }
-        let io = HelloRecords::new(io, self.settings.hello_record_version);
+        let io = HelloRecords::new(io, &self.settings);
         let mut stream = SslStream::new(ssl, io)?;
         if let Err(error) = aia::handshake(&mut stream).await {
             return Err(HandshakeFailure::new(error, stream.ssl()).into());
@@ -756,6 +757,7 @@ impl TlsConnectorBuilder {
             random_aes_hw_override: opts.random_aes_hw_override,
             renegotiation: opts.renegotiation || opts.renegotiation_scsv,
             hello_record_version: opts.hello_record_version,
+            hello_record_layout: opts.hello_record_layout.clone(),
         };
 
         // If the session cache is disabled, we don't need to set up any callbacks.
@@ -1162,11 +1164,19 @@ impl<IO: AsyncRead + AsyncWrite + Unpin> AsyncWrite for TlsStream<IO> {
 
 /// The stream a TLS connection runs over, writing the records it sends before the
 /// server's first byte (its ClientHello) with `version` as their record version, rather
-/// than the TLS 1.0 BoringSSL writes them with.
+/// than the TLS 1.0 BoringSSL writes them with, and the ClientHello in records of the
+/// `layout` lengths (see [`TlsOptions::hello_record_layout`]).
 pub struct HelloRecords<IO> {
     io: IO,
     version: Option<[u8; 2]>,
     framing: Framing,
+    /// The ClientHello's record layout, until the ClientHello went out in it.
+    layout: Option<Cow<'static, [u16]>>,
+    /// The ClientHello's records as written, held until the ClientHello is complete.
+    held: Vec<u8>,
+    /// Bytes accepted but not yet written to `io`, from `sent` on.
+    pending: Vec<u8>,
+    sent: usize,
 }
 
 /// Where the next byte written falls: in a record's header (of a `kind` record), or
@@ -1204,13 +1214,105 @@ impl Framing {
     }
 }
 
+/// The largest fragment a TLS record carries (RFC 8446 §5.1).
+const MAX_FRAGMENT: usize = 1 << 14;
+
 impl<IO> HelloRecords<IO> {
-    fn new(io: IO, version: Option<u16>) -> Self {
+    fn new(io: IO, settings: &HandshakeSettings) -> Self {
         Self {
             io,
-            version: version.map(u16::to_be_bytes),
+            version: settings.hello_record_version.map(u16::to_be_bytes),
             framing: Framing::default(),
+            layout: settings
+                .hello_record_layout
+                .clone()
+                .filter(|layout| !layout.is_empty()),
+            held: Vec::new(),
+            pending: Vec::new(),
+            sent: 0,
         }
+    }
+
+    /// Moves `bytes`, records written after the ClientHello's, to `pending`, with
+    /// `version` set on their handshake records.
+    fn pass(&mut self, mut bytes: Vec<u8>) {
+        if let Some(version) = self.version {
+            self.framing.frame(version, &mut bytes);
+        }
+        self.pending.extend_from_slice(&bytes);
+    }
+
+    /// Once `held` carries the whole ClientHello, queues it in the layout's records (and
+    /// whatever was written after it as written) and ends the layout. A write `held` can't
+    /// be the ClientHello's records in goes out as written.
+    fn relayout(&mut self) {
+        let Some(layout) = self.layout.as_deref() else {
+            return;
+        };
+        let mut hello = Vec::new();
+        let mut at = 0;
+        let mut record_version = [3, 1];
+        let complete = loop {
+            let Some(header) = self.held.get(at..at + 5) else {
+                break false;
+            };
+            let length = usize::from(u16::from_be_bytes([header[3], header[4]]));
+            if header[0] != 0x16 {
+                break true;
+            }
+            record_version = [header[1], header[2]];
+            let Some(fragment) = self.held.get(at + 5..at + 5 + length) else {
+                break false;
+            };
+            hello.extend_from_slice(fragment);
+            at += 5 + length;
+            if hello.len() >= 4
+                && hello.len()
+                    >= 4 + usize::from(hello[1]) * 65536
+                        + usize::from(u16::from_be_bytes([hello[2], hello[3]]))
+            {
+                break true;
+            }
+        };
+        if !complete {
+            return;
+        }
+        let version = self.version.unwrap_or(record_version);
+        let mut rest = hello.as_slice();
+        let mut lengths = layout.iter().map(|&length| usize::from(length));
+        while !rest.is_empty() {
+            let length = lengths.next().unwrap_or(MAX_FRAGMENT).min(rest.len());
+            let (fragment, after) = rest.split_at(length);
+            self.pending.push(0x16);
+            self.pending.extend_from_slice(&version);
+            self.pending
+                .extend_from_slice(&(length as u16).to_be_bytes());
+            self.pending.extend_from_slice(fragment);
+            rest = after;
+        }
+        self.layout = None;
+        let after = self.held.split_off(at);
+        self.held = Vec::new();
+        self.pass(after);
+    }
+
+    /// Writes `pending` to `io`.
+    fn poll_send(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>>
+    where
+        IO: AsyncWrite + Unpin,
+    {
+        while self.sent < self.pending.len() {
+            let written = std::task::ready!(
+                Pin::new(&mut self.io).poll_write(cx, &self.pending[self.sent..])
+            )?;
+            if written == 0 {
+                return Poll::Ready(Err(io::ErrorKind::WriteZero.into()));
+            }
+            self.sent += written;
+        }
+        self.pending.clear();
+        self.sent = 0;
+        Poll::Ready(Ok(()))
     }
 }
 
@@ -1245,6 +1347,12 @@ impl<IO: AsyncWrite + Unpin> AsyncWrite for HelloRecords<IO> {
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
+        std::task::ready!(self.poll_send(cx))?;
+        if self.layout.is_some() {
+            self.held.extend_from_slice(buf);
+            self.relayout();
+            return Poll::Ready(Ok(buf.len()));
+        }
         let Some(version) = self.version else {
             return Pin::new(&mut self.io).poll_write(cx, buf);
         };
@@ -1257,10 +1365,18 @@ impl<IO: AsyncWrite + Unpin> AsyncWrite for HelloRecords<IO> {
     }
 
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        // A flush with the ClientHello still incomplete sends its records as written.
+        if !self.held.is_empty() {
+            self.layout = None;
+            let held = std::mem::take(&mut self.held);
+            self.pass(held);
+        }
+        std::task::ready!(self.poll_send(cx))?;
         Pin::new(&mut self.io).poll_flush(cx)
     }
 
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        std::task::ready!(self.as_mut().poll_flush(cx))?;
         Pin::new(&mut self.io).poll_shutdown(cx)
     }
 }
