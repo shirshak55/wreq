@@ -25,7 +25,7 @@ use std::{
         Arc,
         atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering},
     },
-    task::Waker,
+    task::{Context, Poll, Waker, ready},
 };
 
 use bytes::Bytes;
@@ -37,7 +37,7 @@ use wreq_proto::http2::Control;
 use crate::{conn::net::SocketBindOptions, proxy::Matcher, sync::Mutex};
 
 /// How many frames a scope keeps for its first connection, before it opened, and the
-/// octets of their payloads, as a connection lets wait (see [`Control::backlogged`]):
+/// octets of their payloads, as a connection lets wait (see [`Control::poll_room`]):
 /// those past them go to no connection.
 const PENDING_HTTP2: usize = 4096;
 const PENDING_HTTP2_OCTETS: usize = 1 << 20;
@@ -214,9 +214,9 @@ pub struct ConnectionScope(Arc<(u64, watch::Sender<()>, Arc<Connections>)>);
 /// an HTTP/2 one, `None` for an HTTP/1 one, how they end (a [`ConnectionEnd`], 0 until
 /// told, else one past it) and the tasks waiting to be told, what the caller sent them
 /// before the first opened, which that one sends should it speak HTTP/2 (the frames, unless
-/// the caller dropped them, and the requests held, `true`, or released), how their
-/// origins end the HTTP/2 ones, and how many HTTP/1 ones are open, told once an origin
-/// closed the last.
+/// the caller dropped them, and the requests held, `true`, or released), the tasks waiting
+/// for room among those frames, how their origins end the HTTP/2 ones, and how many HTTP/1
+/// ones are open, told once an origin closed the last.
 #[derive(Default)]
 struct Connections {
     http2: Mutex<Vec<(u64, Control)>>,
@@ -226,6 +226,7 @@ struct Connections {
     pending: Mutex<PendingHttp2>,
     pending_dropped: AtomicBool,
     pending_requests: Mutex<PendingRequests>,
+    pending_tasks: Mutex<Vec<Waker>>,
     origin_ends: OriginEnds,
     http1_open: AtomicUsize,
     http1_origin_closed: Notify,
@@ -295,8 +296,9 @@ pub enum Http2OriginEnd {
         /// The open requests it carried past that stream, as recorded, which it leaves
         /// unprocessed; those of the scope's other connections went on regardless.
         refused: Vec<u32>,
-        /// The requests it carried whose response frames it sent before it weren't read
-        /// yet when it came, as recorded: a client of the origin gets them ahead of it.
+        /// The requests it carried that it answered before it (their response heads or
+        /// resets came first), whether or not their responses were read yet, as recorded:
+        /// a client of the origin gets those ahead of it.
         unread: Vec<u32>,
     },
     /// It broke the protocol: the connection, detecting a connection error in what it
@@ -355,6 +357,14 @@ impl Connections {
             }
             none
         });
+        self.wake_pending_tasks();
+    }
+
+    /// Wakes the tasks waiting for room among the frames kept for the first connection.
+    fn wake_pending_tasks(&self) {
+        for task in self.pending_tasks.lock().drain(..) {
+            task.wake();
+        }
     }
 }
 
@@ -497,6 +507,7 @@ impl ConnectionScope {
         let _http2 = self.0.2.http2.lock();
         self.0.2.pending_dropped.store(true, Ordering::Release);
         *self.0.2.pending.lock() = PendingHttp2::default();
+        self.0.2.wake_pending_tasks();
     }
 
     /// Sends a GOAWAY frame of `error_code` and `debug_data` naming `last_stream_id`, a
@@ -538,15 +549,26 @@ impl ConnectionScope {
         self.0.2.origin_ends.receiver.lock().take()
     }
 
-    /// Whether the frames this scope had its HTTP/2 connections send lag behind on one: as
-    /// many as it lets await their turn (see [`Control::backlogged`]), or, before its first
-    /// connection opened, as many as it keeps for it.
-    pub fn http2_backlogged(&self) -> bool {
+    /// Ready once the frames this scope had its HTTP/2 connections send leave room for more
+    /// on each (see [`Control::poll_room`]), or, before its first connection opened, among
+    /// those it keeps for it: a caller sending its own client's frames on as they arrive
+    /// reads no more of them until then, rather than having them queue without bound.
+    pub fn poll_http2_room(&self, cx: &mut Context<'_>) -> Poll<()> {
         let http2 = self.0.2.http2.lock();
         if self.0.2.first.borrow().is_none() {
-            return self.0.2.pending.lock().is_full();
+            if !self.0.2.pending.lock().is_full() {
+                return Poll::Ready(());
+            }
+            let mut tasks = self.0.2.pending_tasks.lock();
+            if !tasks.iter().any(|task| task.will_wake(cx.waker())) {
+                tasks.push(cx.waker().clone());
+            }
+            return Poll::Pending;
         }
-        http2.iter().any(|(_, control)| control.backlogged())
+        for (_, control) in http2.iter() {
+            ready!(control.poll_room(cx));
+        }
+        Poll::Ready(())
     }
 
     /// Resolves once each HTTP/2 connection open in this scope sent the frames this scope had
