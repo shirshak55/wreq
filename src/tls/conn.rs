@@ -1223,10 +1223,12 @@ impl fmt::Display for HandshakeFailure {
 
 impl std::error::Error for HandshakeFailure {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        if let Some(aia::ServerEnd::Io(error)) = &self.server_end {
-            return Some(error);
+        match &self.server_end {
+            Some(aia::ServerEnd::Io(error)) => Some(error),
+            // Its error only tells the handshake paused; the server's alert ended it.
+            Some(aia::ServerEnd::Alert { .. }) => None,
+            None => Some(&self.error),
         }
-        Some(&self.error)
     }
 }
 
