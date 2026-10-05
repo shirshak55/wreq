@@ -4,6 +4,7 @@
 use std::{
     io::{self, IoSlice},
     pin::Pin,
+    sync::atomic::{AtomicU64, Ordering},
     task::{Context, Poll},
     time::Duration,
 };
@@ -35,6 +36,8 @@ const SCOPE_END_WAIT: Duration = Duration::from_secs(2);
 /// waiting up to [`SCOPE_END_WAIT`] for that, as the origin's close ends the scope's
 /// client soon after; past it, after its origin's close, it closes with a FIN alone.
 pub(super) struct ScopedIo<T: Connection> {
+    /// Its id among its scope's connections waiting for its close.
+    id: u64,
     io: Option<T>,
     scope: Option<ScopeRef>,
     http1: Option<Http1Open>,
@@ -58,8 +61,10 @@ impl<T: Connection + Unpin> ScopedIo<T> {
         http2: bool,
         timer: Timer,
     ) -> (Self, oneshot::Receiver<T>) {
+        static NEXT_ID: AtomicU64 = AtomicU64::new(0);
         let (dropped, dropped_rx) = oneshot::channel();
         let scoped = ScopedIo {
+            id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
             io: Some(io),
             scope,
             http1: http1.filter(|_| !http2),
@@ -147,6 +152,9 @@ impl<T: AsyncRead + Connection + Unpin> ScopedIo<T> {
 
 impl<T: Connection> Drop for ScopedIo<T> {
     fn drop(&mut self) {
+        if let Some(scope) = &self.scope {
+            scope.forget_closed(self.id);
+        }
         if let Some(http1) = &mut self.http1 {
             http1.by_origin = self.origin_ended;
         }
@@ -185,7 +193,7 @@ impl<T: AsyncRead + Connection + Unpin> AsyncRead for ScopedIo<T> {
         if self
             .scope
             .as_ref()
-            .is_some_and(|scope| scope.poll_closed(cx.waker()))
+            .is_some_and(|scope| scope.poll_closed(self.id, cx.waker()))
         {
             return Poll::Ready(Ok(()));
         }

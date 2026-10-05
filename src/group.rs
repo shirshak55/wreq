@@ -225,7 +225,7 @@ struct Connections {
     first: watch::Sender<Option<Option<Control>>>,
     end: AtomicU8,
     end_tasks: Mutex<Vec<Waker>>,
-    close_tasks: Mutex<Vec<Waker>>,
+    close_tasks: Mutex<Vec<(u64, Waker)>>,
     pending: Mutex<PendingHttp2>,
     pending_dropped: AtomicBool,
     pending_requests: Mutex<PendingRequests>,
@@ -526,7 +526,7 @@ impl ConnectionScope {
     pub fn send_http2_settings(&self, after: u32, params: &[(u16, u32)]) {
         let http2 = self.0.2.http2.lock();
         let sent = params.to_vec();
-        let goes = self.on_http2_locked(&http2, size_of_val(params), move |control| {
+        let goes = self.on_http2_locked(&http2, after, size_of_val(params), move |control| {
             control
                 .after_request(after)
                 .send_settings(sent.iter().copied())
@@ -545,7 +545,7 @@ impl ConnectionScope {
     /// Sends a PING carrying `payload` on each HTTP/2 connection open in this scope,
     /// following the request recorded as `after` (see [`Control::after_request`]).
     pub fn send_http2_ping(&self, after: u32, payload: [u8; 8]) {
-        self.on_http2(0, move |control| {
+        self.on_http2(after, 0, move |control| {
             control.after_request(after).send_ping(payload)
         });
     }
@@ -556,7 +556,7 @@ impl ConnectionScope {
     /// [`Control::after_request`]).
     pub fn send_http2_priority(&self, after: u32, priority: &http2::frame::Priority) {
         let priority = priority.clone();
-        self.on_http2(0, move |control| {
+        self.on_http2(after, 0, move |control| {
             control.after_request(after).send_priority(priority.clone())
         });
     }
@@ -568,7 +568,7 @@ impl ConnectionScope {
     /// [`Control::after_request`]).
     pub fn send_http2_priority_update(&self, after: u32, stream_id: u32, field_value: &[u8]) {
         let field_value = field_value.to_vec();
-        self.on_http2(field_value.len(), move |control| {
+        self.on_http2(after, field_value.len(), move |control| {
             control
                 .after_request(after)
                 .send_priority_update(stream_id, &field_value)
@@ -580,7 +580,7 @@ impl ConnectionScope {
     /// numbers it (see [`Control::send_window_update`]), following the request recorded as
     /// `after` (see [`Control::after_request`]).
     pub fn send_http2_window_update(&self, after: u32, stream_id: u32, increment: u32) {
-        self.on_http2(0, move |control| {
+        self.on_http2(after, 0, move |control| {
             control
                 .after_request(after)
                 .send_window_update(stream_id, increment)
@@ -600,7 +600,7 @@ impl ConnectionScope {
         payload: &[u8],
     ) {
         let payload = payload.to_vec();
-        self.on_http2(payload.len(), move |control| {
+        self.on_http2(after, payload.len(), move |control| {
             control
                 .after_request(after)
                 .send_unknown(kind, flags, stream_id, &payload)
@@ -664,7 +664,7 @@ impl ConnectionScope {
         debug_data: &[u8],
     ) {
         let debug_data = debug_data.to_vec();
-        self.on_http2(debug_data.len(), move |control| {
+        self.on_http2(after, debug_data.len(), move |control| {
             control.after_request(after).send_go_away(
                 last_stream_id,
                 error_code.into(),
@@ -744,18 +744,22 @@ impl ConnectionScope {
         }
     }
 
-    /// Runs `send`, sending a frame whose payload takes `octets` on the heap, on each HTTP/2
+    /// Runs `send`, sending a frame following the request recorded as `after` (see
+    /// [`Control::after_request`]) whose payload takes `octets` on the heap, on each HTTP/2
     /// connection open in this scope, or, before the scope's first connection opened, on
-    /// that one should it speak HTTP/2.
-    fn on_http2(&self, octets: usize, send: impl Fn(&Control) + Send + 'static) {
+    /// that one should it speak HTTP/2. Once one of them sent that request, the others,
+    /// which won't, are told so (see [`Control::release_request`]): there it goes at once
+    /// rather than waiting for a later request of theirs.
+    fn on_http2(&self, after: u32, octets: usize, send: impl Fn(&Control) + Send + 'static) {
         let http2 = self.0.2.http2.lock();
-        self.on_http2_locked(&http2, octets, send);
+        self.on_http2_locked(&http2, after, octets, send);
     }
 
     /// [`Self::on_http2`] with the connections (`http2`) locked; whether the frame goes on.
     fn on_http2_locked(
         &self,
         http2: &[(u64, Control)],
+        after: u32,
         octets: usize,
         send: impl Fn(&Control) + Send + 'static,
     ) -> bool {
@@ -776,6 +780,12 @@ impl ConnectionScope {
                 octets + size_of_val(&send) + size_of::<Box<dyn Fn(&Control) + Send>>();
             pending.sends.push(Box::new(send));
             return true;
+        }
+        if after != 0 && http2.len() > 1 && http2.iter().any(|(_, control)| control.carries(after))
+        {
+            for (_, control) in http2.iter().filter(|(_, control)| !control.carries(after)) {
+                control.release_request(after);
+            }
         }
         for (_, control) in http2 {
             send(control);
@@ -818,7 +828,7 @@ impl ConnectionScope {
     pub fn mirror_http2_stream_window(&self, recorded: u32) {
         // Before the scope's first connection opened, none sent it.
         if self.0.2.first.borrow().is_some() {
-            self.on_http2(0, move |control| control.mirror_stream_window(recorded));
+            self.on_http2(0, 0, move |control| control.mirror_stream_window(recorded));
         }
     }
 
@@ -841,7 +851,7 @@ impl ConnectionScope {
     /// those it opens later close at once.
     pub fn close(&self) {
         self.0.1.send_replace(true);
-        for task in self.0.2.close_tasks.lock().drain(..) {
+        for (_, task) in self.0.2.close_tasks.lock().drain(..) {
             task.wake();
         }
     }
@@ -1037,17 +1047,27 @@ impl ScopeRef {
         });
     }
 
-    /// Whether the scope was closed (see [`ConnectionScope::close`]); otherwise wakes `task`
-    /// once it is.
-    pub(crate) fn poll_closed(&self, task: &Waker) -> bool {
+    /// Whether the scope was closed (see [`ConnectionScope::close`]); otherwise wakes `task`,
+    /// the latest of the connection `id`'s, once it is, until [`Self::forget_closed`].
+    pub(crate) fn poll_closed(&self, id: u64, task: &Waker) -> bool {
         let mut tasks = self.connections.close_tasks.lock();
         if *self.closed.borrow() {
             return true;
         }
-        if !tasks.iter().any(|waiting| waiting.will_wake(task)) {
-            tasks.push(task.clone());
+        match tasks.iter_mut().find(|(waiting, _)| *waiting == id) {
+            Some((_, waiting)) => waiting.clone_from(task),
+            None => tasks.push((id, task.clone())),
         }
         false
+    }
+
+    /// Wakes the connection `id`'s task at the scope's close no longer (see
+    /// [`Self::poll_closed`]).
+    pub(crate) fn forget_closed(&self, id: u64) {
+        self.connections
+            .close_tasks
+            .lock()
+            .retain(|(waiting, _)| *waiting != id);
     }
 
     /// Resolves once the scope is dropped or closed.
