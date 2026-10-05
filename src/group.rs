@@ -31,7 +31,7 @@ use std::{
 use bytes::Bytes;
 use http::{Uri, Version};
 use name::GroupId;
-use tokio::sync::{Notify, mpsc, watch};
+use tokio::sync::{Notify, watch};
 use wreq_proto::http2::Control;
 
 use crate::{conn::net::SocketBindOptions, proxy::Matcher, sync::Mutex};
@@ -257,26 +257,97 @@ struct PendingRequests {
 }
 
 /// How the origins of a scope's HTTP/2 connections end them, as they do, until the caller
-/// takes them (see [`ConnectionScope::http2_origin_ends`]).
+/// takes them (see [`ConnectionScope::http2_origin_ends`]), and whether it did.
+#[derive(Default)]
 struct OriginEnds {
-    sender: mpsc::UnboundedSender<Http2OriginEnd>,
-    receiver: Mutex<Option<mpsc::UnboundedReceiver<Http2OriginEnd>>>,
+    ends: Arc<OriginEndsInner>,
+    taken: AtomicBool,
 }
 
-impl Default for OriginEnds {
-    fn default() -> Self {
-        let (sender, receiver) = mpsc::unbounded_channel();
-        OriginEnds {
-            sender,
-            receiver: Mutex::new(Some(receiver)),
-        }
-    }
+#[derive(Default)]
+struct OriginEndsInner {
+    queue: Mutex<OriginEndsQueue>,
+    told: Notify,
 }
+
+/// The ends told and not yet taken, at most [`ORIGIN_GO_AWAYS`] GOAWAYs waiting before one
+/// merges into the last, and whether the scope is gone.
+#[derive(Default)]
+struct OriginEndsQueue {
+    ends: VecDeque<Http2OriginEnd>,
+    closed: bool,
+}
+
+/// How many ends wait to be taken before a GOAWAY told past them merges into a GOAWAY
+/// waiting last.
+const ORIGIN_GO_AWAYS: usize = 4;
 
 impl OriginEnds {
     fn tell(&self, end: Http2OriginEnd) {
-        // Refused once the caller no longer listens.
-        let _ = self.sender.send(end);
+        let mut queue = self.ends.queue.lock();
+        let waiting = queue.ends.len();
+        match (queue.ends.back_mut(), end) {
+            (
+                Some(Http2OriginEnd::GoAway {
+                    last_stream_id,
+                    error_code,
+                    debug_data,
+                    refused,
+                    unread,
+                }),
+                Http2OriginEnd::GoAway {
+                    last_stream_id: next_last_stream_id,
+                    error_code: next_error_code,
+                    debug_data: next_debug_data,
+                    refused: next_refused,
+                    unread: next_unread,
+                },
+            ) if waiting >= ORIGIN_GO_AWAYS => {
+                *last_stream_id = (*last_stream_id).min(next_last_stream_id);
+                *error_code = next_error_code;
+                *debug_data = next_debug_data;
+                for (merged, next) in [(refused, next_refused), (unread, next_unread)] {
+                    merged.extend(next);
+                    merged.sort_unstable();
+                    merged.dedup();
+                }
+            }
+            (_, end) => queue.ends.push_back(end),
+        }
+        drop(queue);
+        self.ends.told.notify_one();
+    }
+}
+
+impl Drop for OriginEnds {
+    fn drop(&mut self) {
+        self.ends.queue.lock().closed = true;
+        self.ends.told.notify_one();
+    }
+}
+
+/// How the origins of a scope's HTTP/2 connections end them, in the order they do (see
+/// [`ConnectionScope::http2_origin_ends`]). Past four waiting to be taken, a GOAWAY merges
+/// into a GOAWAY waiting last: that one then names the lower last stream of the two, with
+/// this one's error code and debug data, and the requests either refused or answered.
+pub struct Http2OriginEnds(Arc<OriginEndsInner>);
+
+impl Http2OriginEnds {
+    /// The next end, once told; `None` once the scope is gone and every end was taken.
+    pub async fn recv(&mut self) -> Option<Http2OriginEnd> {
+        loop {
+            let told = self.0.told.notified();
+            {
+                let mut queue = self.0.queue.lock();
+                if let Some(end) = queue.ends.pop_front() {
+                    return Some(end);
+                }
+                if queue.closed {
+                    return None;
+                }
+            }
+            told.await;
+        }
     }
 }
 
@@ -545,8 +616,10 @@ impl ConnectionScope {
 
     /// How the origins of this scope's HTTP/2 connections end them, as they do: each GOAWAY
     /// they send, then how they close. Taken by the first call, `None` after it.
-    pub fn http2_origin_ends(&self) -> Option<mpsc::UnboundedReceiver<Http2OriginEnd>> {
-        self.0.2.origin_ends.receiver.lock().take()
+    pub fn http2_origin_ends(&self) -> Option<Http2OriginEnds> {
+        let origin_ends = &self.0.2.origin_ends;
+        (!origin_ends.taken.swap(true, Ordering::AcqRel))
+            .then(|| Http2OriginEnds(origin_ends.ends.clone()))
     }
 
     /// Ready once the frames this scope had its HTTP/2 connections send leave room for more
