@@ -37,11 +37,9 @@ use wreq_proto::http2::Control;
 
 use crate::{conn::net::SocketBindOptions, proxy::Matcher, sync::Mutex};
 
-/// How many frames a scope keeps for its first connection, before it opened, and the
-/// octets of their payloads, as a connection lets wait (see [`Control::poll_room`]):
-/// those past them go to no connection.
-const PENDING_HTTP2: usize = 4096;
-const PENDING_HTTP2_OCTETS: usize = 1 << 20;
+/// How much memory the frames a scope keeps for its first connection, before it opened,
+/// may take: those past it go to no connection.
+const PENDING_HTTP2_BYTES: usize = 1 << 20;
 
 /// How many requests held, and released, a scope keeps for its first connection, before
 /// it opened: as many as a connection remembers (see [`Control::release_request`]), and as
@@ -240,18 +238,19 @@ struct Connections {
     http1_origin_gone: AtomicBool,
 }
 
-/// The frames a scope had its HTTP/2 connections send before its first opened, and the
-/// octets of their payloads.
+/// The frames a scope had its HTTP/2 connections send before its first opened, the memory
+/// they take, and whether one past them went to no connection.
 #[derive(Default)]
 struct PendingHttp2 {
     sends: Vec<Box<dyn Fn(&Control) + Send>>,
-    octets: usize,
+    bytes: usize,
+    overflowed: bool,
 }
 
 impl PendingHttp2 {
     /// Whether it holds as many as it may.
     fn is_full(&self) -> bool {
-        self.sends.len() >= PENDING_HTTP2 || self.octets >= PENDING_HTTP2_OCTETS
+        self.bytes >= PENDING_HTTP2_BYTES
     }
 }
 
@@ -522,7 +521,7 @@ impl ConnectionScope {
     /// connection opened, that one sends it, should it speak HTTP/2, as the frames below.
     pub fn send_http2_settings(&self, after: u32, params: &[(u16, u32)]) {
         let params = params.to_vec();
-        self.on_http2(params.len() * 6, move |control| {
+        self.on_http2(size_of_val(params.as_slice()), move |control| {
             control
                 .after_request(after)
                 .send_settings(params.iter().copied())
@@ -700,11 +699,14 @@ impl ConnectionScope {
     /// Ready once the frames this scope had its HTTP/2 connections send leave room for more
     /// on each (see [`Control::poll_room`]), or, before its first connection opened, among
     /// those it keeps for it: a caller sending its own client's frames on as they arrive
-    /// reads no more of them until then, rather than having them queue without bound.
+    /// reads no more of them until then, rather than having them queue without bound. While
+    /// a request is held before that (see [`Self::hold_http2_request`]), whose release may
+    /// wait for frames behind them, such as its body's, those past them go to no connection.
     pub fn poll_http2_room(&self, cx: &mut Context<'_>) -> Poll<()> {
         let http2 = self.0.2.http2.lock();
         if self.0.2.first.borrow().is_none() {
-            if !self.0.2.pending.lock().is_full() {
+            let full = self.0.2.pending.lock().is_full();
+            if !full || !self.0.2.pending_requests.lock().held.is_empty() {
                 return Poll::Ready(());
             }
             let mut tasks = self.0.2.pending_tasks.lock();
@@ -728,9 +730,9 @@ impl ConnectionScope {
         }
     }
 
-    /// Runs `send`, sending a frame whose payload takes `octets`, on each HTTP/2 connection
-    /// open in this scope, or, before the scope's first connection opened, on that one
-    /// should it speak HTTP/2.
+    /// Runs `send`, sending a frame whose payload takes `octets` on the heap, on each HTTP/2
+    /// connection open in this scope, or, before the scope's first connection opened, on
+    /// that one should it speak HTTP/2.
     fn on_http2(&self, octets: usize, send: impl Fn(&Control) + Send + 'static) {
         let http2 = self.0.2.http2.lock();
         if self.0.2.first.borrow().is_none() {
@@ -739,13 +741,16 @@ impl ConnectionScope {
                 return;
             }
             if pending.is_full() {
-                warn!(
-                    "an HTTP/2 frame sent before the scope's first connection opened, past as many as it keeps, goes to no connection"
-                );
+                if !std::mem::replace(&mut pending.overflowed, true) {
+                    warn!(
+                        "the HTTP/2 frames sent before the scope's first connection opened, past as many as it keeps, go to no connection"
+                    );
+                }
                 return;
             }
+            pending.bytes +=
+                octets + size_of_val(&send) + size_of::<Box<dyn Fn(&Control) + Send>>();
             pending.sends.push(Box::new(send));
-            pending.octets += octets;
             return;
         }
         for (_, control) in http2.iter() {
@@ -760,7 +765,10 @@ impl ConnectionScope {
         let http2 = self.0.2.http2.lock();
         if self.0.2.first.borrow().is_none() {
             let mut pending = self.0.2.pending_requests.lock();
-            if !held {
+            if held {
+                // Those waiting for room no longer wait while it is held.
+                self.0.2.wake_pending_tasks();
+            } else {
                 pending.held.retain(|kept| *kept != recorded);
             }
             let kept = if held {
