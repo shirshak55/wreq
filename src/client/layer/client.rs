@@ -609,6 +609,16 @@ where
         let connector = self.connector.clone();
         let scope = descriptor.scope().cloned();
         lazy(move || {
+            if scope.as_ref().is_some_and(ScopeRef::http1_origin_gone) {
+                let gone = std::io::Error::new(
+                    std::io::ErrorKind::ConnectionAborted,
+                    "the origin closed the scope's last HTTP/1 connection",
+                );
+                return Either::Right(futures_util::future::err(Error::new(
+                    ErrorKind::Connect,
+                    gone,
+                )));
+            }
             // Try to take a "connecting lock".
             //
             // If the pool_key is for HTTP/2, and there is already a

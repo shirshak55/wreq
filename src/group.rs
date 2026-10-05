@@ -216,7 +216,8 @@ pub struct ConnectionScope(Arc<(u64, watch::Sender<()>, Arc<Connections>)>);
 /// before the first opened, which that one sends should it speak HTTP/2 (the frames, unless
 /// the caller dropped them, and the requests held, `true`, or released), the tasks waiting
 /// for room among those frames, how their origins end the HTTP/2 ones, and how many HTTP/1
-/// ones are open, told once an origin closed the last.
+/// ones are open, told once an origin closed the last, which, in a scope ending with its
+/// HTTP/1 origin, leaves it gone for good.
 #[derive(Default)]
 struct Connections {
     http2: Mutex<Vec<(u64, Control)>>,
@@ -230,6 +231,8 @@ struct Connections {
     origin_ends: OriginEnds,
     http1_open: AtomicUsize,
     http1_origin_closed: Notify,
+    ends_with_http1_origin: AtomicBool,
+    http1_origin_gone: AtomicBool,
 }
 
 /// The frames a scope had its HTTP/2 connections send before its first opened, and the
@@ -614,6 +617,20 @@ impl ConnectionScope {
         }
     }
 
+    /// Makes this scope end with its HTTP/1 origin, as a client's own connection to it does:
+    /// once the origin closed the last HTTP/1 connection open in it (see
+    /// [`Self::http1_origin_closed`]), it opens no other, its requests failing to connect.
+    pub fn end_with_http1_origin(&self) {
+        self.0.2.ends_with_http1_origin.store(true, Ordering::Release);
+    }
+
+    /// Whether this scope, ending with its HTTP/1 origin (see
+    /// [`Self::end_with_http1_origin`]), is gone: that origin closed its last HTTP/1
+    /// connection.
+    pub fn http1_origin_gone(&self) -> bool {
+        self.0.2.http1_origin_gone.load(Ordering::Acquire)
+    }
+
     /// How the origins of this scope's HTTP/2 connections end them, as they do: each GOAWAY
     /// they send, then how they close. Taken by the first call, `None` after it.
     pub fn http2_origin_ends(&self) -> Option<Http2OriginEnds> {
@@ -782,6 +799,11 @@ pub(crate) struct Http1Open {
 impl Drop for Http1Open {
     fn drop(&mut self) {
         if self.connections.http1_open.fetch_sub(1, Ordering::AcqRel) == 1 && self.by_origin {
+            if self.connections.ends_with_http1_origin.load(Ordering::Acquire) {
+                self.connections
+                    .http1_origin_gone
+                    .store(true, Ordering::Release);
+            }
             self.connections.http1_origin_closed.notify_one();
         }
     }
@@ -868,6 +890,12 @@ impl ScopeRef {
             tasks.push(task.clone());
         }
         ended
+    }
+
+    /// Whether the scope is gone with its HTTP/1 origin (see
+    /// [`ConnectionScope::http1_origin_gone`]): it opens no connection.
+    pub(crate) fn http1_origin_gone(&self) -> bool {
+        self.connections.http1_origin_gone.load(Ordering::Acquire)
     }
 
     /// Counts an HTTP/1 connection open in the scope, from its connect on, until the
