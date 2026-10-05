@@ -43,7 +43,8 @@ const PENDING_HTTP2: usize = 4096;
 const PENDING_HTTP2_OCTETS: usize = 1 << 20;
 
 /// How many requests held, and released, a scope keeps for its first connection, before
-/// it opened: as many as a connection remembers (see [`Control::release_request`]).
+/// it opened: as many as a connection remembers (see [`Control::release_request`]), and as
+/// many requests' resets (see [`ConnectionScope::send_http2_reset`]).
 const PENDING_REQUESTS: usize = 256;
 
 macro_rules! impl_group_variants {
@@ -205,9 +206,9 @@ impl From<Box<str>> for Group {
 
 /// Confines the connections requests open to one lifetime: a connection serves only
 /// requests of the scope it was opened for, and closes, idle or not, once every clone of
-/// the scope is dropped.
+/// the scope is dropped, or it is closed (see [`ConnectionScope::close`]).
 #[derive(Clone)]
-pub struct ConnectionScope(Arc<(u64, watch::Sender<()>, Arc<Connections>)>);
+pub struct ConnectionScope(Arc<(u64, watch::Sender<bool>, Arc<Connections>)>);
 
 /// The HTTP/2 connections open in a scope, each by an id, able to send frames of the
 /// caller's choosing, the first connection opened in it, once one is: the [`Control`] of
@@ -215,18 +216,20 @@ pub struct ConnectionScope(Arc<(u64, watch::Sender<()>, Arc<Connections>)>);
 /// told, else one past it) and the tasks waiting to be told, what the caller sent them
 /// before the first opened, which that one sends should it speak HTTP/2 (the frames, unless
 /// the caller dropped them, and the requests held, `true`, or released), the tasks waiting
-/// for room among those frames, how their origins end the HTTP/2 ones, and how many HTTP/1
-/// ones are open, told once an origin closed the last, which, in a scope ending with its
-/// HTTP/1 origin, leaves it gone for good.
+/// for room among those frames, the requests' resets, by request, the connections waiting
+/// for the scope's close, how their origins end the HTTP/2 ones, and how many HTTP/1 ones are open, told once an origin closed the last, which,
+/// in a scope ending with its HTTP/1 origin, leaves it gone for good.
 #[derive(Default)]
 struct Connections {
     http2: Mutex<Vec<(u64, Control)>>,
     first: watch::Sender<Option<Option<Control>>>,
     end: AtomicU8,
     end_tasks: Mutex<Vec<Waker>>,
+    close_tasks: Mutex<Vec<Waker>>,
     pending: Mutex<PendingHttp2>,
     pending_dropped: AtomicBool,
     pending_requests: Mutex<PendingRequests>,
+    pending_resets: Mutex<VecDeque<(u32, u32)>>,
     pending_tasks: Mutex<Vec<Waker>>,
     origin_ends: OriginEnds,
     http1_open: AtomicUsize,
@@ -446,7 +449,7 @@ impl ConnectionScope {
     /// Creates a scope no other scope's requests share connections with.
     pub fn new() -> Self {
         static NEXT_ID: AtomicU64 = AtomicU64::new(0);
-        let (closed, _) = watch::channel(());
+        let (closed, _) = watch::channel(false);
         ConnectionScope(Arc::new((
             NEXT_ID.fetch_add(1, Ordering::Relaxed),
             closed,
@@ -555,11 +558,25 @@ impl ConnectionScope {
 
     /// Makes the request recorded as `recorded`, on the HTTP/2 connection of this scope it
     /// was sent on, reset with `error_code` rather than its own should it be dropped before
-    /// it ends or reset (see [`Control::cancel_with`]): as its client reset it.
+    /// it ends or reset (see [`Control::cancel_with`]): as its client reset it. Before the
+    /// scope's first connection opened, that one is told, should it speak HTTP/2: the first
+    /// reset of each request, the oldest past [`PENDING_REQUESTS`] dropped, kept apart from
+    /// the frames, so they never wait for room (see [`Self::poll_http2_room`]).
     pub fn send_http2_reset(&self, recorded: u32, error_code: u32) {
-        self.on_http2(0, move |control| {
-            control.cancel_with(recorded, error_code.into())
-        });
+        let http2 = self.0.2.http2.lock();
+        if self.0.2.first.borrow().is_none() {
+            let mut resets = self.0.2.pending_resets.lock();
+            if resets.iter().all(|(kept, _)| *kept != recorded) {
+                if resets.len() == PENDING_REQUESTS {
+                    resets.pop_front();
+                }
+                resets.push_back((recorded, error_code));
+            }
+            return;
+        }
+        for (_, control) in http2.iter() {
+            control.cancel_with(recorded, error_code.into());
+        }
     }
 
     /// Tells each HTTP/2 connection open in this scope that the request recorded as
@@ -576,7 +593,7 @@ impl ConnectionScope {
 
     /// Drops the frames this scope had its HTTP/2 connections send before its first one
     /// opened, and keeps none from now on: they go to no connection. The requests held or
-    /// released before still go to it.
+    /// released before, and the resets of requests, still go to it.
     pub fn drop_http2_pending(&self) {
         let _http2 = self.0.2.http2.lock();
         self.0.2.pending_dropped.store(true, Ordering::Release);
@@ -742,6 +759,18 @@ impl ConnectionScope {
             task.wake();
         }
     }
+
+    /// Closes this scope's connections now, as dropping its last clone does, the requests
+    /// still open on them failing: for a scope whose requests' client connection ended,
+    /// their streams ending with their connections as that client's did, rather than each
+    /// being reset first. They read nothing more, ending as [`Self::end_with`] says, and
+    /// those it opens later close at once.
+    pub fn close(&self) {
+        self.0.1.send_replace(true);
+        for task in self.0.2.close_tasks.lock().drain(..) {
+            task.wake();
+        }
+    }
 }
 
 impl Default for ConnectionScope {
@@ -761,7 +790,7 @@ impl std::fmt::Debug for ConnectionScope {
 #[derive(Clone)]
 pub(crate) struct ScopeRef {
     id: u64,
-    closed: watch::Receiver<()>,
+    closed: watch::Receiver<bool>,
     connections: Arc<Connections>,
 }
 
@@ -849,6 +878,10 @@ impl ScopeRef {
         for recorded in requests.held {
             control.hold_request(recorded);
         }
+        for (recorded, error_code) in std::mem::take(&mut *self.connections.pending_resets.lock())
+        {
+            control.cancel_with(recorded, error_code.into());
+        }
         http2.push((id, control.clone()));
         self.connections.opened(Some(control));
         drop(http2);
@@ -864,6 +897,7 @@ impl ScopeRef {
         let _http2 = self.connections.http2.lock();
         *self.connections.pending.lock() = PendingHttp2::default();
         *self.connections.pending_requests.lock() = PendingRequests::default();
+        self.connections.pending_resets.lock().clear();
         self.connections.opened(None);
     }
 
@@ -916,10 +950,23 @@ impl ScopeRef {
         });
     }
 
-    /// Resolves once the scope is dropped.
+    /// Whether the scope was closed (see [`ConnectionScope::close`]); otherwise wakes `task`
+    /// once it is.
+    pub(crate) fn poll_closed(&self, task: &Waker) -> bool {
+        let mut tasks = self.connections.close_tasks.lock();
+        if *self.closed.borrow() {
+            return true;
+        }
+        if !tasks.iter().any(|waiting| waiting.will_wake(task)) {
+            tasks.push(task.clone());
+        }
+        false
+    }
+
+    /// Resolves once the scope is dropped or closed.
     pub(crate) async fn closed(mut self) {
-        // Nothing is ever sent, so this returns only when the sender is gone.
-        let _ = self.closed.changed().await;
+        // An error once the sender is gone.
+        let _ = self.closed.wait_for(|closed| *closed).await;
     }
 }
 

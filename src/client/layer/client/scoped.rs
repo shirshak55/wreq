@@ -26,8 +26,8 @@ const SCOPE_END_WAIT: Duration = Duration::from_secs(2);
 
 /// A connection's transport. Once its scope ends with [`ConnectionEnd::Fin`] or
 /// [`ConnectionEnd::Reset`] every read and write of it fails, so the connection sends
-/// nothing more, and it closes so once dropped. Dropped, it goes to the receiver
-/// [`ScopedIo::new`] returned, if that is still there.
+/// nothing more, and it closes so once dropped; once its scope is closed it reads nothing
+/// more. Dropped, it goes to the receiver [`ScopedIo::new`] returned, if that is still there.
 ///
 /// An HTTP/1 one is counted open in its scope from its connect on (see
 /// [`ConnectionScope::http1_origin_closed`](crate::ConnectionScope::http1_origin_closed)).
@@ -180,6 +180,15 @@ impl<T: AsyncRead + Connection + Unpin> AsyncRead for ScopedIo<T> {
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
+        // Its scope closed: it reads nothing more, its connection ending as at the origin's
+        // close, without a frame more.
+        if self
+            .scope
+            .as_ref()
+            .is_some_and(|scope| scope.poll_closed(cx.waker()))
+        {
+            return Poll::Ready(Ok(()));
+        }
         let filled = buf.filled().len();
         let read = self.io()?.poll_read(cx, buf);
         let empty = buf.filled().len() == filled && buf.remaining() > 0;
