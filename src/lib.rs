@@ -330,6 +330,7 @@ pub use self::{
         Client, ClientBuilder,
         body::{Body, ReadAheadOnHttp1},
         emulate::{Emulation, EmulationBuilder, IntoEmulation},
+        layer::client::NoHostOnHttp1,
         request::{Request, RequestBuilder},
         response::Response,
         upgrade::Upgraded,

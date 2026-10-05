@@ -335,7 +335,7 @@ where
                 ));
             }
 
-            if self.config.set_host {
+            if self.config.set_host && req.extensions().get::<NoHostOnHttp1>().is_none() {
                 req.headers_mut()
                     .entry(HOST)
                     .or_insert_with(|| generate_host_header(&uri));
@@ -1306,6 +1306,11 @@ fn normalize_uri<B>(req: &mut Request<B>, is_http_connect: bool) -> Result<Uri, 
         }
     }
 }
+
+/// A request extension for a request that names no `Host`, as an HTTP/1.0 one may: on an
+/// HTTP/1 connection it goes without one, rather than with one generated from its URI.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct NoHostOnHttp1;
 
 fn generate_host_header(uri: &Uri) -> HeaderValue {
     let hostname = uri.host().expect("authority implies host");
