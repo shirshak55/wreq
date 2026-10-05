@@ -30,6 +30,7 @@ use std::{
 
 use bytes::Bytes;
 use http::{Uri, Version};
+use http2::ext::ResponsePosition;
 use name::GroupId;
 use tokio::sync::{Notify, watch};
 use wreq_proto::http2::Control;
@@ -278,20 +279,36 @@ struct OriginEndsInner {
 }
 
 /// The ends told and not yet taken, at most [`ORIGIN_GO_AWAYS`] GOAWAYs waiting before one
-/// merges into the last, and whether the scope is gone.
+/// merges into the last, whether the scope is gone, how many GOAWAYs were told, and what
+/// is called with each as it is (see [`Http2OriginEnds::on_go_away`]).
 #[derive(Default)]
 struct OriginEndsQueue {
     ends: VecDeque<Http2OriginEnd>,
     closed: bool,
+    go_aways: u64,
+    on_go_away: Option<Box<GoAwayHook>>,
 }
+
+/// Called with each GOAWAY's number and positions as it is told.
+type GoAwayHook = dyn Fn(u64, &[(u32, ResponsePosition)]) + Send + Sync;
 
 /// How many ends wait to be taken before a GOAWAY told past them merges into a GOAWAY
 /// waiting last.
 const ORIGIN_GO_AWAYS: usize = 4;
 
 impl OriginEnds {
-    fn tell(&self, end: Http2OriginEnd) {
+    fn tell(&self, mut end: Http2OriginEnd) {
         let mut queue = self.ends.queue.lock();
+        if let Http2OriginEnd::GoAway {
+            number, positions, ..
+        } = &mut end
+        {
+            queue.go_aways += 1;
+            *number = queue.go_aways;
+            if let Some(on_go_away) = &queue.on_go_away {
+                on_go_away(*number, positions);
+            }
+        }
         let waiting = queue.ends.len();
         match (queue.ends.back_mut(), end) {
             (
@@ -300,23 +317,30 @@ impl OriginEnds {
                     error_code,
                     debug_data,
                     refused,
-                    unread,
+                    positions,
+                    number,
                 }),
                 Http2OriginEnd::GoAway {
                     last_stream_id: next_last_stream_id,
                     error_code: next_error_code,
                     debug_data: next_debug_data,
                     refused: next_refused,
-                    unread: next_unread,
+                    positions: next_positions,
+                    number: next_number,
                 },
             ) if waiting >= ORIGIN_GO_AWAYS => {
                 *last_stream_id = (*last_stream_id).min(next_last_stream_id);
                 *error_code = next_error_code;
                 *debug_data = next_debug_data;
-                for (merged, next) in [(refused, next_refused), (unread, next_unread)] {
-                    merged.extend(next);
-                    merged.sort_unstable();
-                    merged.dedup();
+                *number = next_number;
+                refused.extend(next_refused);
+                refused.sort_unstable();
+                refused.dedup();
+                // A response's earlier position stands.
+                for (recorded, position) in next_positions {
+                    if !positions.iter().any(|(merged, _)| *merged == recorded) {
+                        positions.push((recorded, position));
+                    }
                 }
             }
             (_, end) => queue.ends.push_back(end),
@@ -336,10 +360,21 @@ impl Drop for OriginEnds {
 /// How the origins of a scope's HTTP/2 connections end them, in the order they do (see
 /// [`ConnectionScope::http2_origin_ends`]). Past four waiting to be taken, a GOAWAY merges
 /// into a GOAWAY waiting last: that one then names the lower last stream of the two, with
-/// this one's error code and debug data, and the requests either refused or answered.
+/// this one's error code, debug data and number, the requests either refused, and the
+/// positions of either (the waiting one's where both have one).
 pub struct Http2OriginEnds(Arc<OriginEndsInner>);
 
 impl Http2OriginEnds {
+    /// Calls `go_away` with each GOAWAY's number and positions (see
+    /// [`Http2OriginEnd::GoAway`]) as the connection receives it, before the frames it
+    /// received after it can be read; GOAWAYs merged are each told so.
+    pub fn on_go_away(
+        &self,
+        go_away: impl Fn(u64, &[(u32, ResponsePosition)]) + Send + Sync + 'static,
+    ) {
+        self.0.queue.lock().on_go_away = Some(Box::new(go_away));
+    }
+
     /// The next end, once told; `None` once the scope is gone and every end was taken.
     pub async fn recv(&mut self) -> Option<Http2OriginEnd> {
         loop {
@@ -374,10 +409,12 @@ pub enum Http2OriginEnd {
         /// The open requests it carried past that stream, as recorded, which it leaves
         /// unprocessed; those of the scope's other connections went on regardless.
         refused: Vec<u32>,
-        /// The requests it carried that it answered before it (their response heads or
-        /// resets came first), whether or not their responses were read yet, as recorded:
-        /// a client of the origin gets those ahead of it.
-        unread: Vec<u32>,
+        /// Where it came in the response to each request it carried up to that stream, as
+        /// recorded, whether or not that response was read yet: a client of the origin
+        /// gets the frames before that point ahead of it, and those past it after it.
+        positions: Vec<(u32, ResponsePosition)>,
+        /// How many GOAWAYs the scope's connections sent up to it, it included.
+        number: u64,
     },
     /// It broke the protocol: the connection, detecting a connection error in what it
     /// sent, ended with a GOAWAY carrying `error_code` (see
@@ -863,17 +900,20 @@ impl ScopeRef {
                 });
             }
         });
-        control.on_go_away(move |last_stream_id, reason, debug_data, refused, unread| {
-            if let Some(connections) = connections.upgrade() {
-                connections.origin_ends.tell(Http2OriginEnd::GoAway {
-                    last_stream_id,
-                    error_code: reason.into(),
-                    debug_data,
-                    refused: refused.to_vec(),
-                    unread: unread.to_vec(),
-                });
-            }
-        });
+        control.on_go_away(
+            move |last_stream_id, reason, debug_data, refused, positions| {
+                if let Some(connections) = connections.upgrade() {
+                    connections.origin_ends.tell(Http2OriginEnd::GoAway {
+                        last_stream_id,
+                        error_code: reason.into(),
+                        debug_data,
+                        refused: refused.to_vec(),
+                        positions: positions.to_vec(),
+                        number: 0,
+                    });
+                }
+            },
+        );
         let mut http2 = self.connections.http2.lock();
         for send in std::mem::take(&mut *self.connections.pending.lock()).sends {
             send(&control);
