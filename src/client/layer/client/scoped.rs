@@ -45,6 +45,8 @@ pub(super) struct ScopedIo<T: Connection> {
     http2: bool,
     /// Whether its origin ended its side: a read ended, or failed.
     origin_ended: bool,
+    /// Whether its origin reset it.
+    origin_reset: bool,
     timer: Timer,
     /// Bounds its wait for its scope's end, once it started.
     scope_end_wait: Option<Pin<Box<dyn Sleep>>>,
@@ -71,6 +73,7 @@ impl<T: Connection + Unpin> ScopedIo<T> {
             dropped: Some(dropped),
             http2,
             origin_ended: false,
+            origin_reset: false,
             timer,
             scope_end_wait: None,
         };
@@ -106,6 +109,7 @@ impl<T: Connection + Unpin> ScopedIo<T> {
         if std::mem::replace(&mut self.origin_ended, true) {
             return;
         }
+        self.origin_reset = reset;
         if let (true, Some(scope)) = (self.http2, &self.scope) {
             let close_notify = !reset
                 && self
@@ -157,6 +161,7 @@ impl<T: Connection> Drop for ScopedIo<T> {
         }
         if let Some(http1) = &mut self.http1 {
             http1.by_origin = self.origin_ended;
+            http1.reset = self.origin_reset;
         }
         let Some(io) = self.io.take() else {
             return;
