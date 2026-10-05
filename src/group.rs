@@ -639,7 +639,10 @@ impl ConnectionScope {
     /// once the origin closed the last HTTP/1 connection open in it (see
     /// [`Self::http1_origin_closed`]), it opens no other, its requests failing to connect.
     pub fn end_with_http1_origin(&self) {
-        self.0.2.ends_with_http1_origin.store(true, Ordering::Release);
+        self.0
+            .2
+            .ends_with_http1_origin
+            .store(true, Ordering::Release);
     }
 
     /// Whether this scope, ending with its HTTP/1 origin (see
@@ -829,7 +832,11 @@ pub(crate) struct Http1Open {
 impl Drop for Http1Open {
     fn drop(&mut self) {
         if self.connections.http1_open.fetch_sub(1, Ordering::AcqRel) == 1 && self.by_origin {
-            if self.connections.ends_with_http1_origin.load(Ordering::Acquire) {
+            if self
+                .connections
+                .ends_with_http1_origin
+                .load(Ordering::Acquire)
+            {
                 self.connections
                     .http1_origin_gone
                     .store(true, Ordering::Release);
