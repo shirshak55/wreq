@@ -217,8 +217,9 @@ pub struct ConnectionScope(Arc<(u64, watch::Sender<bool>, Arc<Connections>)>);
 /// before the first opened, which that one sends should it speak HTTP/2 (the frames, unless
 /// the caller dropped them, and the requests held, `true`, or released), the tasks waiting
 /// for room among those frames, the requests' resets, by request, the connections waiting
-/// for the scope's close, how their origins end the HTTP/2 ones, and how many HTTP/1 ones are open, told once an origin closed the last, which,
-/// in a scope ending with its HTTP/1 origin, leaves it gone for good.
+/// for the scope's close, how their origins end the HTTP/2 ones, and how many HTTP/1 ones are open,
+/// told once an origin closed the last, which, in a scope ending with its HTTP/1 origin, leaves it
+/// gone for good.
 #[derive(Default)]
 struct Connections {
     http2: Mutex<Vec<(u64, Control)>>,
@@ -878,8 +879,7 @@ impl ScopeRef {
         for recorded in requests.held {
             control.hold_request(recorded);
         }
-        for (recorded, error_code) in std::mem::take(&mut *self.connections.pending_resets.lock())
-        {
+        for (recorded, error_code) in std::mem::take(&mut *self.connections.pending_resets.lock()) {
             control.cancel_with(recorded, error_code.into());
         }
         http2.push((id, control.clone()));
