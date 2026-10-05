@@ -46,7 +46,8 @@ pub(super) struct ScopedIo<T: Connection> {
     http1: Option<Http1Open>,
     dropped: Option<oneshot::Sender<(T, Option<Http1Open>)>>,
     http2: bool,
-    /// Whether its origin ended its side: a read ended, or failed.
+    /// Whether its origin ended its side: a read ended, or failed, or a write failed with
+    /// its reset.
     origin_ended: bool,
     timer: Timer,
     /// Bounds its wait for its scope's end, once it started.
@@ -108,11 +109,26 @@ impl<T: Connection + Unpin> ScopedIo<T> {
             Err(_) if !self.http2 => {}
             _ => return,
         }
+        let io = self.io.as_ref();
+        let end = OriginEnd::of_read(read, || io.is_some_and(Connection::close_notify_received));
+        self.note_end(end);
+    }
+
+    /// Notes a write (`written`) failing with the origin's reset, which ended its side so
+    /// before any read did.
+    fn note_write<R>(&mut self, written: &Poll<io::Result<R>>) {
+        if let Poll::Ready(Err(e)) = written
+            && e.kind() == io::ErrorKind::ConnectionReset
+        {
+            self.note_end(OriginEnd::Reset);
+        }
+    }
+
+    /// Notes how the origin ended its side (`end`), telling its scope at once.
+    fn note_end(&mut self, end: OriginEnd) {
         if std::mem::replace(&mut self.origin_ended, true) {
             return;
         }
-        let io = self.io.as_ref();
-        let end = OriginEnd::of_read(read, || io.is_some_and(Connection::close_notify_received));
         if let (true, Some(scope)) = (self.http2, &self.scope) {
             scope.origin_closed(end == OriginEnd::CloseNotify, end == OriginEnd::Reset);
         }
@@ -218,7 +234,9 @@ impl<T: AsyncWrite + AsyncRead + Connection + Unpin> AsyncWrite for ScopedIo<T> 
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
-        self.io()?.poll_write(cx, buf)
+        let written = self.io()?.poll_write(cx, buf);
+        self.note_write(&written);
+        written
     }
 
     fn poll_write_vectored(
@@ -226,7 +244,9 @@ impl<T: AsyncWrite + AsyncRead + Connection + Unpin> AsyncWrite for ScopedIo<T> 
         cx: &mut Context<'_>,
         bufs: &[IoSlice<'_>],
     ) -> Poll<io::Result<usize>> {
-        self.io()?.poll_write_vectored(cx, bufs)
+        let written = self.io()?.poll_write_vectored(cx, bufs);
+        self.note_write(&written);
+        written
     }
 
     fn is_write_vectored(&self) -> bool {
@@ -234,7 +254,9 @@ impl<T: AsyncWrite + AsyncRead + Connection + Unpin> AsyncWrite for ScopedIo<T> 
     }
 
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        self.io()?.poll_flush(cx)
+        let flushed = self.io()?.poll_flush(cx);
+        self.note_write(&flushed);
+        flushed
     }
 
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
