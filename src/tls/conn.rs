@@ -1041,6 +1041,15 @@ impl<IO> TlsStream<IO> {
     pub fn get_ref(&self) -> &IO {
         &self.stream.get_ref().io
     }
+
+    /// Whether the peer closed its TLS with a close_notify: a read ending without one ends
+    /// as one ending with one does.
+    pub fn received_close_notify(&self) -> bool {
+        self.stream
+            .ssl()
+            .get_shutdown()
+            .contains(btls::ssl::ShutdownState::RECEIVED)
+    }
 }
 
 impl<IO: AsyncRead + AsyncWrite + Unpin> TlsStream<IO> {
