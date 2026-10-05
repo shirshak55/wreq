@@ -16,7 +16,7 @@ use btls::{
     ex_data::Index,
     hash::MessageDigest,
     nid::Nid,
-    ssl::{PeekedAlert, Ssl, SslAlert, SslRef, SslVerifyError},
+    ssl::{AlertScan, PeekedAlert, Ssl, SslAlert, SslRef, SslVerifyError},
     stack::Stack,
     x509::{GeneralNameRef, X509, X509Ref, X509StoreContext, X509VerifyError, X509VerifyResult},
 };
@@ -543,6 +543,7 @@ async fn server_end<IO>(stream: &mut SslStream<HelloRecords<IO>>) -> ServerEnd
 where
     IO: AsyncRead + Unpin,
 {
+    let mut scan = AlertScan::default();
     loop {
         match std::future::poll_fn(|cx| stream.get_mut().poll_read_ahead(cx)).await {
             Ok(0) => {
@@ -555,7 +556,7 @@ where
             Err(error) => return ServerEnd::Io(error),
         }
         let ahead = stream.get_ref().read_ahead();
-        match stream.ssl().peek_server_alert(ahead) {
+        match stream.ssl().peek_server_alert(ahead, &mut scan) {
             PeekedAlert::Alert { level, description } => {
                 return ServerEnd::Alert { level, description };
             }

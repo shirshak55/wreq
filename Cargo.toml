@@ -207,8 +207,8 @@ cyper = { version = "0.9.0",  default-features = false, features = ["rustls", "s
 
 # The btls fork carrying the ClientHello controls this fork's TLS options use.
 [patch.crates-io]
-btls = { git = "https://github.com/shirshak55/btls", rev = "a804e989f8cd9cdbf6d9447226331871c768927c" }
-btls-sys = { git = "https://github.com/shirshak55/btls", rev = "a804e989f8cd9cdbf6d9447226331871c768927c" }
+btls = { git = "https://github.com/shirshak55/btls", rev = "d18c1619490a0d2ab07b9297c64127236e9e7ed7" }
+btls-sys = { git = "https://github.com/shirshak55/btls", rev = "d18c1619490a0d2ab07b9297c64127236e9e7ed7" }
 # The wreq-proto and http2 forks carrying the HTTP/2 controls (`Control`, frame logs and
 # relays) this fork's connection scopes use.
 http2 = { git = "https://github.com/shirshak55/http2", branch = "wiremason" }
