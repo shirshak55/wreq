@@ -1052,6 +1052,15 @@ impl<IO> TlsStream<IO> {
     }
 }
 
+/// The alert the peer sent that `error` reports, if it does: the SSL library's reason for it
+/// is `SSL_AD_REASON_OFFSET` plus its description.
+pub(crate) fn received_alert(error: &btls::ssl::Error) -> Option<u8> {
+    error.ssl_error()?.errors().iter().find_map(|error| {
+        let reason = error.library_reason(btls_sys::ERR_LIB_SSL)?;
+        u8::try_from(reason.checked_sub(btls_sys::SSL_AD_REASON_OFFSET)?).ok()
+    })
+}
+
 impl<IO: AsyncRead + AsyncWrite + Unpin> TlsStream<IO> {
     /// Whether the peer has neither closed the connection nor sent data yet, reading
     /// only what is already there (a TLS 1.3 session ticket, say).
@@ -1096,12 +1105,7 @@ impl HandshakeFailure {
         // plus its description.
         let alert = match &server_end {
             Some(aia::ServerEnd::Alert { description, .. }) => Some(*description),
-            _ => error.ssl_error().and_then(|stack| {
-                stack.errors().iter().find_map(|error| {
-                    let reason = error.library_reason(btls_sys::ERR_LIB_SSL)?;
-                    u8::try_from(reason.checked_sub(btls_sys::SSL_AD_REASON_OFFSET)?).ok()
-                })
-            }),
+            _ => received_alert(&error),
         };
         let verify_error = aia::verify_result(ssl)
             .err()

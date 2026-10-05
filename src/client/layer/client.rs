@@ -55,7 +55,7 @@ use crate::{
         proxy,
     },
     error::ProxyConnect,
-    group::{ConnectionEnd, Http1Open, OnQueued, ScopeRef},
+    group::{ConnectionEnd, Http1Open, OnQueued, OriginEnd, ScopeRef},
     rt::{Executor, Timer},
 };
 
@@ -1298,17 +1298,14 @@ async fn origin_end<T: AsyncRead + Connection + Unpin>(mut io: T, mut open: Http
     use tokio::io::AsyncReadExt;
 
     let mut unread = [0; 4096];
-    // Only a TLS close_notify ends an HTTP/1 connection's read cleanly (see `TlsConn`).
-    let (reset, close_notify) = loop {
+    let read = loop {
         match io.read(&mut unread).await {
-            Ok(0) => break (false, io.close_notify_received()),
+            Ok(0) => break Ok(()),
             Ok(_) => {}
-            Err(e) => break (e.kind() == std::io::ErrorKind::ConnectionReset, false),
+            Err(e) => break Err(e),
         }
     };
-    open.by_origin = true;
-    open.reset = reset;
-    open.close_notify = close_notify;
+    open.ended(OriginEnd::of_read(&read, || io.close_notify_received()));
 }
 
 fn origin_form(uri: &mut Uri) {

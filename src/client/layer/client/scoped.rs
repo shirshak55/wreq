@@ -17,7 +17,7 @@ use wreq_proto::rt::{Sleep, Timer as _};
 
 use crate::{
     conn::Connection,
-    group::{ConnectionEnd, Http1Open, ScopeRef},
+    group::{ConnectionEnd, Http1Open, OriginEnd, ScopeRef},
     rt::Timer,
 };
 
@@ -48,10 +48,6 @@ pub(super) struct ScopedIo<T: Connection> {
     http2: bool,
     /// Whether its origin ended its side: a read ended, or failed.
     origin_ended: bool,
-    /// Whether its origin reset it.
-    origin_reset: bool,
-    /// Whether its origin ended its TLS with its close_notify.
-    origin_close_notify: bool,
     timer: Timer,
     /// Bounds its wait for its scope's end, once it started.
     scope_end_wait: Option<Pin<Box<dyn Sleep>>>,
@@ -78,8 +74,6 @@ impl<T: Connection + Unpin> ScopedIo<T> {
             dropped: Some(dropped),
             http2,
             origin_ended: false,
-            origin_reset: false,
-            origin_close_notify: false,
             timer,
             scope_end_wait: None,
         };
@@ -101,31 +95,30 @@ impl<T: Connection + Unpin> ScopedIo<T> {
     }
 
     /// Notes a read (`read`, which filled nothing when `empty`) ending the origin's side, and
-    /// how: by a close, with or without its close_notify, or a reset. An HTTP/2 connection
-    /// tells its scope at once.
+    /// how (see [`OriginEnd`]), telling its scope at once.
     fn note_read(&mut self, read: &Poll<io::Result<()>>, empty: bool) {
-        let reset = match read {
-            Poll::Ready(Ok(())) if empty => false,
-            Poll::Ready(Err(e)) if e.kind() == io::ErrorKind::ConnectionReset => true,
-            // An HTTP/1 one's origin ended its side on any failed read: a TLS close without
-            // its close_notify, say.
-            Poll::Ready(Err(_)) if !self.http2 => false,
-            _ => return,
+        let Poll::Ready(read) = read else {
+            return;
         };
+        match read {
+            Ok(()) if empty => {}
+            Err(e) if e.kind() == io::ErrorKind::ConnectionReset => {}
+            // An HTTP/1 one's origin ended its side on any failed read: a TLS close without
+            // its close_notify, or its fatal alert, say.
+            Err(_) if !self.http2 => {}
+            _ => return,
+        }
         if std::mem::replace(&mut self.origin_ended, true) {
             return;
         }
-        self.origin_reset = reset;
-        let close_notify = !reset
-            && self
-                .io
-                .as_ref()
-                .is_some_and(Connection::close_notify_received);
+        let io = self.io.as_ref();
+        let end = OriginEnd::of_read(read, || io.is_some_and(Connection::close_notify_received));
         if let (true, Some(scope)) = (self.http2, &self.scope) {
-            scope.origin_closed(close_notify, reset);
+            scope.origin_closed(end == OriginEnd::CloseNotify, end == OriginEnd::Reset);
         }
-        // A fatal alert, failing the read, leaves the TLS state a close_notify does.
-        self.origin_close_notify = close_notify && matches!(read, Poll::Ready(Ok(())));
+        if let Some(http1) = &mut self.http1 {
+            http1.ended(end);
+        }
     }
 }
 
@@ -166,11 +159,6 @@ impl<T: Connection> Drop for ScopedIo<T> {
     fn drop(&mut self) {
         if let Some(scope) = &self.scope {
             scope.forget(self.id);
-        }
-        if let Some(http1) = &mut self.http1 {
-            http1.by_origin = self.origin_ended;
-            http1.reset = self.origin_reset;
-            http1.close_notify = self.origin_close_notify;
         }
         let Some(io) = self.io.take() else {
             return;

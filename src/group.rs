@@ -218,9 +218,9 @@ pub struct ConnectionScope(Arc<(u64, watch::Sender<bool>, Arc<Connections>)>);
 /// for room among those frames, the requests' resets, by request, the SETTINGS parameters
 /// sent on, each's latest value, the connections waiting for the scope's close, how their origins
 /// end the HTTP/2 ones, and how many HTTP/1 ones are open, told once an origin closed the last,
-/// and whether it reset it, which, in a scope ending with its HTTP/1 origin, leaves it gone for
-/// good. Also whether that origin sent its TLS close_notify, whether an HTTP/1 one's origin
-/// is to close it, and whether the HTTP/1 ones half-close with a FIN alone.
+/// which, in a scope ending with its HTTP/1 origin, leaves it gone for good. Also how the
+/// origin of an HTTP/1 one ended it last, in such a scope, whether an HTTP/1 one's origin is
+/// to close it, and whether the HTTP/1 ones half-close with a FIN alone.
 #[derive(Default)]
 struct Connections {
     http2: Mutex<Vec<(u64, Control)>>,
@@ -239,8 +239,7 @@ struct Connections {
     http1_origin_closed: Notify,
     ends_with_http1_origin: AtomicBool,
     http1_origin_gone: AtomicBool,
-    http1_origin_reset: AtomicBool,
-    http1_origin_close_notify: AtomicBool,
+    http1_origin_end: Mutex<Option<OriginEnd>>,
     http1_origin_closing: AtomicBool,
     http1_half_close_fin: AtomicBool,
 }
@@ -467,6 +466,37 @@ pub enum ConnectionEnd {
     Fin = 1,
     /// With a TCP reset, sending nothing more.
     Reset = 2,
+}
+
+/// How an origin ended its side of a connection (see
+/// [`ConnectionScope::http1_origin_end`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OriginEnd {
+    /// With TLS's close_notify.
+    CloseNotify,
+    /// With a FIN alone: no close_notify, or no TLS.
+    Fin,
+    /// With the fatal TLS alert of this description.
+    Alert(u8),
+    /// With a TCP reset.
+    Reset,
+}
+
+impl OriginEnd {
+    /// How the read `read` ended the origin's side: one that succeeded read its end, a
+    /// clean one when `close_notify` tells the origin sent its TLS close_notify.
+    pub fn of_read(read: &std::io::Result<()>, close_notify: impl FnOnce() -> bool) -> Self {
+        match read {
+            Ok(()) if close_notify() => Self::CloseNotify,
+            Ok(()) => Self::Fin,
+            Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset => Self::Reset,
+            Err(e) => e
+                .get_ref()
+                .and_then(|e| e.downcast_ref::<btls::ssl::Error>())
+                .and_then(crate::tls::conn::received_alert)
+                .map_or(Self::Fin, Self::Alert),
+        }
+    }
 }
 
 impl Connections {
@@ -715,16 +745,12 @@ impl ConnectionScope {
         self.0.2.http1_origin_gone.load(Ordering::Acquire)
     }
 
-    /// Whether the origin that closed the last HTTP/1 connection open in this scope (see
-    /// [`Self::http1_origin_closed`]) reset it.
-    pub fn http1_origin_reset(&self) -> bool {
-        self.0.2.http1_origin_reset.load(Ordering::Acquire)
-    }
-
-    /// Whether the origin that closed the last HTTP/1 connection open in this scope (see
-    /// [`Self::http1_origin_closed`]) ended its TLS with its close_notify.
-    pub fn http1_origin_close_notify(&self) -> bool {
-        self.0.2.http1_origin_close_notify.load(Ordering::Acquire)
+    /// How the origin of an HTTP/1 connection of this scope, ending with its HTTP/1 origin
+    /// (see [`Self::end_with_http1_origin`]), ended it, the last to: told as soon as the
+    /// connection read it, ahead of the request it failed, and of
+    /// [`Self::http1_origin_closed`].
+    pub fn http1_origin_end(&self) -> Option<OriginEnd> {
+        *self.0.2.http1_origin_end.lock()
     }
 
     /// Whether this scope, ending with its HTTP/1 origin (see
@@ -947,11 +973,22 @@ impl Drop for Http2Registration {
 /// `by_origin`.
 pub(crate) struct Http1Open {
     connections: Arc<Connections>,
-    pub(crate) by_origin: bool,
-    /// Its origin reset it.
-    pub(crate) reset: bool,
-    /// Its origin ended its TLS with its close_notify.
-    pub(crate) close_notify: bool,
+    by_origin: bool,
+}
+
+impl Http1Open {
+    /// Notes that its origin ended it so (`end`), telling its scope if it ends with its
+    /// HTTP/1 origin.
+    pub(crate) fn ended(&mut self, end: OriginEnd) {
+        self.by_origin = true;
+        if self
+            .connections
+            .ends_with_http1_origin
+            .load(Ordering::Acquire)
+        {
+            *self.connections.http1_origin_end.lock() = Some(end);
+        }
+    }
 }
 
 impl Drop for Http1Open {
@@ -969,12 +1006,6 @@ impl Drop for Http1Open {
                     .http1_origin_gone
                     .store(true, Ordering::Release);
             }
-            self.connections
-                .http1_origin_reset
-                .store(self.reset, Ordering::Release);
-            self.connections
-                .http1_origin_close_notify
-                .store(self.close_notify, Ordering::Release);
             self.connections.http1_origin_closed.notify_one();
         }
     }
@@ -1117,8 +1148,6 @@ impl ScopeRef {
         Http1Open {
             connections: self.connections.clone(),
             by_origin: false,
-            reset: false,
-            close_notify: false,
         }
     }
 
