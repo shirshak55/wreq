@@ -134,8 +134,8 @@ impl AlpsGate {
 
     /// Ends the handshake, rejecting the server's certificate with `alert`, or the one
     /// BoringSSL sends for its verification failure (`certificate_unknown` for one that
-    /// verified). A handshake paused for a client certificate ends with
-    /// `internal_error`.
+    /// verified). A handshake paused for a client certificate ends with `alert`, or
+    /// `internal_error` without one.
     pub fn reject(&self, alert: Option<u8>) {
         self.verdict.send_replace(Some(Verdict::Reject(alert)));
     }

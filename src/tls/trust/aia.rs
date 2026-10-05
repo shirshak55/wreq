@@ -139,8 +139,10 @@ fn gate_index() -> Result<Index<Ssl, AlpsGate>, ErrorStack> {
 }
 
 /// Makes `ssl`'s handshake wait on `gate` for its application settings, and for the
-/// other decisions its caller takes (see [`AlpsGate`]).
+/// other decisions its caller takes (see [`AlpsGate`]), with the server's whole flight read
+/// (a TLS 1.2 certificate is verified after the ServerHelloDone).
 pub(crate) fn set_alps_gate(ssl: &mut Ssl, gate: AlpsGate) -> Result<(), ErrorStack> {
+    ssl.set_verify_after_server_flight(true)?;
     ssl.set_ex_data(gate_index()?, gate);
     // SAFETY: `ssl` is a live `SSL`, and the callback takes no argument.
     #[allow(unsafe_code)]
@@ -153,7 +155,8 @@ pub(crate) fn set_alps_gate(ssl: &mut Ssl, gate: AlpsGate) -> Result<(), ErrorSt
 /// The client certificate callback of a connection with a gate, which BoringSSL runs on the
 /// server's CertificateRequest: in the handshake, for a connection with no certificate
 /// configured, it pauses the handshake on the gate, unless that paused it already, for
-/// whether it goes on without one (an empty Certificate) or ends (see [`handshake`]).
+/// whether it goes on without one (an empty Certificate) or ends, with the alert the gate
+/// rejects with (see [`handshake`]).
 #[allow(unsafe_code)]
 unsafe extern "C" fn certificate_request(ssl: *mut btls_sys::SSL, _arg: *mut c_void) -> c_int {
     // SAFETY: BoringSSL passes the live `SSL` whose handshake runs the callback.
@@ -175,7 +178,13 @@ unsafe extern "C" fn certificate_request(ssl: *mut btls_sys::SSL, _arg: *mut c_v
     };
     let mut state = state.lock();
     match state.verdict {
-        Some(Verdict::Reject(_) | Verdict::Close) => 0,
+        Some(Verdict::Reject(Some(alert))) => {
+            // BoringSSL's own internal_error then finds this alert sent.
+            // SAFETY: `ssl` is a live `SSL` in its handshake.
+            unsafe { btls_sys::SSL_send_fatal_alert(ssl.as_ptr(), alert) };
+            0
+        }
+        Some(Verdict::Reject(None) | Verdict::Close) => 0,
         Some(Verdict::Accept(_)) => 1,
         None => {
             state.paused = true;
@@ -470,17 +479,23 @@ async fn wait_for_verdict(ssl: &SslRef) -> Option<Verdict> {
     Some(verdict)
 }
 
-/// Reads what `stream` received, without waiting for more, so closing it sends a FIN, not
-/// the reset a socket closed with unread data sends.
+/// The most [`drain`] reads: a server's flight, not what a server streaming faster than it
+/// is read keeps sending.
+const MAX_DRAIN: usize = 64 * 1024;
+
+/// Reads what `stream` received, up to [`MAX_DRAIN`] bytes, without waiting for more, so
+/// closing it sends a FIN, not the reset a socket closed with unread data sends.
 fn drain<S: AsyncRead + Unpin>(stream: &mut S) {
     let mut chunk = [0; 4096];
-    loop {
+    let mut drained = 0;
+    while drained < MAX_DRAIN {
         let mut buf = ReadBuf::new(&mut chunk);
         let read =
             Pin::new(&mut *stream).poll_read(&mut Context::from_waker(Waker::noop()), &mut buf);
         if !matches!(read, Poll::Ready(Ok(()))) || buf.filled().is_empty() {
             break;
         }
+        drained += buf.filled().len();
     }
 }
 
