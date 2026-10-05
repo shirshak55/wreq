@@ -244,6 +244,16 @@ impl<T: AsyncWrite + AsyncRead + Connection + Unpin> AsyncWrite for ScopedIo<T> 
                     "the origin closed the connection before its scope ended",
                 )));
             }
+        } else if self
+            .scope
+            .as_ref()
+            .is_some_and(ScopeRef::half_closes_with_fin)
+        {
+            let mut io = self.io()?;
+            std::task::ready!(io.as_mut().poll_flush(cx))?;
+            if let Some(socket) = io.socket() {
+                return Poll::Ready(socket.shutdown(std::net::Shutdown::Write));
+            }
         }
         self.io()?.poll_shutdown(cx)
     }

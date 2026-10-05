@@ -219,7 +219,7 @@ pub struct ConnectionScope(Arc<(u64, watch::Sender<bool>, Arc<Connections>)>);
 /// sent on, each's latest value, the connections waiting for the scope's close, how their origins
 /// end the HTTP/2 ones, and how many HTTP/1 ones are open, told once an origin closed the last,
 /// and whether it reset it, which, in a scope ending with its HTTP/1 origin, leaves it gone for
-/// good.
+/// good. Also whether the HTTP/1 ones half-close with a FIN alone.
 #[derive(Default)]
 struct Connections {
     http2: Mutex<Vec<(u64, Control)>>,
@@ -239,6 +239,7 @@ struct Connections {
     ends_with_http1_origin: AtomicBool,
     http1_origin_gone: AtomicBool,
     http1_origin_reset: AtomicBool,
+    http1_half_close_fin: AtomicBool,
 }
 
 /// The frames a scope had its HTTP/2 connections send before its first opened, the memory
@@ -697,6 +698,13 @@ impl ConnectionScope {
             .store(true, Ordering::Release);
     }
 
+    /// Makes this scope's HTTP/1 connections half-close, as a request relaying a client's
+    /// half-close has them do (see [`ReadClosed`](wreq_proto::ext::ReadClosed)), with a FIN
+    /// alone, sending no close_notify: the client half-closed its own TLS so.
+    pub fn half_close_with_fin(&self) {
+        self.0.2.http1_half_close_fin.store(true, Ordering::Release);
+    }
+
     /// Whether this scope, ending with its HTTP/1 origin (see
     /// [`Self::end_with_http1_origin`]), is gone: that origin closed its last HTTP/1
     /// connection.
@@ -1017,6 +1025,14 @@ impl ScopeRef {
         *self.connections.pending_requests.lock() = PendingRequests::default();
         self.connections.pending_resets.lock().clear();
         self.connections.opened(None);
+    }
+
+    /// Whether the scope's HTTP/1 connections half-close with a FIN alone (see
+    /// [`ConnectionScope::half_close_with_fin`]).
+    pub(crate) fn half_closes_with_fin(&self) -> bool {
+        self.connections
+            .http1_half_close_fin
+            .load(Ordering::Acquire)
     }
 
     /// How the scope's connections end (see [`ConnectionScope::end_with`]).
