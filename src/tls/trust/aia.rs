@@ -185,6 +185,12 @@ unsafe extern "C" fn certificate_request(ssl: *mut btls_sys::SSL, _arg: *mut c_v
             0
         }
         Some(Verdict::Reject(None) | Verdict::Close) => 0,
+        Some(Verdict::CloseNotify) => {
+            // BoringSSL then sends no internal_error after it.
+            // SAFETY: `ssl` is a live `SSL` in its handshake.
+            unsafe { btls_sys::SSL_send_close_notify(ssl.as_ptr()) };
+            0
+        }
         Some(Verdict::Accept(_)) => 1,
         None => {
             state.paused = true;
@@ -293,7 +299,12 @@ impl AiaCache {
         let gate = alps_gate(ssl).filter(|_| !state.paused && !renegotiating);
         match result {
             // The verify callback may accept a chain despite an error.
-            _ if verified && !matches!(state.verdict, Some(Verdict::Reject(_))) => {
+            _ if verified
+                && !matches!(
+                    state.verdict,
+                    Some(Verdict::Reject(_) | Verdict::CloseNotify)
+                ) =>
+            {
                 state.error = None;
                 if let Some(gate) = gate
                     && ssl.peer_application_settings().is_some()
@@ -325,6 +336,13 @@ impl AiaCache {
                     }
                     Some(Verdict::Reject(Some(alert))) => {
                         return Err(SslVerifyError::Invalid(SslAlert::from_raw((*alert).into())));
+                    }
+                    Some(Verdict::CloseNotify) => {
+                        // BoringSSL then sends no alert for this failure.
+                        // SAFETY: `ssl` is a live `SSL` in its handshake.
+                        #[allow(unsafe_code)]
+                        let _ = unsafe { btls_sys::SSL_send_close_notify(ssl.as_ptr()) };
+                        return Err(SslVerifyError::Invalid(SslAlert::CERTIFICATE_UNKNOWN));
                     }
                     _ => {}
                 }
@@ -432,8 +450,14 @@ pub(crate) async fn handshake<S>(stream: &mut SslStream<S>) -> Result<(), btls::
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
+    let mut close_notify = false;
     loop {
         let error = match Pin::new(&mut *stream).connect().await {
+            // Failing as the close_notify the gate decided on ended it.
+            Err(error) if close_notify => {
+                drain(stream.get_mut());
+                return Err(error);
+            }
             Err(error) if error.code() == btls::ssl::ErrorCode::WANT_CERTIFICATE_VERIFY => {
                 let pending = state_index()
                     .ok()
@@ -454,6 +478,7 @@ where
                 drain(stream.get_mut());
                 return Err(error);
             }
+            Some(Verdict::CloseNotify) => close_notify = true,
             Some(_) => {}
         }
     }

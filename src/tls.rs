@@ -93,6 +93,8 @@ pub(crate) enum Verdict {
     Reject(Option<u8>),
     /// Ends without an alert, the connection closed once what the server sent is read.
     Close,
+    /// Ends with a close_notify, the connection closed once what the server sent is read.
+    CloseNotify,
 }
 
 impl Default for AlpsGate {
@@ -145,6 +147,12 @@ impl AlpsGate {
     /// reset a socket closed with unread data sends.
     pub fn close(&self) {
         self.verdict.send_replace(Some(Verdict::Close));
+    }
+
+    /// Ends the handshake with a close_notify and no other alert, as a client closing its
+    /// connection with one does, the connection then closed as [`Self::close`] closes it.
+    pub fn close_notify(&self) {
+        self.verdict.send_replace(Some(Verdict::CloseNotify));
     }
 
     /// Resolves with `true` once the server asks for a client certificate past the
