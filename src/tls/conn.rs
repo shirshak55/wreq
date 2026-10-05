@@ -1064,6 +1064,7 @@ impl<IO: AsyncRead + AsyncWrite + Unpin> TlsStream<IO> {
 #[derive(Debug)]
 pub struct HandshakeFailure {
     error: btls::ssl::Error,
+    server_end: Option<aia::ServerEnd>,
     alert: Option<u8>,
     verify_error: Option<(i32, &'static str)>,
     peer_certificate_chain: Vec<Bytes>,
@@ -1081,14 +1082,18 @@ pub struct HandshakeFailure {
 impl HandshakeFailure {
     #[cfg_attr(not(feature = "tokio-rt"), allow(dead_code))]
     fn new(error: btls::ssl::Error, ssl: &SslRef) -> Self {
+        let server_end = aia::server_end_of(ssl);
         // A received alert is reported as the SSL library's reason `SSL_AD_REASON_OFFSET`
         // plus its description.
-        let alert = error.ssl_error().and_then(|stack| {
-            stack.errors().iter().find_map(|error| {
-                let reason = error.library_reason(btls_sys::ERR_LIB_SSL)?;
-                u8::try_from(reason.checked_sub(btls_sys::SSL_AD_REASON_OFFSET)?).ok()
-            })
-        });
+        let alert = match &server_end {
+            Some(aia::ServerEnd::Alert { description, .. }) => Some(*description),
+            _ => error.ssl_error().and_then(|stack| {
+                stack.errors().iter().find_map(|error| {
+                    let reason = error.library_reason(btls_sys::ERR_LIB_SSL)?;
+                    u8::try_from(reason.checked_sub(btls_sys::SSL_AD_REASON_OFFSET)?).ok()
+                })
+            }),
+        };
         let verify_error = aia::verify_result(ssl)
             .err()
             .map(|error| (error.as_raw(), error.error_string()));
@@ -1100,6 +1105,7 @@ impl HandshakeFailure {
             .collect();
         Self {
             error,
+            server_end,
             alert,
             verify_error,
             peer_certificate_chain,
@@ -1199,12 +1205,27 @@ impl HandshakeFailure {
 
 impl fmt::Display for HandshakeFailure {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        fmt::Display::fmt(&self.error, f)
+        match &self.server_end {
+            Some(aia::ServerEnd::Alert { level, description }) => write!(
+                f,
+                "the server sent alert {description} (level {level}) while the handshake waited"
+            ),
+            Some(aia::ServerEnd::Io(error)) => {
+                write!(
+                    f,
+                    "the server ended the connection while the handshake waited: {error}"
+                )
+            }
+            None => fmt::Display::fmt(&self.error, f),
+        }
     }
 }
 
 impl std::error::Error for HandshakeFailure {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        if let Some(aia::ServerEnd::Io(error)) = &self.server_end {
+            return Some(error);
+        }
         Some(&self.error)
     }
 }
@@ -1271,6 +1292,9 @@ pub struct HelloRecords<IO> {
     /// Bytes accepted but not yet written to `io`, from `sent` on.
     pending: Vec<u8>,
     sent: usize,
+    /// What the server sent, read ahead of the TLS library while its handshake waits (see
+    /// [`Self::poll_read_ahead`]), for it to read first.
+    ahead: Vec<u8>,
 }
 
 /// Where the next byte written falls: in a record's header (of a `kind` record), or
@@ -1331,7 +1355,40 @@ impl<IO> HelloRecords<IO> {
             held: Vec::new(),
             pending: Vec::new(),
             sent: 0,
+            ahead: Vec::new(),
         }
+    }
+
+    /// Reads what the server sends next ahead of the TLS library, which reads it first once
+    /// it reads again (see [`Self::read_ahead`]): how many bytes, none at EOF.
+    pub(crate) fn poll_read_ahead(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<usize>>
+    where
+        IO: AsyncRead + Unpin,
+    {
+        let mut chunk = [0; 4096];
+        let mut buf = ReadBuf::new(&mut chunk);
+        std::task::ready!(self.poll_read_io(cx, &mut buf))?;
+        self.ahead.extend_from_slice(buf.filled());
+        Poll::Ready(Ok(buf.filled().len()))
+    }
+
+    /// What [`Self::poll_read_ahead`] read that the TLS library hasn't yet.
+    pub(crate) fn read_ahead(&self) -> &[u8] {
+        &self.ahead
+    }
+
+    /// Reads from `io` into `buf`, taking note of the server's first bytes.
+    fn poll_read_io(&mut self, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<io::Result<()>>
+    where
+        IO: AsyncRead + Unpin,
+    {
+        let filled = buf.filled().len();
+        let read = Pin::new(&mut self.io).poll_read(cx, buf);
+        if buf.filled().len() > filled {
+            self.version = None;
+            self.read_server_head(&buf.filled()[filled..]);
+        }
+        read
     }
 
     /// Takes `read`, the server's next bytes, until they show whether its first message is a
@@ -1466,13 +1523,13 @@ impl<IO: AsyncRead + Unpin> AsyncRead for HelloRecords<IO> {
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
-        let filled = buf.filled().len();
-        let read = Pin::new(&mut self.io).poll_read(cx, buf);
-        if buf.filled().len() > filled {
-            self.version = None;
-            self.read_server_head(&buf.filled()[filled..]);
+        if !self.ahead.is_empty() {
+            let len = self.ahead.len().min(buf.remaining());
+            buf.put_slice(&self.ahead[..len]);
+            self.ahead.drain(..len);
+            return Poll::Ready(Ok(()));
         }
-        read
+        self.get_mut().poll_read_io(cx, buf)
     }
 }
 

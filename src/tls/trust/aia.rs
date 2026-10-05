@@ -16,19 +16,19 @@ use btls::{
     ex_data::Index,
     hash::MessageDigest,
     nid::Nid,
-    ssl::{Ssl, SslAlert, SslRef, SslVerifyError},
+    ssl::{PeekedAlert, Ssl, SslAlert, SslRef, SslVerifyError},
     stack::Stack,
     x509::{GeneralNameRef, X509, X509Ref, X509StoreContext, X509VerifyError, X509VerifyResult},
 };
 use bytes::Bytes;
 use foreign_types::{ForeignType, ForeignTypeRef};
-use futures_util::future::{FutureExt, Shared};
+use futures_util::future::{Either, FutureExt, Shared};
 use lru::LruCache;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio_btls::SslStream;
 
 use crate::sync::Mutex;
-use crate::tls::{AlpsGate, Verdict};
+use crate::tls::{AlpsGate, Verdict, conn::HelloRecords};
 
 /// How many missing issuers one verification fetches, one chain level each.
 const MAX_LEVELS: usize = 3;
@@ -130,6 +130,17 @@ struct State {
     paused: bool,
     failed_leaf: Option<[u8; 32]>,
     verdict: Option<Verdict>,
+    /// How the server ended the handshake while it waited for that verdict, if it did.
+    server_end: Option<ServerEnd>,
+}
+
+/// How a server ended a handshake waiting on its gate (see [`AlpsGate`]), read meanwhile.
+#[derive(Debug)]
+pub(crate) enum ServerEnd {
+    /// With this alert: its level and description.
+    Alert { level: u8, description: u8 },
+    /// Closing (an EOF, as `UnexpectedEof`) or resetting its connection.
+    Io(io::Error),
 }
 
 fn gate_index() -> Result<Index<Ssl, AlpsGate>, ErrorStack> {
@@ -445,10 +456,12 @@ impl AiaCache {
 
 /// Runs `stream`'s client handshake, waiting out the issuer fetches its certificate
 /// verification pauses it for (see [`AiaCache`]), and the decisions of the gate it pauses
-/// on (see [`AlpsGate`]).
-pub(crate) async fn handshake<S>(stream: &mut SslStream<S>) -> Result<(), btls::ssl::Error>
+/// on (see [`AlpsGate`]), unless the server ends it meanwhile (see [`server_end`]).
+pub(crate) async fn handshake<IO>(
+    stream: &mut SslStream<HelloRecords<IO>>,
+) -> Result<(), btls::ssl::Error>
 where
-    S: AsyncRead + AsyncWrite + Unpin,
+    IO: AsyncRead + AsyncWrite + Unpin,
 {
     let mut close_notify = false;
     loop {
@@ -472,36 +485,94 @@ where
             Err(error) if error.code() == btls::ssl::ErrorCode::WANT_X509_LOOKUP => error,
             result => return result,
         };
-        match wait_for_verdict(stream.ssl()).await {
-            None => return Err(error),
-            Some(Verdict::Close) => {
+        let Some(gate) = undecided_gate(stream.ssl()) else {
+            return Err(error);
+        };
+        // The verdict is recorded for the handshake to act on, as is how the server ended
+        // it meanwhile.
+        let decided = {
+            let verdict = std::pin::pin!(gate.verdict());
+            let end = std::pin::pin!(server_end(stream));
+            match futures_util::future::select(verdict, end).await {
+                Either::Left((verdict, _)) => Ok(verdict),
+                Either::Right((end, _)) => Err(end),
+            }
+        };
+        let verdict = match decided {
+            Ok(verdict) => verdict,
+            Err(end) => {
+                with_state(stream.ssl(), |state| state.server_end = Some(end));
+                return Err(error);
+            }
+        };
+        with_state(stream.ssl(), |state| state.verdict = Some(verdict.clone()));
+        match verdict {
+            Verdict::Close => {
                 drain(stream.get_mut());
                 return Err(error);
             }
-            Some(Verdict::CloseNotify) => close_notify = true,
-            Some(_) => {}
+            Verdict::CloseNotify => close_notify = true,
+            Verdict::Accept(_) | Verdict::Reject(_) => {}
         }
     }
 }
 
-/// Waits for the verdict of the gate `ssl`'s handshake paused on, should it have paused
-/// on one that decided nothing yet, and records it for the handshake to act on: the
-/// verdict, if it waited for one.
-async fn wait_for_verdict(ssl: &SslRef) -> Option<Verdict> {
-    let state = state_index().ok().and_then(|index| ssl.ex_data(index));
-    let (Some(state), Some(gate)) = (state, alps_gate(ssl)) else {
-        return None;
-    };
-    let waiting = {
-        let state = state.lock();
-        state.paused && state.verdict.is_none()
-    };
-    if !waiting {
-        return None;
+/// The gate `ssl`'s handshake paused on, should it have paused on one that decided nothing
+/// yet.
+fn undecided_gate(ssl: &SslRef) -> Option<AlpsGate> {
+    let state = state_index().ok().and_then(|index| ssl.ex_data(index))?;
+    let state = state.lock();
+    (state.paused && state.verdict.is_none())
+        .then(|| alps_gate(ssl).cloned())
+        .flatten()
+}
+
+/// Runs `f` on `ssl`'s verification state, if it has one.
+fn with_state(ssl: &SslRef, f: impl FnOnce(&mut State)) {
+    if let Some(state) = state_index().ok().and_then(|index| ssl.ex_data(index)) {
+        f(&mut state.lock());
     }
-    let verdict = gate.verdict().await;
-    state.lock().verdict = Some(verdict.clone());
-    Some(verdict)
+}
+
+/// Reads ahead what the server sends while `stream`'s handshake waits on its gate, for the
+/// handshake to read once it goes on, until the server ends it: with an alert (see
+/// [`SslRef::peek_server_alert`]), or closing or resetting its connection, as a client
+/// whose handshake stalls finds. Once the server sends anything else, or more than
+/// [`MAX_DRAIN`] bytes before an alert, the handshake is left to its gate.
+async fn server_end<IO>(stream: &mut SslStream<HelloRecords<IO>>) -> ServerEnd
+where
+    IO: AsyncRead + Unpin,
+{
+    loop {
+        match std::future::poll_fn(|cx| stream.get_mut().poll_read_ahead(cx)).await {
+            Ok(0) => {
+                return ServerEnd::Io(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "the server closed the connection",
+                ));
+            }
+            Ok(_) => {}
+            Err(error) => return ServerEnd::Io(error),
+        }
+        let ahead = stream.get_ref().read_ahead();
+        match stream.ssl().peek_server_alert(ahead) {
+            PeekedAlert::Alert { level, description } => {
+                return ServerEnd::Alert { level, description };
+            }
+            PeekedAlert::Incomplete if ahead.len() <= MAX_DRAIN => {}
+            PeekedAlert::Incomplete | PeekedAlert::Unknown => {
+                return std::future::pending().await;
+            }
+        }
+    }
+}
+
+/// How the server ended `ssl`'s handshake while it waited on its gate, if it did.
+pub(crate) fn server_end_of(ssl: &SslRef) -> Option<ServerEnd> {
+    state_index()
+        .ok()
+        .and_then(|index| ssl.ex_data(index))
+        .and_then(|state| state.lock().server_end.take())
 }
 
 /// The most [`drain`] reads: a server's flight, not what a server streaming faster than it
