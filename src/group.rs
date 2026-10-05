@@ -30,7 +30,7 @@ use std::{
 
 use bytes::Bytes;
 use http::{Uri, Version};
-use http2::ext::ResponsePosition;
+use http2::ext::{PrefaceFrame, ResponsePosition};
 use name::GroupId;
 use tokio::sync::{Notify, watch};
 use wreq_proto::http2::Control;
@@ -215,10 +215,10 @@ pub struct ConnectionScope(Arc<(u64, watch::Sender<bool>, Arc<Connections>)>);
 /// told, else one past it) and the tasks waiting to be told, what the caller sent them
 /// before the first opened, which that one sends should it speak HTTP/2 (the frames, unless
 /// the caller dropped them, and the requests held, `true`, or released), the tasks waiting
-/// for room among those frames, the requests' resets, by request, the connections waiting
-/// for the scope's close, how their origins end the HTTP/2 ones, and how many HTTP/1 ones are open,
-/// told once an origin closed the last, which, in a scope ending with its HTTP/1 origin, leaves it
-/// gone for good.
+/// for room among those frames, the requests' resets, by request, the SETTINGS parameters
+/// sent on, each's latest value, the connections waiting for the scope's close, how their origins
+/// end the HTTP/2 ones, and how many HTTP/1 ones are open, told once an origin closed the last,
+/// which, in a scope ending with its HTTP/1 origin, leaves it gone for good.
 #[derive(Default)]
 struct Connections {
     http2: Mutex<Vec<(u64, Control)>>,
@@ -230,6 +230,7 @@ struct Connections {
     pending_dropped: AtomicBool,
     pending_requests: Mutex<PendingRequests>,
     pending_resets: Mutex<VecDeque<(u32, u32)>>,
+    settings: Mutex<Vec<(u16, u32)>>,
     pending_tasks: Mutex<Vec<Waker>>,
     origin_ends: OriginEnds,
     http1_open: AtomicUsize,
@@ -519,13 +520,26 @@ impl ConnectionScope {
     /// [`Control::after_request`]), once the previous one it sent was acknowledged; the
     /// known parameters apply to it on the acknowledgement. Before the scope's first
     /// connection opened, that one sends it, should it speak HTTP/2, as the frames below.
+    /// A connection opening in this scope after its first sends their parameters, each's
+    /// latest value, right before its first request (see
+    /// [`Control::send_before_next_request`]).
     pub fn send_http2_settings(&self, after: u32, params: &[(u16, u32)]) {
-        let params = params.to_vec();
-        self.on_http2(size_of_val(params.as_slice()), move |control| {
+        let http2 = self.0.2.http2.lock();
+        let sent = params.to_vec();
+        let goes = self.on_http2_locked(&http2, size_of_val(params), move |control| {
             control
                 .after_request(after)
-                .send_settings(params.iter().copied())
+                .send_settings(sent.iter().copied())
         });
+        if goes {
+            let mut settings = self.0.2.settings.lock();
+            for &(id, value) in params {
+                match settings.iter_mut().find(|(kept, _)| *kept == id) {
+                    Some(kept) => kept.1 = value,
+                    None => settings.push((id, value)),
+                }
+            }
+        }
     }
 
     /// Sends a PING carrying `payload` on each HTTP/2 connection open in this scope,
@@ -735,10 +749,20 @@ impl ConnectionScope {
     /// that one should it speak HTTP/2.
     fn on_http2(&self, octets: usize, send: impl Fn(&Control) + Send + 'static) {
         let http2 = self.0.2.http2.lock();
+        self.on_http2_locked(&http2, octets, send);
+    }
+
+    /// [`Self::on_http2`] with the connections (`http2`) locked; whether the frame goes on.
+    fn on_http2_locked(
+        &self,
+        http2: &[(u64, Control)],
+        octets: usize,
+        send: impl Fn(&Control) + Send + 'static,
+    ) -> bool {
         if self.0.2.first.borrow().is_none() {
             let mut pending = self.0.2.pending.lock();
             if self.0.2.pending_dropped.load(Ordering::Acquire) {
-                return;
+                return false;
             }
             if pending.is_full() {
                 if !std::mem::replace(&mut pending.overflowed, true) {
@@ -746,16 +770,17 @@ impl ConnectionScope {
                         "the HTTP/2 frames sent before the scope's first connection opened, past as many as it keeps, go to no connection"
                     );
                 }
-                return;
+                return false;
             }
             pending.bytes +=
                 octets + size_of_val(&send) + size_of::<Box<dyn Fn(&Control) + Send>>();
             pending.sends.push(Box::new(send));
-            return;
+            return true;
         }
-        for (_, control) in http2.iter() {
+        for (_, control) in http2 {
             send(control);
         }
+        true
     }
 
     /// Tells each HTTP/2 connection open in this scope that the request recorded as
@@ -926,6 +951,13 @@ impl ScopeRef {
         for send in std::mem::take(&mut *self.connections.pending.lock()).sends {
             send(&control);
         }
+        // One opening after the first carries the SETTINGS sent on before it, which the
+        // first got as they came (see `ConnectionScope::send_http2_settings`).
+        let settings = self.connections.settings.lock();
+        if self.connections.first.borrow().is_some() && !settings.is_empty() {
+            control.send_before_next_request([PrefaceFrame::Settings(settings.clone())]);
+        }
+        drop(settings);
         // Releases first: a request held again after its release stays held.
         let requests = std::mem::take(&mut *self.connections.pending_requests.lock());
         for recorded in requests.released {
