@@ -32,6 +32,9 @@ const SCOPE_END_WAIT: Duration = Duration::from_secs(2);
 ///
 /// An HTTP/1 one is counted open in its scope from its connect on (see
 /// [`ConnectionScope::http1_origin_closed`](crate::ConnectionScope::http1_origin_closed)).
+/// Dropped before its origin ended it, in a scope ending with its HTTP/1 origin that hasn't
+/// ended otherwise, it goes to that receiver still counted open, to learn how its origin
+/// ends it.
 /// An HTTP/2 one tells its scope how its origin closed it, and closes as its scope ends,
 /// waiting up to [`SCOPE_END_WAIT`] for that, as the origin's close ends the scope's
 /// client soon after; past it, after its origin's close, it closes with a FIN alone.
@@ -41,12 +44,14 @@ pub(super) struct ScopedIo<T: Connection> {
     io: Option<T>,
     scope: Option<ScopeRef>,
     http1: Option<Http1Open>,
-    dropped: Option<oneshot::Sender<T>>,
+    dropped: Option<oneshot::Sender<(T, Option<Http1Open>)>>,
     http2: bool,
     /// Whether its origin ended its side: a read ended, or failed.
     origin_ended: bool,
     /// Whether its origin reset it.
     origin_reset: bool,
+    /// Whether its origin ended its TLS with its close_notify.
+    origin_close_notify: bool,
     timer: Timer,
     /// Bounds its wait for its scope's end, once it started.
     scope_end_wait: Option<Pin<Box<dyn Sleep>>>,
@@ -62,7 +67,7 @@ impl<T: Connection + Unpin> ScopedIo<T> {
         http1: Option<Http1Open>,
         http2: bool,
         timer: Timer,
-    ) -> (Self, oneshot::Receiver<T>) {
+    ) -> (Self, oneshot::Receiver<(T, Option<Http1Open>)>) {
         static NEXT_ID: AtomicU64 = AtomicU64::new(0);
         let (dropped, dropped_rx) = oneshot::channel();
         let scoped = ScopedIo {
@@ -74,6 +79,7 @@ impl<T: Connection + Unpin> ScopedIo<T> {
             http2,
             origin_ended: false,
             origin_reset: false,
+            origin_close_notify: false,
             timer,
             scope_end_wait: None,
         };
@@ -94,9 +100,9 @@ impl<T: Connection + Unpin> ScopedIo<T> {
         Ok(Pin::new(self.io.as_mut().expect("taken only once dropped")))
     }
 
-    /// Notes a read (`read`, which filled nothing when `empty`) ending the origin's side,
-    /// telling the scope of an HTTP/2 connection how: by a close, with or without its
-    /// close_notify, or a reset.
+    /// Notes a read (`read`, which filled nothing when `empty`) ending the origin's side, and
+    /// how: by a close, with or without its close_notify, or a reset. An HTTP/2 connection
+    /// tells its scope at once.
     fn note_read(&mut self, read: &Poll<io::Result<()>>, empty: bool) {
         let reset = match read {
             Poll::Ready(Ok(())) if empty => false,
@@ -110,14 +116,16 @@ impl<T: Connection + Unpin> ScopedIo<T> {
             return;
         }
         self.origin_reset = reset;
+        let close_notify = !reset
+            && self
+                .io
+                .as_ref()
+                .is_some_and(Connection::close_notify_received);
         if let (true, Some(scope)) = (self.http2, &self.scope) {
-            let close_notify = !reset
-                && self
-                    .io
-                    .as_ref()
-                    .is_some_and(Connection::close_notify_received);
             scope.origin_closed(close_notify, reset);
         }
+        // A fatal alert, failing the read, leaves the TLS state a close_notify does.
+        self.origin_close_notify = close_notify && matches!(read, Poll::Ready(Ok(())));
     }
 }
 
@@ -162,6 +170,7 @@ impl<T: Connection> Drop for ScopedIo<T> {
         if let Some(http1) = &mut self.http1 {
             http1.by_origin = self.origin_ended;
             http1.reset = self.origin_reset;
+            http1.close_notify = self.origin_close_notify;
         }
         let Some(io) = self.io.take() else {
             return;
@@ -180,9 +189,14 @@ impl<T: Connection> Drop for ScopedIo<T> {
                 None => debug!("a scoped connection over no TCP socket closes rather than resets"),
             }
         }
+        let origin_to_end = !self.origin_ended
+            && self.scope.as_ref().is_some_and(|scope| {
+                scope.ends_with_http1_origin() && scope.end() == ConnectionEnd::Graceful
+            });
+        let http1 = self.http1.take_if(|_| origin_to_end);
         if let Some(dropped) = self.dropped.take() {
             // Refused when nothing waits to close it, so it just closes.
-            let _ = dropped.send(io);
+            let _ = dropped.send((io, http1));
         }
     }
 }

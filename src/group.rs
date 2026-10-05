@@ -219,7 +219,8 @@ pub struct ConnectionScope(Arc<(u64, watch::Sender<bool>, Arc<Connections>)>);
 /// sent on, each's latest value, the connections waiting for the scope's close, how their origins
 /// end the HTTP/2 ones, and how many HTTP/1 ones are open, told once an origin closed the last,
 /// and whether it reset it, which, in a scope ending with its HTTP/1 origin, leaves it gone for
-/// good. Also whether the HTTP/1 ones half-close with a FIN alone.
+/// good. Also whether that origin sent its TLS close_notify, whether an HTTP/1 one's origin
+/// is to close it, and whether the HTTP/1 ones half-close with a FIN alone.
 #[derive(Default)]
 struct Connections {
     http2: Mutex<Vec<(u64, Control)>>,
@@ -239,6 +240,8 @@ struct Connections {
     ends_with_http1_origin: AtomicBool,
     http1_origin_gone: AtomicBool,
     http1_origin_reset: AtomicBool,
+    http1_origin_close_notify: AtomicBool,
+    http1_origin_closing: AtomicBool,
     http1_half_close_fin: AtomicBool,
 }
 
@@ -718,6 +721,20 @@ impl ConnectionScope {
         self.0.2.http1_origin_reset.load(Ordering::Acquire)
     }
 
+    /// Whether the origin that closed the last HTTP/1 connection open in this scope (see
+    /// [`Self::http1_origin_closed`]) ended its TLS with its close_notify.
+    pub fn http1_origin_close_notify(&self) -> bool {
+        self.0.2.http1_origin_close_notify.load(Ordering::Acquire)
+    }
+
+    /// Whether this scope, ending with its HTTP/1 origin (see
+    /// [`Self::end_with_http1_origin`]), has an HTTP/1 connection open whose last exchange
+    /// said its origin would close it (`Connection: close`): its close (see
+    /// [`Self::http1_origin_closed`]) is to come.
+    pub fn http1_origin_closing(&self) -> bool {
+        self.0.2.http1_origin_closing.load(Ordering::Acquire)
+    }
+
     /// How the origins of this scope's HTTP/2 connections end them, as they do: each GOAWAY
     /// they send, then how they close. Taken by the first call, `None` after it.
     pub fn http2_origin_ends(&self) -> Option<Http2OriginEnds> {
@@ -933,10 +950,15 @@ pub(crate) struct Http1Open {
     pub(crate) by_origin: bool,
     /// Its origin reset it.
     pub(crate) reset: bool,
+    /// Its origin ended its TLS with its close_notify.
+    pub(crate) close_notify: bool,
 }
 
 impl Drop for Http1Open {
     fn drop(&mut self) {
+        self.connections
+            .http1_origin_closing
+            .store(false, Ordering::Release);
         if self.connections.http1_open.fetch_sub(1, Ordering::AcqRel) == 1 && self.by_origin {
             if self
                 .connections
@@ -950,6 +972,9 @@ impl Drop for Http1Open {
             self.connections
                 .http1_origin_reset
                 .store(self.reset, Ordering::Release);
+            self.connections
+                .http1_origin_close_notify
+                .store(self.close_notify, Ordering::Release);
             self.connections.http1_origin_closed.notify_one();
         }
     }
@@ -1061,6 +1086,24 @@ impl ScopeRef {
         ended
     }
 
+    /// Tells the scope, if it ends with its HTTP/1 origin, that the origin of one of its HTTP/1
+    /// connections is to close it (see [`ConnectionScope::http1_origin_closing`]).
+    pub(crate) fn expect_http1_origin_close(&self) {
+        if self.ends_with_http1_origin() {
+            self.connections
+                .http1_origin_closing
+                .store(true, Ordering::Release);
+        }
+    }
+
+    /// Whether the scope ends with its HTTP/1 origin (see
+    /// [`ConnectionScope::end_with_http1_origin`]).
+    pub(crate) fn ends_with_http1_origin(&self) -> bool {
+        self.connections
+            .ends_with_http1_origin
+            .load(Ordering::Acquire)
+    }
+
     /// Whether the scope is gone with its HTTP/1 origin (see
     /// [`ConnectionScope::http1_origin_gone`]): it opens no connection.
     pub(crate) fn http1_origin_gone(&self) -> bool {
@@ -1075,6 +1118,7 @@ impl ScopeRef {
             connections: self.connections.clone(),
             by_origin: false,
             reset: false,
+            close_notify: false,
         }
     }
 

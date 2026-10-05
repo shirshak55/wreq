@@ -17,7 +17,7 @@ use bytes::Bytes;
 use futures_util::future::{self, BoxFuture, Either, FutureExt, TryFutureExt};
 use http::{
     HeaderValue, Method, Request, Response, Uri, Version,
-    header::{HOST, PROXY_AUTHORIZATION, TRANSFER_ENCODING},
+    header::{CONNECTION, HOST, PROXY_AUTHORIZATION, TRANSFER_ENCODING},
     uri::{Authority, PathAndQuery, Scheme},
 };
 use http_body::Body;
@@ -55,7 +55,7 @@ use crate::{
         proxy,
     },
     error::ProxyConnect,
-    group::{ConnectionEnd, OnQueued, ScopeRef},
+    group::{ConnectionEnd, Http1Open, OnQueued, ScopeRef},
     rt::{Executor, Timer},
 };
 
@@ -319,6 +319,7 @@ where
         mut req: Request<B>,
         descriptor: ConnectionDescriptor,
     ) -> Result<Response<Incoming>, TrySendError<B>> {
+        let scope = descriptor.scope().cloned();
         let mut pooled = self
             .connection_for(descriptor)
             .await
@@ -408,6 +409,7 @@ where
 
         let on_queued = req.extensions().get::<OnQueued>().cloned();
         let _expected = pooled.expect_request(&req);
+        let request_close = lists(req.headers(), "close");
         let sent = pooled.try_send_request(req);
         if let Some(on_queued) = on_queued {
             on_queued.queued();
@@ -430,6 +432,16 @@ where
                 };
             }
         };
+
+        // Its origin closes the connection after this exchange.
+        if let Some(scope) = &scope
+            && pooled.is_http1()
+            && (request_close
+                || lists(res.headers(), "close")
+                || res.version() == Version::HTTP_10 && !lists(res.headers(), "keep-alive"))
+        {
+            scope.expect_http1_origin_close();
+        }
 
         #[cfg(feature = "cookies")]
         if let Some(cookie_store) = cookie_store {
@@ -1224,31 +1236,42 @@ impl Error {
 /// How long an HTTP/1 connection whose scope ended gets to close its transport.
 const SCOPED_CLOSE_TIMEOUT: Duration = Duration::from_secs(1);
 
+/// How long an HTTP/1 connection done before its origin ended it reads for that end: the
+/// origin of an exchange that said `Connection: close` ends it right after.
+const ORIGIN_END_WAIT: Duration = Duration::from_secs(2);
+
 /// Drives a connection until it ends or, for a scoped connection, its scope does. An HTTP/1
 /// connection whose scope ends gracefully (see [`ConnectionEnd`]) then closes its transport,
 /// back once the connection dropped it (`dropped`), as a client done with it does, within
-/// [`SCOPED_CLOSE_TIMEOUT`] by `timer`; an HTTP/2 one (`http2`) closes so itself.
-async fn scoped<T: AsyncWrite + Unpin>(
+/// [`SCOPED_CLOSE_TIMEOUT`] by `timer`; an HTTP/2 one (`http2`) closes so itself. An HTTP/1
+/// one done first, back still counted open in its scope (see [`ScopedIo`]), is counted closed
+/// as its origin then ends it, or, past [`ORIGIN_END_WAIT`], as closed by the client.
+async fn scoped<T: AsyncRead + AsyncWrite + Connection + Unpin>(
     conn: impl Future<Output = ()>,
     scope: Option<ScopeRef>,
-    dropped: tokio::sync::oneshot::Receiver<T>,
+    mut dropped: tokio::sync::oneshot::Receiver<(T, Option<Http1Open>)>,
     http2: bool,
     timer: Timer,
 ) {
     let Some(scope) = scope else {
         return conn.await;
     };
-    {
+    let ended = {
         let conn = std::pin::pin!(conn);
         let closed = std::pin::pin!(scope.clone().closed());
-        if let Either::Left(_) = future::select(conn, closed).await {
-            return;
+        matches!(future::select(conn, closed).await, Either::Left(_))
+    };
+    if ended {
+        if let Ok((io, Some(open))) = dropped.try_recv() {
+            let end = std::pin::pin!(origin_end(io, open));
+            future::select(end, timer.sleep(ORIGIN_END_WAIT)).await;
         }
+        return;
     }
     if http2 || scope.end() != ConnectionEnd::Graceful {
         return;
     }
-    let Ok(mut io) = dropped.await else {
+    let Ok((mut io, _)) = dropped.await else {
         return;
     };
     let shutdown = std::pin::pin!(io.shutdown());
@@ -1257,6 +1280,35 @@ async fn scoped<T: AsyncWrite + Unpin>(
         Either::Left((Err(_e), _)) => debug!("closing a scoped connection failed: {}", _e),
         Either::Right(_) => debug!("closing a scoped connection timed out"),
     }
+}
+
+/// Whether `headers` list `option` in `Connection`.
+fn lists(headers: &http::HeaderMap, option: &str) -> bool {
+    headers
+        .get_all(CONNECTION)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|value| value.split(','))
+        .any(|token| token.trim().eq_ignore_ascii_case(option))
+}
+
+/// Reads what the origin of the HTTP/1 connection over `io` still sends until it ends it,
+/// then counts it closed (`open`) as the origin did.
+async fn origin_end<T: AsyncRead + Connection + Unpin>(mut io: T, mut open: Http1Open) {
+    use tokio::io::AsyncReadExt;
+
+    let mut unread = [0; 4096];
+    // Only a TLS close_notify ends an HTTP/1 connection's read cleanly (see `TlsConn`).
+    let (reset, close_notify) = loop {
+        match io.read(&mut unread).await {
+            Ok(0) => break (false, io.close_notify_received()),
+            Ok(_) => {}
+            Err(e) => break (e.kind() == std::io::ErrorKind::ConnectionReset, false),
+        }
+    };
+    open.by_origin = true;
+    open.reset = reset;
+    open.close_notify = close_notify;
 }
 
 fn origin_form(uri: &mut Uri) {
