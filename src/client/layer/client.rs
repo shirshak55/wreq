@@ -21,6 +21,7 @@ use http::{
     uri::{Authority, PathAndQuery, Scheme},
 };
 use http_body::Body;
+use http2::ext::{HeadersFrameOptions, RecordedStream};
 use pool::Ver;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tower::{BoxError, util::Oneshot};
@@ -406,6 +407,7 @@ where
         }
 
         let on_queued = req.extensions().get::<OnQueued>().cloned();
+        let _expected = pooled.expect_request(&req);
         let sent = pooled.try_send_request(req);
         if let Some(on_queued) = on_queued {
             on_queued.queued();
@@ -869,6 +871,28 @@ impl<B> PoolClient<B> {
     #[inline]
     fn is_http1(&self) -> bool {
         !self.is_http2()
+    }
+
+    /// Tells a scoped HTTP/2 connection that `req`, a request of its scope's client recorded
+    /// as it numbered it, is on its way to it, until sent there or the value returned is
+    /// dropped (see [`Control::expect_request`](http2::client::Control::expect_request)).
+    fn expect_request<T>(&self, req: &Request<T>) -> Option<http2::client::ExpectedRequest> {
+        let PoolTx::Http2(tx) = &self.tx else {
+            return None;
+        };
+        if !self.scoped {
+            return None;
+        }
+        let extensions = req.extensions();
+        let recorded = extensions
+            .get::<HeadersFrameOptions>()
+            .and_then(|options| options.recorded_stream_id)
+            .or_else(|| {
+                extensions
+                    .get::<RecordedStream>()
+                    .map(|recorded| recorded.0)
+            })?;
+        Some(tx.control().expect_request(recorded))
     }
 
     #[inline]

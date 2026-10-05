@@ -225,7 +225,7 @@ struct Connections {
     http2: Mutex<Vec<(u64, Control)>>,
     first: watch::Sender<Option<Option<Control>>>,
     end: AtomicU8,
-    end_tasks: Mutex<Vec<Waker>>,
+    end_tasks: Mutex<Vec<(u64, Waker)>>,
     close_tasks: Mutex<Vec<(u64, Waker)>>,
     pending: Mutex<PendingHttp2>,
     pending_dropped: AtomicBool,
@@ -847,7 +847,7 @@ impl ConnectionScope {
     /// otherwise before it ends gracefully.
     pub fn end_with(&self, end: ConnectionEnd) {
         self.0.2.end.store(end as u8 + 1, Ordering::Release);
-        for task in self.0.2.end_tasks.lock().drain(..) {
+        for (_, task) in self.0.2.end_tasks.lock().drain(..) {
             task.wake();
         }
     }
@@ -892,6 +892,14 @@ fn tell_request(control: &Control, recorded: u32, held: bool) {
         control.hold_request(recorded);
     } else {
         control.release_request(recorded);
+    }
+}
+
+/// Has `tasks` wake `task` for the connection `id`, in place of the one it woke for it.
+fn wait(tasks: &mut Vec<(u64, Waker)>, id: u64, task: &Waker) {
+    match tasks.iter_mut().find(|(waiting, _)| *waiting == id) {
+        Some((_, waiting)) => waiting.clone_from(task),
+        None => tasks.push((id, task.clone())),
     }
 }
 
@@ -1026,12 +1034,13 @@ impl ScopeRef {
         }
     }
 
-    /// Wakes `task` once the scope is told how its connections end, unless it was already.
-    pub(crate) fn wake_on_end(&self, task: &Waker) -> Option<ConnectionEnd> {
+    /// Wakes `task`, the latest of the connection `id`'s, once the scope is told how its
+    /// connections end, unless it was already, until [`Self::forget`].
+    pub(crate) fn wake_on_end(&self, id: u64, task: &Waker) -> Option<ConnectionEnd> {
         let mut tasks = self.connections.end_tasks.lock();
         let ended = self.ended();
-        if ended.is_none() && !tasks.iter().any(|waiting| waiting.will_wake(task)) {
-            tasks.push(task.clone());
+        if ended.is_none() {
+            wait(&mut tasks, id, task);
         }
         ended
     }
@@ -1062,26 +1071,22 @@ impl ScopeRef {
     }
 
     /// Whether the scope was closed (see [`ConnectionScope::close`]); otherwise wakes `task`,
-    /// the latest of the connection `id`'s, once it is, until [`Self::forget_closed`].
+    /// the latest of the connection `id`'s, once it is, until [`Self::forget`].
     pub(crate) fn poll_closed(&self, id: u64, task: &Waker) -> bool {
         let mut tasks = self.connections.close_tasks.lock();
         if *self.closed.borrow() {
             return true;
         }
-        match tasks.iter_mut().find(|(waiting, _)| *waiting == id) {
-            Some((_, waiting)) => waiting.clone_from(task),
-            None => tasks.push((id, task.clone())),
-        }
+        wait(&mut tasks, id, task);
         false
     }
 
-    /// Wakes the connection `id`'s task at the scope's close no longer (see
-    /// [`Self::poll_closed`]).
-    pub(crate) fn forget_closed(&self, id: u64) {
-        self.connections
-            .close_tasks
-            .lock()
-            .retain(|(waiting, _)| *waiting != id);
+    /// Wakes the connection `id`'s task at the scope's end or close no longer (see
+    /// [`Self::wake_on_end`] and [`Self::poll_closed`]).
+    pub(crate) fn forget(&self, id: u64) {
+        let kept = |(waiting, _): &(u64, Waker)| *waiting != id;
+        self.connections.end_tasks.lock().retain(kept);
+        self.connections.close_tasks.lock().retain(kept);
     }
 
     /// Resolves once the scope is dropped or closed.

@@ -36,7 +36,7 @@ const SCOPE_END_WAIT: Duration = Duration::from_secs(2);
 /// waiting up to [`SCOPE_END_WAIT`] for that, as the origin's close ends the scope's
 /// client soon after; past it, after its origin's close, it closes with a FIN alone.
 pub(super) struct ScopedIo<T: Connection> {
-    /// Its id among its scope's connections waiting for its close.
+    /// Its id among its scope's connections waiting for its end or close.
     id: u64,
     io: Option<T>,
     scope: Option<ScopeRef>,
@@ -126,7 +126,7 @@ impl<T: AsyncRead + Connection + Unpin> ScopedIo<T> {
     /// sends to learn how it closes. Whether the scope ended.
     fn poll_scope_end(&mut self, cx: &mut Context<'_>, scope: &ScopeRef) -> Poll<bool> {
         loop {
-            if scope.wake_on_end(cx.waker()).is_some() {
+            if scope.wake_on_end(self.id, cx.waker()).is_some() {
                 return Poll::Ready(true);
             }
             if self.origin_ended {
@@ -157,7 +157,7 @@ impl<T: AsyncRead + Connection + Unpin> ScopedIo<T> {
 impl<T: Connection> Drop for ScopedIo<T> {
     fn drop(&mut self) {
         if let Some(scope) = &self.scope {
-            scope.forget_closed(self.id);
+            scope.forget(self.id);
         }
         if let Some(http1) = &mut self.http1 {
             http1.by_origin = self.origin_ended;
