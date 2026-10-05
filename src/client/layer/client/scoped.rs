@@ -115,10 +115,14 @@ impl<T: Connection + Unpin> ScopedIo<T> {
     }
 
     /// Notes a write (`written`) failing with the origin's reset, which ended its side so
-    /// before any read did.
+    /// before any read did: as `ConnectionReset`, or as `BrokenPipe` where the kernel fails
+    /// writes to a reset connection so (macOS).
     fn note_write<R>(&mut self, written: &Poll<io::Result<R>>) {
         if let Poll::Ready(Err(e)) = written
-            && e.kind() == io::ErrorKind::ConnectionReset
+            && matches!(
+                e.kind(),
+                io::ErrorKind::ConnectionReset | io::ErrorKind::BrokenPipe
+            )
         {
             self.note_end(OriginEnd::Reset);
         }

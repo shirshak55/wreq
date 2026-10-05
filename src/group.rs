@@ -756,7 +756,8 @@ impl ConnectionScope {
     /// Whether this scope, ending with its HTTP/1 origin (see
     /// [`Self::end_with_http1_origin`]), has an HTTP/1 connection open whose last exchange
     /// said its origin would close it (`Connection: close`): its close (see
-    /// [`Self::http1_origin_closed`]) is to come.
+    /// [`Self::http1_origin_closed`]) is to come. It stays set once that origin closed it,
+    /// the last open, so a close waiting on it can't miss what `http1_origin_closed` tells.
     pub fn http1_origin_closing(&self) -> bool {
         self.0.2.http1_origin_closing.load(Ordering::Acquire)
     }
@@ -993,9 +994,6 @@ impl Http1Open {
 
 impl Drop for Http1Open {
     fn drop(&mut self) {
-        self.connections
-            .http1_origin_closing
-            .store(false, Ordering::Release);
         if self.connections.http1_open.fetch_sub(1, Ordering::AcqRel) == 1 && self.by_origin {
             if self
                 .connections
@@ -1007,6 +1005,10 @@ impl Drop for Http1Open {
                     .store(true, Ordering::Release);
             }
             self.connections.http1_origin_closed.notify_one();
+        } else {
+            self.connections
+                .http1_origin_closing
+                .store(false, Ordering::Release);
         }
     }
 }
