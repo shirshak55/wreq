@@ -45,7 +45,7 @@ use self::{
 };
 use crate::{
     client::{
-        body::{ReadAhead, ReadAheadOnHttp1},
+        body::{READ_AHEAD_WAIT, ReadAhead, ReadAheadOnHttp1},
         layer::config::RequestOptions,
     },
     config::RequestConfig,
@@ -372,7 +372,7 @@ where
                 on_queued.queued();
             }
             let (mut parts, body) = req.into_parts();
-            let body = body.read_ahead().await;
+            let body = body.read_ahead(self.timer.sleep(READ_AHEAD_WAIT)).await;
             if body.is_end_stream() {
                 parts.headers.remove(TRANSFER_ENCODING);
             }

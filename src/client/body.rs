@@ -1,12 +1,14 @@
 use std::{
     pin::Pin,
     task::{Context, Poll, ready},
+    time::Duration,
 };
 
 use bytes::Bytes;
 use http_body::{Body as HttpBody, SizeHint};
 use http_body_util::{BodyExt, Either, Full, combinators::BoxBody};
 use pin_project_lite::pin_project;
+use wreq_proto::rt::Sleep;
 
 use crate::error::{BoxError, Error};
 
@@ -136,24 +138,43 @@ impl Default for Body {
 /// A request extension for a body that may turn out to have no frames at all, such as that
 /// of an HTTP/2 GET whose HEADERS didn't end its stream. An HTTP/1 connection frames a GET
 /// or HEAD body only when the request's `Transfer-Encoding` says how, so on one the body's
-/// first frame is read before the request goes, and a body without any goes as none, the
-/// request without its `Transfer-Encoding`. Any other connection sends the request at once.
+/// first frame is read before the request goes, for up to [`READ_AHEAD_WAIT`], and a body
+/// without any goes as none, the request without its `Transfer-Encoding`; one still to come
+/// then goes as that says, its origin free to answer before it. Any other connection sends
+/// the request at once.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct ReadAheadOnHttp1;
 
+/// How long an HTTP/1 connection waits for a [`ReadAheadOnHttp1`] body's first frame.
+pub(crate) const READ_AHEAD_WAIT: Duration = Duration::from_secs(1);
+
 /// A request body whose first frame can be read ahead (see [`ReadAheadOnHttp1`]).
 pub(crate) trait ReadAhead: Sized {
-    /// This body with its first frame read ahead, or an ended one when it has none.
-    fn read_ahead(self) -> futures_util::future::BoxFuture<'static, Self>;
+    /// This body with its first frame read ahead, or an ended one when it has none, or as it
+    /// is when none came before `wait` ended.
+    fn read_ahead(
+        self,
+        wait: Pin<Box<dyn Sleep>>,
+    ) -> futures_util::future::BoxFuture<'static, Self>;
 }
 
 impl ReadAhead for Body {
-    fn read_ahead(mut self) -> futures_util::future::BoxFuture<'static, Body> {
+    fn read_ahead(
+        mut self,
+        wait: Pin<Box<dyn Sleep>>,
+    ) -> futures_util::future::BoxFuture<'static, Body> {
         use futures_util::StreamExt;
         use http_body_util::{BodyStream, StreamBody};
 
         Box::pin(async move {
-            match self.frame().await {
+            let first = match futures_util::future::select(self.frame(), wait).await {
+                futures_util::future::Either::Left((first, _)) => Some(first),
+                futures_util::future::Either::Right(_) => None,
+            };
+            let Some(first) = first else {
+                return self;
+            };
+            match first {
                 Some(first) => Body::from(
                     StreamBody::new(
                         futures_util::stream::once(std::future::ready(first))
