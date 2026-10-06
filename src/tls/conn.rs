@@ -1350,9 +1350,13 @@ impl Framing {
 /// The largest fragment a TLS record carries (RFC 8446 §5.1).
 const MAX_FRAGMENT: usize = 1 << 14;
 
-/// The bytes of a server's first record up to the end of its ServerHello's random: the
-/// record header, the handshake header, the version and the random.
-const SERVER_HELLO_RANDOM_END: usize = 5 + 4 + 2 + 32;
+/// The bytes of a ServerHello up to the end of its random: the handshake header, the
+/// version and the random.
+const SERVER_HELLO_RANDOM_END: usize = 4 + 2 + 32;
+
+/// How many of the server's first bytes may show its ServerHello's random: as many as
+/// records carrying a byte of it each take.
+const SERVER_HEAD_LIMIT: usize = SERVER_HELLO_RANDOM_END * (5 + 1);
 
 impl<IO> HelloRecords<IO> {
     fn new(io: IO, settings: &HandshakeSettings) -> Self {
@@ -1412,17 +1416,30 @@ impl<IO> HelloRecords<IO> {
         let Some(head) = &mut self.server_head else {
             return;
         };
-        let take = read.len().min(SERVER_HELLO_RANDOM_END - head.len());
+        let take = read.len().min(SERVER_HEAD_LIMIT - head.len());
         head.extend_from_slice(&read[..take]);
-        if head.len() < SERVER_HELLO_RANDOM_END {
+        // The ServerHello as far as its handshake records carry it, which a server may
+        // fragment across them.
+        let mut hello = Vec::new();
+        let mut records = head.as_slice();
+        let mut other = false;
+        while hello.len() < SERVER_HELLO_RANDOM_END
+            && let Some((header, rest)) = records.split_first_chunk::<5>()
+        {
+            if header[0] != 0x16 {
+                other = true;
+                break;
+            }
+            let length = usize::from(u16::from_be_bytes([header[3], header[4]]));
+            hello.extend_from_slice(&rest[..length.min(rest.len())]);
+            records = rest.get(length..).unwrap_or_default();
+        }
+        if hello.len() < SERVER_HELLO_RANDOM_END && !other && head.len() < SERVER_HEAD_LIMIT {
             return;
         }
-        // A handshake record carrying a whole ServerHello random.
-        let retry = head[0] == 0x16
-            && usize::from(u16::from_be_bytes([head[3], head[4]])) >= SERVER_HELLO_RANDOM_END - 5
-            && head[5] == 2
-            && head[11..] == crate::tls::ServerFlight::HRR_RANDOM;
-        self.relaying = retry;
+        self.relaying = hello.len() >= SERVER_HELLO_RANDOM_END
+            && hello[0] == 2
+            && hello[6..SERVER_HELLO_RANDOM_END] == crate::tls::ServerFlight::HRR_RANDOM;
         self.server_head = None;
     }
 
