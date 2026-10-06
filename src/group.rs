@@ -23,7 +23,7 @@ use std::{
     hash::{Hash, Hasher},
     sync::{
         Arc,
-        atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicU16, AtomicU64, AtomicUsize, Ordering},
     },
     task::{Context, Poll, Waker, ready},
 };
@@ -212,7 +212,7 @@ pub struct ConnectionScope(Arc<(u64, watch::Sender<bool>, Arc<Connections>)>);
 /// The HTTP/2 connections open in a scope, each by an id, able to send frames of the
 /// caller's choosing, the first connection opened in it, once one is: the [`Control`] of
 /// an HTTP/2 one, `None` for an HTTP/1 one, how they end (a [`ConnectionEnd`], 0 until
-/// told, else one past it) and the tasks waiting to be told, what the caller sent them
+/// told, else as `end_with` stores it) and the tasks waiting to be told, what the caller sent them
 /// before the first opened, which that one sends should it speak HTTP/2 (the frames, unless
 /// the caller dropped them, and the requests held, `true`, or released), the tasks waiting
 /// for room among those frames, the requests' resets, by request, the SETTINGS parameters
@@ -225,7 +225,7 @@ pub struct ConnectionScope(Arc<(u64, watch::Sender<bool>, Arc<Connections>)>);
 struct Connections {
     http2: Mutex<Vec<(u64, Control)>>,
     first: watch::Sender<Option<Option<Control>>>,
-    end: AtomicU8,
+    end: AtomicU16,
     end_tasks: Mutex<Vec<(u64, Waker)>>,
     close_tasks: Mutex<Vec<(u64, Waker)>>,
     pending: Mutex<PendingHttp2>,
@@ -457,15 +457,16 @@ impl OnQueued {
 /// HTTP/2 one sends no GOAWAY of its own: only those
 /// [`ConnectionScope::send_http2_go_away`] sends.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-#[repr(u8)]
 pub enum ConnectionEnd {
     /// With TLS's close_notify, then a FIN, once they close.
     #[default]
-    Graceful = 0,
+    Graceful,
     /// With a FIN alone, sending nothing more: no close_notify.
-    Fin = 1,
+    Fin,
     /// With a TCP reset, sending nothing more.
-    Reset = 2,
+    Reset,
+    /// With the fatal TLS alert of this description, then a FIN, sending nothing more.
+    Alert(u8),
 }
 
 /// How an origin ended its side of a connection (see
@@ -892,13 +893,19 @@ impl ConnectionScope {
         }
     }
 
-    /// Makes this scope's connections end as `end` says: past [`ConnectionEnd::Fin`] or
-    /// [`ConnectionEnd::Reset`] they send nothing more, and end so once they close, as they
+    /// Makes this scope's connections end as `end` says: past any but
+    /// [`ConnectionEnd::Graceful`] they send nothing more, and end so once they close, as they
     /// do once the scope is dropped. An HTTP/2 connection whose origin closed it first
     /// waits a moment for it before closing, else ends with a FIN alone; one closing
     /// otherwise before it ends gracefully.
     pub fn end_with(&self, end: ConnectionEnd) {
-        self.0.2.end.store(end as u8 + 1, Ordering::Release);
+        let end = match end {
+            ConnectionEnd::Graceful => 1,
+            ConnectionEnd::Fin => 2,
+            ConnectionEnd::Reset => 3,
+            ConnectionEnd::Alert(alert) => 0x100 | u16::from(alert),
+        };
+        self.0.2.end.store(end, Ordering::Release);
         for (_, task) in self.0.2.end_tasks.lock().drain(..) {
             task.wake();
         }
@@ -1104,6 +1111,7 @@ impl ScopeRef {
             0 => None,
             2 => Some(ConnectionEnd::Fin),
             3 => Some(ConnectionEnd::Reset),
+            alert @ 0x100.. => Some(ConnectionEnd::Alert(alert as u8)),
             _ => Some(ConnectionEnd::Graceful),
         }
     }

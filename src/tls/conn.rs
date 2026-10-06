@@ -1062,6 +1062,17 @@ pub(crate) fn received_alert(error: &btls::ssl::Error) -> Option<u8> {
 }
 
 impl<IO: AsyncRead + AsyncWrite + Unpin> TlsStream<IO> {
+    /// Sends the fatal TLS alert `alert`, past which the connection sends nothing.
+    pub fn poll_send_fatal_alert(
+        &mut self,
+        cx: &mut Context<'_>,
+        alert: u8,
+    ) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.stream)
+            .poll_send_fatal_alert(cx, alert)
+            .map_err(io::Error::other)
+    }
+
     /// Whether the peer has neither closed the connection nor sent data yet, reading
     /// only what is already there (a TLS 1.3 session ticket, say).
     #[cfg(feature = "tokio-rt")]

@@ -111,6 +111,15 @@ pub trait Connection {
     fn close_notify_received(&self) -> bool {
         false
     }
+
+    /// Sends the fatal TLS alert `alert` on a TLS connection, past which it sends nothing.
+    fn poll_send_fatal_alert(
+        self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+        _alert: u8,
+    ) -> Poll<io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
 }
 
 /// Indicates the negotiated ALPN protocol.
@@ -193,6 +202,14 @@ impl Connection for Conn {
     fn close_notify_received(&self) -> bool {
         self.stream.close_notify_received()
     }
+
+    fn poll_send_fatal_alert(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        alert: u8,
+    ) -> Poll<io::Result<()>> {
+        Pin::new(&mut **self.project().stream.get_mut()).poll_send_fatal_alert(cx, alert)
+    }
 }
 
 impl AsyncRead for Conn {
@@ -245,7 +262,7 @@ impl AsyncWrite for Conn {
 
 impl<T> Connection for TlsConn<T>
 where
-    T: Connection,
+    T: Connection + AsyncRead + AsyncWrite,
 {
     fn connected(&self) -> Connected {
         let connected = self.stream.get_ref().connected();
@@ -267,6 +284,17 @@ where
 
     fn close_notify_received(&self) -> bool {
         close_notify_received(self.stream.ssl())
+    }
+
+    fn poll_send_fatal_alert(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        alert: u8,
+    ) -> Poll<io::Result<()>> {
+        self.project()
+            .stream
+            .poll_send_fatal_alert(cx, alert)
+            .map_err(io::Error::other)
     }
 }
 

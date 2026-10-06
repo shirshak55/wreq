@@ -205,10 +205,12 @@ criterion = { version = "0.8.2", features = ["async_tokio"] }
 reqwest = { version = "0.13.3", default-features = false, features = ["rustls", "stream", "http2"] }
 cyper = { version = "0.9.0",  default-features = false, features = ["rustls", "stream"] }
 
-# The btls fork carrying the ClientHello controls this fork's TLS options use.
+# The btls fork carrying the ClientHello controls this fork's TLS options use, and the
+# fatal alerts its connections send.
 [patch.crates-io]
 btls = { git = "https://github.com/shirshak55/btls", rev = "d18c1619490a0d2ab07b9297c64127236e9e7ed7" }
 btls-sys = { git = "https://github.com/shirshak55/btls", rev = "d18c1619490a0d2ab07b9297c64127236e9e7ed7" }
+tokio-btls = { git = "https://github.com/shirshak55/btls", rev = "d18c1619490a0d2ab07b9297c64127236e9e7ed7" }
 # The wreq-proto and http2 forks carrying the HTTP/2 controls (`Control`, frame logs and
 # relays) this fork's connection scopes use.
 http2 = { git = "https://github.com/shirshak55/http2", branch = "wiremason" }

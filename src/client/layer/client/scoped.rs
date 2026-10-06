@@ -5,7 +5,7 @@ use std::{
     io::{self, IoSlice},
     pin::Pin,
     sync::atomic::{AtomicU64, Ordering},
-    task::{Context, Poll},
+    task::{Context, Poll, Waker},
     time::Duration,
 };
 
@@ -25,10 +25,11 @@ use crate::{
 /// [`ConnectionScope::end_with`](crate::ConnectionScope::end_with)).
 const SCOPE_END_WAIT: Duration = Duration::from_secs(2);
 
-/// A connection's transport. Once its scope ends with [`ConnectionEnd::Fin`] or
-/// [`ConnectionEnd::Reset`] every read and write of it fails, so the connection sends
-/// nothing more, and it closes so once dropped; once its scope is closed it reads nothing
-/// more. Dropped, it goes to the receiver [`ScopedIo::new`] returned, if that is still there.
+/// A connection's transport. Once its scope ends otherwise than [`ConnectionEnd::Graceful`]
+/// every read and write of it fails, so the connection sends nothing more, and it closes so
+/// once dropped, the alert of [`ConnectionEnd::Alert`] sent as far as its socket has room;
+/// once its scope is closed it reads nothing more. Dropped, it goes to the receiver
+/// [`ScopedIo::new`] returned, if that is still there.
 ///
 /// An HTTP/1 one is counted open in its scope from its connect on (see
 /// [`ConnectionScope::http1_origin_closed`](crate::ConnectionScope::http1_origin_closed)).
@@ -38,7 +39,7 @@ const SCOPE_END_WAIT: Duration = Duration::from_secs(2);
 /// An HTTP/2 one tells its scope how its origin closed it, and closes as its scope ends,
 /// waiting up to [`SCOPE_END_WAIT`] for that, as the origin's close ends the scope's
 /// client soon after; past it, after its origin's close, it closes with a FIN alone.
-pub(super) struct ScopedIo<T: Connection> {
+pub(super) struct ScopedIo<T: Connection + Unpin> {
     /// Its id among its scope's connections waiting for its end or close.
     id: u64,
     io: Option<T>,
@@ -175,27 +176,37 @@ impl<T: AsyncRead + Connection + Unpin> ScopedIo<T> {
     }
 }
 
-impl<T: Connection> Drop for ScopedIo<T> {
+impl<T: Connection + Unpin> Drop for ScopedIo<T> {
     fn drop(&mut self) {
         if let Some(scope) = &self.scope {
             scope.forget(self.id);
         }
-        let Some(io) = self.io.take() else {
+        let Some(mut io) = self.io.take() else {
             return;
         };
-        if self
-            .scope
-            .as_ref()
-            .is_some_and(|scope| scope.end() == ConnectionEnd::Reset)
-        {
-            let linger = io
-                .socket()
-                .map(|socket| socket.set_linger(Some(Duration::ZERO)));
-            match linger {
-                Some(Ok(())) => {}
-                Some(Err(_e)) => debug!("resetting a scoped connection failed: {}", _e),
-                None => debug!("a scoped connection over no TCP socket closes rather than resets"),
+        match self.scope.as_ref().map(ScopeRef::end) {
+            Some(ConnectionEnd::Reset) => {
+                let linger = io
+                    .socket()
+                    .map(|socket| socket.set_linger(Some(Duration::ZERO)));
+                match linger {
+                    Some(Ok(())) => {}
+                    Some(Err(_e)) => debug!("resetting a scoped connection failed: {}", _e),
+                    None => {
+                        debug!("a scoped connection over no TCP socket closes rather than resets")
+                    }
+                }
             }
+            // Its origin ended its side already; dropped, it can't wait for room to send it.
+            Some(ConnectionEnd::Alert(alert)) if !self.origin_ended => {
+                let mut cx = Context::from_waker(Waker::noop());
+                match Pin::new(&mut io).poll_send_fatal_alert(&mut cx, alert) {
+                    Poll::Ready(Ok(())) => {}
+                    Poll::Ready(Err(_e)) => debug!("alerting a scoped connection failed: {}", _e),
+                    Poll::Pending => debug!("a scoped connection had no room for its alert"),
+                }
+            }
+            _ => {}
         }
         let origin_to_end = !self.origin_ended
             && self.scope.as_ref().is_some_and(|scope| {

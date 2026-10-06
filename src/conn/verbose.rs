@@ -59,6 +59,14 @@ mod sealed {
         fn close_notify_received(&self) -> bool {
             self.inner.close_notify_received()
         }
+
+        fn poll_send_fatal_alert(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            alert: u8,
+        ) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.inner).poll_send_fatal_alert(cx, alert)
+        }
     }
 
     impl<T: AsyncRead + AsyncWrite + Unpin> AsyncRead for Wrapper<T> {
