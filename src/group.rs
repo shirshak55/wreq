@@ -220,7 +220,8 @@ pub struct ConnectionScope(Arc<(u64, watch::Sender<bool>, Arc<Connections>)>);
 /// end the HTTP/2 ones, and how many HTTP/1 ones are open, told once an origin closed the last,
 /// which, in a scope ending with its HTTP/1 origin, leaves it gone for good. Also how the
 /// origin of an HTTP/1 one ended it last, in such a scope, whether an HTTP/1 one's origin is
-/// to close it, and whether the HTTP/1 ones half-close with a FIN alone.
+/// to close it, whether the HTTP/1 ones half-close with a FIN alone, and whether the HTTP/2
+/// ones' streams end with them (see `ConnectionScope::end_streams_with_connections`).
 #[derive(Default)]
 struct Connections {
     http2: Mutex<Vec<(u64, Control)>>,
@@ -242,6 +243,7 @@ struct Connections {
     http1_origin_end: Mutex<Option<OriginEnd>>,
     http1_origin_closing: AtomicBool,
     http1_half_close_fin: AtomicBool,
+    streams_end: AtomicBool,
 }
 
 /// The frames a scope had its HTTP/2 connections send before its first opened, the memory
@@ -897,8 +899,12 @@ impl ConnectionScope {
     /// [`ConnectionEnd::Graceful`] they send nothing more, and end so once they close, as they
     /// do once the scope is dropped. An HTTP/2 connection whose origin closed it first
     /// waits a moment for it before closing, else ends with a FIN alone; one closing
-    /// otherwise before it ends gracefully.
+    /// otherwise before it ends gracefully. Past any but [`ConnectionEnd::Reset`], their
+    /// streams end with them (see [`Self::end_streams_with_connections`]).
     pub fn end_with(&self, end: ConnectionEnd) {
+        if end != ConnectionEnd::Reset {
+            self.end_streams_with_connections();
+        }
         let end = match end {
             ConnectionEnd::Graceful => 1,
             ConnectionEnd::Fin => 2,
@@ -908,6 +914,18 @@ impl ConnectionScope {
         self.0.2.end.store(end, Ordering::Release);
         for (_, task) in self.0.2.end_tasks.lock().drain(..) {
             task.wake();
+        }
+    }
+
+    /// Has this scope's HTTP/2 connections end the requests dropped from now on with them,
+    /// rather than each being reset, those requests' bodies still sending what their client
+    /// sent (see `ScopedIo`), as their client's connection ended: only the resets its client
+    /// sent go (see [`Self::send_http2_reset`]).
+    pub fn end_streams_with_connections(&self) {
+        let http2 = self.0.2.http2.lock();
+        self.0.2.streams_end.store(true, Ordering::Release);
+        for (_, control) in http2.iter() {
+            control.end_streams_with_connection();
         }
     }
 
@@ -1052,6 +1070,9 @@ impl ScopeRef {
             },
         );
         let mut http2 = self.connections.http2.lock();
+        if self.connections.streams_end.load(Ordering::Acquire) {
+            control.end_streams_with_connection();
+        }
         for send in std::mem::take(&mut *self.connections.pending.lock()).sends {
             send(&control);
         }
@@ -1105,7 +1126,7 @@ impl ScopeRef {
         self.ended().unwrap_or_default()
     }
 
-    /// Whether its HTTP/1 connections still send what they hold before they close (see
+    /// Whether its connections still send what they hold before they close (see
     /// `ScopedIo`): it ends with its client's FIN or alert, or was closed, not reset.
     pub(crate) fn drains(&self) -> bool {
         match self.end() {
@@ -1113,6 +1134,13 @@ impl ScopeRef {
             ConnectionEnd::Graceful => *self.closed.borrow(),
             ConnectionEnd::Reset => false,
         }
+    }
+
+    /// Whether its HTTP/2 connections' request bodies, canceled, still send what their client
+    /// sent (see `ScopedIo::sending_bodies`): their streams end with them (see
+    /// [`ConnectionScope::end_streams_with_connections`]), not reset.
+    pub(crate) fn finishes(&self) -> bool {
+        self.connections.streams_end.load(Ordering::Acquire) && self.end() != ConnectionEnd::Reset
     }
 
     /// How the scope's connections end, once told (see [`ConnectionScope::end_with`]).

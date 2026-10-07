@@ -682,8 +682,12 @@ where
                                 ScopedIo::new(io, scope.clone(), http1, is_h2, timer.clone());
                             let tx = if is_h2 {
                                {
-                                    let (mut tx, conn) =
-                                        h2_builder.handshake(io).await.map_err(Error::tx)?;
+                                    let (sending, finishes) = io.sending_bodies();
+                                    let (mut tx, conn) = h2_builder
+                                        .sending_bodies(sending, finishes)
+                                        .handshake(io)
+                                        .await
+                                        .map_err(Error::tx)?;
 
                                     trace!(
                                         "http2 handshake complete, spawning background dispatcher task"
@@ -1244,13 +1248,13 @@ const SCOPED_CLOSE_TIMEOUT: Duration = Duration::from_secs(1);
 /// origin of an exchange that said `Connection: close` ends it right after.
 const ORIGIN_END_WAIT: Duration = Duration::from_secs(2);
 
-/// Drives a connection until it ends or, for a scoped connection, its scope does, an HTTP/1
-/// one whose scope drains then still getting [`SCOPED_CLOSE_TIMEOUT`] to send what it holds (see
-/// [`ScopedIo`]). An HTTP/1 connection whose scope ends gracefully (see [`ConnectionEnd`])
-/// then closes its transport, back once the connection dropped it (`dropped`), as a client
-/// done with it does, within [`SCOPED_CLOSE_TIMEOUT`] by `timer`; an HTTP/2 one (`http2`)
-/// closes so itself. One back owing its origin its scope's alert sends it (see
-/// [`send_alert`]), an upgraded one once its transport is dropped. An HTTP/1 one done
+/// Drives a connection until it ends or, for a scoped connection, its scope does, one whose
+/// scope drains then still getting [`SCOPED_CLOSE_TIMEOUT`] to send what it holds, an HTTP/2
+/// one its request bodies, should they finish (see [`ScopedIo`]). An HTTP/1 connection whose scope
+/// ends gracefully (see [`ConnectionEnd`]) then closes its transport, back once the connection
+/// dropped it (`dropped`), as a client done with it does, within [`SCOPED_CLOSE_TIMEOUT`] by
+/// `timer`; an HTTP/2 one (`http2`) closes so itself. One back owing its origin its scope's alert
+/// sends it (see [`send_alert`]), an upgraded one once its transport is dropped. An HTTP/1 one done
 /// first, back still counted open in its scope (see [`ScopedIo`]), is counted closed as its
 /// origin then ends it, or, past [`ORIGIN_END_WAIT`], as closed by the client.
 async fn scoped<T: AsyncRead + AsyncWrite + Connection + Unpin>(
@@ -1269,7 +1273,7 @@ async fn scoped<T: AsyncRead + AsyncWrite + Connection + Unpin>(
         match future::select(conn.as_mut(), closed).await {
             Either::Left(_) => true,
             Either::Right(_) => {
-                if !http2 && scope.drains() {
+                if scope.drains() && (!http2 || scope.finishes()) {
                     future::select(conn, timer.sleep(SCOPED_CLOSE_TIMEOUT)).await;
                 }
                 false

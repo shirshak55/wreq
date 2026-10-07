@@ -16,7 +16,10 @@ use tokio::{
     io::{AsyncRead, AsyncWrite, ReadBuf},
     sync::oneshot,
 };
-use wreq_proto::rt::{Sleep, Timer as _};
+use wreq_proto::{
+    conn::http2::SendingBodies,
+    rt::{Sleep, Timer as _},
+};
 
 use super::SCOPED_CLOSE_TIMEOUT;
 use crate::{
@@ -31,8 +34,9 @@ const SCOPE_END_WAIT: Duration = Duration::from_secs(2);
 
 /// A connection's transport. Once its scope ends otherwise than [`ConnectionEnd::Graceful`]
 /// every read and write of it fails, so the connection sends nothing more, and it closes so
-/// once dropped; once its scope is closed it reads nothing more. An HTTP/1 one not reset still
-/// writes what it holds first (see [`ScopedIo::draining`]). Dropped, it goes to the
+/// once dropped; once its scope is closed it reads nothing more. One not reset still writes
+/// what it holds first, an HTTP/2 one the request bodies it still has to send (see
+/// [`ScopedIo::draining`]). Dropped, it goes to the
 /// receiver [`ScopedIo::new`] returned, if that is still there, with the alert of
 /// [`ConnectionEnd::Alert`] it owes its origin, which the receiver sends; without one, the
 /// alert goes as far as its socket has room.
@@ -70,6 +74,9 @@ pub(super) struct ScopedIo<T: Connection + Unpin> {
     /// Set while its HTTP/1 connection has a request body still to send (see
     /// [`Self::sending_body`]).
     sending_body: Arc<AtomicBool>,
+    /// The request bodies its HTTP/2 connection still has to send (see
+    /// [`Self::sending_bodies`]).
+    sending_bodies: Arc<SendingBodies>,
 }
 
 /// A dropped [`ScopedIo`]'s transport, still counted open in its scope if it is, and the
@@ -104,6 +111,7 @@ impl<T: Connection + Unpin> ScopedIo<T> {
             drain_turn: false,
             drained: false,
             sending_body: Arc::default(),
+            sending_bodies: Arc::default(),
         };
         (scoped, dropped_rx)
     }
@@ -112,6 +120,19 @@ impl<T: Connection + Unpin> ScopedIo<T> {
     /// draining, it holds more then, though it wrote nothing lately (see `poll_flush`).
     pub(super) fn sending_body(&self) -> Arc<AtomicBool> {
         Arc::clone(&self.sending_body)
+    }
+
+    /// The request bodies its HTTP/2 connection still has to send, and whether those
+    /// canceled or failing still send what their client sent ([`ScopeRef::finishes`]),
+    /// draining then (see [`Self::draining`]).
+    pub(super) fn sending_bodies(
+        &self,
+    ) -> (Arc<SendingBodies>, Arc<dyn Fn() -> bool + Send + Sync>) {
+        let scope = self.scope.clone();
+        (
+            Arc::clone(&self.sending_bodies),
+            Arc::new(move || scope.as_ref().is_some_and(ScopeRef::finishes)),
+        )
     }
 
     fn io(&mut self) -> io::Result<Pin<&mut T>> {
@@ -129,11 +150,21 @@ impl<T: Connection + Unpin> ScopedIo<T> {
     }
 
     /// Whether it still writes what it holds, reading nothing until it holds nothing more (see
-    /// `poll_flush`): an HTTP/1 one does once its scope drains ([`ScopeRef::drains`]), up to
+    /// `poll_flush`): one does once its scope drains ([`ScopeRef::drains`]), up to
     /// [`SCOPED_CLOSE_TIMEOUT`], so that its origin gets what the client sent before it ended,
-    /// as it would directly.
+    /// as it would directly; an HTTP/2 one only while it has request bodies to send then,
+    /// which still send what their client sent, reading on for the WINDOW_UPDATEs they wait
+    /// for.
     fn draining(&mut self, cx: &mut Context<'_>) -> bool {
-        if self.drained || self.http2 || !self.scope.as_ref().is_some_and(ScopeRef::drains) {
+        if self.drained || !self.scope.as_ref().is_some_and(ScopeRef::drains) {
+            return false;
+        }
+        if self.http2
+            && self.drain.is_none()
+            && !(self.scope.as_ref().is_some_and(ScopeRef::finishes)
+                && self.sending_bodies.poll_any(cx))
+        {
+            self.drained = true;
             return false;
         }
         let timer = &self.timer;
@@ -143,12 +174,13 @@ impl<T: Connection + Unpin> ScopedIo<T> {
         drain.as_mut().poll(cx).is_pending()
     }
 
-    /// Its transport to write to (see [`Self::io`] and [`Self::draining`]), none once drained.
+    /// Its transport to write to (see [`Self::io`] and [`Self::draining`]), none once an
+    /// HTTP/1 one drained: an HTTP/2 one closes itself then, reading nothing more.
     fn writer(&mut self, cx: &mut Context<'_>) -> io::Result<Pin<&mut T>> {
         if self.draining(cx) {
             return Ok(Pin::new(self.io.as_mut().expect("taken only once dropped")));
         }
-        if self.drained {
+        if self.drained && !self.http2 {
             return Err(io::Error::new(
                 io::ErrorKind::ConnectionAborted,
                 "the connection's scope ended it",
@@ -291,7 +323,15 @@ impl<T: AsyncRead + Connection + Unpin> AsyncRead for ScopedIo<T> {
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
         if self.draining(cx) {
-            return Poll::Pending;
+            if !self.http2 {
+                return Poll::Pending;
+            }
+            let filled = buf.filled().len();
+            let read =
+                Pin::new(self.io.as_mut().expect("taken only once dropped")).poll_read(cx, buf);
+            let empty = buf.filled().len() == filled && buf.remaining() > 0;
+            self.note_read(&read, empty);
+            return read;
         }
         // Its scope closed: it reads nothing more, its connection ending as at the origin's
         // close, without a frame more.
@@ -342,13 +382,25 @@ impl<T: AsyncWrite + AsyncRead + Connection + Unpin> AsyncWrite for ScopedIo<T> 
         // nothing more, unless its connection has a request body still to send (paced, say):
         // the body's end, or the drain's bound, ends it then.
         if self.draining(cx) {
-            if std::mem::take(&mut self.wrote) || self.sending_body.load(Ordering::Acquire) {
+            let sending = self.sending_bodies.poll_any(cx);
+            if std::mem::take(&mut self.wrote)
+                || self.sending_body.load(Ordering::Acquire)
+                || sending
+            {
                 self.drain_turn = false;
+                // An HTTP/2 one is polled again only as it has more to write: its request
+                // bodies sent, it gets a turn.
+                if self.http2 && !sending {
+                    cx.waker().wake_by_ref();
+                }
             } else if !std::mem::replace(&mut self.drain_turn, true) {
                 cx.waker().wake_by_ref();
                 return Poll::Pending;
             } else {
                 self.drained = true;
+                if self.http2 {
+                    cx.waker().wake_by_ref();
+                }
             }
         }
         let flushed = self.writer(cx)?.poll_flush(cx);
