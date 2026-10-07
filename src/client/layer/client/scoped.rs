@@ -134,6 +134,13 @@ impl EndedFirst {
 /// alert it owes its origin, if any, and whether it was shut down.
 pub(super) type Dropped<T> = (T, Option<Http1Open>, Option<u8>, bool);
 
+/// A new id among a scope's connections, and those being set up, waiting for its end or
+/// close (see [`ScopeRef::wake_on_end`]).
+pub(super) fn next_id() -> u64 {
+    static NEXT_ID: AtomicU64 = AtomicU64::new(0);
+    NEXT_ID.fetch_add(1, Ordering::Relaxed)
+}
+
 impl<T: Connection + Unpin> ScopedIo<T> {
     /// Wraps `io`, the transport of a connection confined to `scope`, if any, speaking
     /// HTTP/2 when `http2`, `timer` bounding its wait for the scope's end. `http1` counted it
@@ -145,10 +152,9 @@ impl<T: Connection + Unpin> ScopedIo<T> {
         http2: bool,
         timer: Timer,
     ) -> (Self, oneshot::Receiver<Dropped<T>>) {
-        static NEXT_ID: AtomicU64 = AtomicU64::new(0);
         let (dropped, dropped_rx) = oneshot::channel();
         let scoped = ScopedIo {
-            id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
+            id: next_id(),
             io: Some(io),
             scope,
             http1: http1.filter(|_| !http2),

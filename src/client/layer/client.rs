@@ -652,8 +652,16 @@ where
                 .as_ref()
                 .filter(|_| !is_ver_h2)
                 .map(ScopeRef::http1_opened);
+            let abandoned = Box::pin(abandoned(scope.clone(), timer.clone()));
             Either::Left(
-                Oneshot::new(connector, descriptor)
+                future::select(Oneshot::new(connector, descriptor), abandoned)
+                    .map(|raced| match raced {
+                        Either::Left((connected, _)) => connected.map_err(Into::into),
+                        Either::Right(_) => Err(BoxError::from(std::io::Error::new(
+                            std::io::ErrorKind::ConnectionAborted,
+                            "the connection's scope ended before it was set up",
+                        ))),
+                    })
                     .map_err(|src| Error::new(ErrorKind::Connect, src))
                     .and_then(move |io| {
                         let connected = io.connected();
@@ -1277,6 +1285,34 @@ fn drain_bound(timer: &Timer, deadline: Option<Instant>) -> Pin<Box<dyn Sleep>> 
         Some(deadline) => timer.sleep_until(deadline),
         None => timer.sleep(SCOPED_CLOSE_TIMEOUT),
     }
+}
+
+/// Resolves once a connection still being set up for `scope`, if any, is to be given up, as
+/// an open one would end: at once as its scope ends with a reset, else once its scope is
+/// closed, by the bound of its end (see [`drain_bound`]), its connect (its TLS handshake,
+/// say) dropped then, whether a request still waits for it or the pool's checkout won.
+async fn abandoned(scope: Option<ScopeRef>, timer: Timer) {
+    struct Waiting<'a>(&'a ScopeRef, u64);
+    impl Drop for Waiting<'_> {
+        fn drop(&mut self) {
+            self.0.forget(self.1);
+        }
+    }
+    let Some(scope) = scope else {
+        return future::pending().await;
+    };
+    let waiting = Waiting(&scope, scoped::next_id());
+    let reset = future::poll_fn(|cx| match scope.wake_on_end(waiting.1, cx.waker()) {
+        Some(ConnectionEnd::Reset) => Poll::Ready(()),
+        _ => Poll::Pending,
+    });
+    let closed = async {
+        scope.clone().closed().await;
+        if scope.drains() {
+            drain_bound(&timer, scope.drain_deadline()).await;
+        }
+    };
+    future::select(std::pin::pin!(reset), std::pin::pin!(closed)).await;
 }
 
 /// How long an HTTP/1 connection done before its origin ended it reads for that end: the
