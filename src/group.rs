@@ -1105,6 +1105,16 @@ impl ScopeRef {
         self.ended().unwrap_or_default()
     }
 
+    /// Whether its HTTP/1 connections still send what they hold before they close (see
+    /// `ScopedIo`): it ends with its client's FIN or alert, or was closed, not reset.
+    pub(crate) fn drains(&self) -> bool {
+        match self.end() {
+            ConnectionEnd::Alert(_) | ConnectionEnd::Fin => true,
+            ConnectionEnd::Graceful => *self.closed.borrow(),
+            ConnectionEnd::Reset => false,
+        }
+    }
+
     /// How the scope's connections end, once told (see [`ConnectionScope::end_with`]).
     pub(crate) fn ended(&self) -> Option<ConnectionEnd> {
         match self.connections.end.load(Ordering::Acquire) {

@@ -15,6 +15,7 @@ use tokio::{
 };
 use wreq_proto::rt::{Sleep, Timer as _};
 
+use super::SCOPED_CLOSE_TIMEOUT;
 use crate::{
     conn::Connection,
     group::{ConnectionEnd, Http1Open, OriginEnd, ScopeRef},
@@ -27,7 +28,8 @@ const SCOPE_END_WAIT: Duration = Duration::from_secs(2);
 
 /// A connection's transport. Once its scope ends otherwise than [`ConnectionEnd::Graceful`]
 /// every read and write of it fails, so the connection sends nothing more, and it closes so
-/// once dropped; once its scope is closed it reads nothing more. Dropped, it goes to the
+/// once dropped; once its scope is closed it reads nothing more. An HTTP/1 one not reset still
+/// writes what it holds first (see [`ScopedIo::draining`]). Dropped, it goes to the
 /// receiver [`ScopedIo::new`] returned, if that is still there, with the alert of
 /// [`ConnectionEnd::Alert`] it owes its origin, which the receiver sends; without one, the
 /// alert goes as far as its socket has room.
@@ -54,6 +56,14 @@ pub(super) struct ScopedIo<T: Connection + Unpin> {
     timer: Timer,
     /// Bounds its wait for its scope's end, once it started.
     scope_end_wait: Option<Pin<Box<dyn Sleep>>>,
+    /// Bounds its writes past its scope's end or close, once they started.
+    drain: Option<Pin<Box<dyn Sleep>>>,
+    /// Whether it was written to since it was last flushed.
+    wrote: bool,
+    /// Whether, draining, a flush waited a turn for it to be written to.
+    drain_turn: bool,
+    /// Whether, draining, it was found to hold nothing more.
+    drained: bool,
 }
 
 /// A dropped [`ScopedIo`]'s transport, still counted open in its scope if it is, and the
@@ -83,6 +93,10 @@ impl<T: Connection + Unpin> ScopedIo<T> {
             origin_ended: false,
             timer,
             scope_end_wait: None,
+            drain: None,
+            wrote: false,
+            drain_turn: false,
+            drained: false,
         };
         (scoped, dropped_rx)
     }
@@ -99,6 +113,35 @@ impl<T: Connection + Unpin> ScopedIo<T> {
             ));
         }
         Ok(Pin::new(self.io.as_mut().expect("taken only once dropped")))
+    }
+
+    /// Whether it still writes what it holds, reading nothing until it holds nothing more (see
+    /// `poll_flush`): an HTTP/1 one does once its scope drains ([`ScopeRef::drains`]), up to
+    /// [`SCOPED_CLOSE_TIMEOUT`], so that its origin gets what the client sent before it ended,
+    /// as it would directly.
+    fn draining(&mut self, cx: &mut Context<'_>) -> bool {
+        if self.drained || self.http2 || !self.scope.as_ref().is_some_and(ScopeRef::drains) {
+            return false;
+        }
+        let timer = &self.timer;
+        let drain = self
+            .drain
+            .get_or_insert_with(|| timer.sleep(SCOPED_CLOSE_TIMEOUT));
+        drain.as_mut().poll(cx).is_pending()
+    }
+
+    /// Its transport to write to (see [`Self::io`] and [`Self::draining`]), none once drained.
+    fn writer(&mut self, cx: &mut Context<'_>) -> io::Result<Pin<&mut T>> {
+        if self.draining(cx) {
+            return Ok(Pin::new(self.io.as_mut().expect("taken only once dropped")));
+        }
+        if self.drained {
+            return Err(io::Error::new(
+                io::ErrorKind::ConnectionAborted,
+                "the connection's scope ended it",
+            ));
+        }
+        self.io()
     }
 
     /// Notes a read (`read`, which filled nothing when `empty`) ending the origin's side, and
@@ -234,6 +277,9 @@ impl<T: AsyncRead + Connection + Unpin> AsyncRead for ScopedIo<T> {
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
+        if self.draining(cx) {
+            return Poll::Pending;
+        }
         // Its scope closed: it reads nothing more, its connection ending as at the origin's
         // close, without a frame more.
         if self
@@ -257,7 +303,8 @@ impl<T: AsyncWrite + AsyncRead + Connection + Unpin> AsyncWrite for ScopedIo<T> 
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
-        let written = self.io()?.poll_write(cx, buf);
+        self.wrote = true;
+        let written = self.writer(cx)?.poll_write(cx, buf);
         self.note_write(&written);
         written
     }
@@ -267,7 +314,8 @@ impl<T: AsyncWrite + AsyncRead + Connection + Unpin> AsyncWrite for ScopedIo<T> 
         cx: &mut Context<'_>,
         bufs: &[IoSlice<'_>],
     ) -> Poll<io::Result<usize>> {
-        let written = self.io()?.poll_write_vectored(cx, bufs);
+        self.wrote = true;
+        let written = self.writer(cx)?.poll_write_vectored(cx, bufs);
         self.note_write(&written);
         written
     }
@@ -277,12 +325,25 @@ impl<T: AsyncWrite + AsyncRead + Connection + Unpin> AsyncWrite for ScopedIo<T> 
     }
 
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        let flushed = self.io()?.poll_flush(cx);
+        // Draining, one not written to since it was last flushed, even given a turn, holds
+        // nothing more.
+        if self.draining(cx) {
+            if std::mem::take(&mut self.wrote) {
+                self.drain_turn = false;
+            } else if !std::mem::replace(&mut self.drain_turn, true) {
+                cx.waker().wake_by_ref();
+                return Poll::Pending;
+            } else {
+                self.drained = true;
+            }
+        }
+        let flushed = self.writer(cx)?.poll_flush(cx);
         self.note_write(&flushed);
         flushed
     }
 
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        self.drained = true;
         if let (true, Some(scope)) = (self.http2, self.scope.clone()) {
             let ended = std::task::ready!(self.poll_scope_end(cx, &scope));
             if !ended && self.origin_ended {
