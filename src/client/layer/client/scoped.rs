@@ -4,7 +4,10 @@
 use std::{
     io::{self, IoSlice},
     pin::Pin,
-    sync::atomic::{AtomicU64, Ordering},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicU64, Ordering},
+    },
     task::{Context, Poll, Waker},
     time::Duration,
 };
@@ -64,6 +67,9 @@ pub(super) struct ScopedIo<T: Connection + Unpin> {
     drain_turn: bool,
     /// Whether, draining, it was found to hold nothing more.
     drained: bool,
+    /// Set while its HTTP/1 connection has a request body still to send (see
+    /// [`Self::sending_body`]).
+    sending_body: Arc<AtomicBool>,
 }
 
 /// A dropped [`ScopedIo`]'s transport, still counted open in its scope if it is, and the
@@ -97,8 +103,15 @@ impl<T: Connection + Unpin> ScopedIo<T> {
             wrote: false,
             drain_turn: false,
             drained: false,
+            sending_body: Arc::default(),
         };
         (scoped, dropped_rx)
+    }
+
+    /// The flag its HTTP/1 connection keeps set while it has a request body still to send:
+    /// draining, it holds more then, though it wrote nothing lately (see `poll_flush`).
+    pub(super) fn sending_body(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.sending_body)
     }
 
     fn io(&mut self) -> io::Result<Pin<&mut T>> {
@@ -326,9 +339,10 @@ impl<T: AsyncWrite + AsyncRead + Connection + Unpin> AsyncWrite for ScopedIo<T> 
 
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         // Draining, one not written to since it was last flushed, even given a turn, holds
-        // nothing more.
+        // nothing more, unless its connection has a request body still to send (paced, say):
+        // the body's end, or the drain's bound, ends it then.
         if self.draining(cx) {
-            if std::mem::take(&mut self.wrote) {
+            if std::mem::take(&mut self.wrote) || self.sending_body.load(Ordering::Acquire) {
                 self.drain_turn = false;
             } else if !std::mem::replace(&mut self.drain_turn, true) {
                 cx.waker().wake_by_ref();

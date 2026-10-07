@@ -710,8 +710,12 @@ where
                                     // Perform the HTTP/1.1 handshake on the provided I/O stream. More actions
                                     // Uses the h1_builder to establish a connection, returning a sender (tx) for requests
                                     // and a connection task (conn) that manages the connection lifecycle.
-                                    let (mut tx, conn) =
-                                        h1_builder.handshake(io).await.map_err(Error::tx)?;
+                                    let sending_body = io.sending_body();
+                                    let (mut tx, conn) = h1_builder
+                                        .sending_body(sending_body)
+                                        .handshake(io)
+                                        .await
+                                        .map_err(Error::tx)?;
 
                                     // Log that the HTTP/1.1 handshake has completed successfully.
                                     // This indicates the connection is established and ready for request processing.
