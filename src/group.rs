@@ -949,6 +949,11 @@ impl ConnectionScope {
             task.wake();
         }
     }
+
+    /// Whether this scope was closed (see [`Self::close`]).
+    pub fn is_closed(&self) -> bool {
+        *self.0.1.borrow()
+    }
 }
 
 impl Default for ConnectionScope {

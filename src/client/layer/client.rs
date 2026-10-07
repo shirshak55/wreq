@@ -1361,23 +1361,23 @@ async fn close<T: AsyncRead + AsyncWrite + Connection + Unpin>(
 }
 
 /// Sends `alert`, the fatal alert a scoped connection over `io` owes its origin, as its
-/// origin reads what was sent before it, within [`SCOPED_CLOSE_TIMEOUT`] by `timer`. It first
-/// reads what the origin sent that is already there, dropping it: left unread, a session
-/// ticket say, it would have the close that follows answered with a reset, which may cost the
-/// origin the alert.
+/// origin reads what was sent before it, then its FIN, then reads what its origin still sends,
+/// dropping it, until the origin closes too, within [`SCOPED_CLOSE_TIMEOUT`] by `timer`, as
+/// [`close`] does: dropped at once, it would answer what the origin still sends, the session
+/// tickets and SETTINGS of a connection it just opened say, with a reset, which may cost the
+/// origin the alert, or the request sent before it.
 async fn send_alert<T: AsyncRead + Connection + Unpin>(mut io: T, alert: u8, timer: &Timer) {
-    let mut unread = [0; 4096];
-    future::poll_fn(|cx| {
-        loop {
-            let mut buf = tokio::io::ReadBuf::new(&mut unread);
-            match std::pin::Pin::new(&mut io).poll_read(cx, &mut buf) {
-                Poll::Ready(Ok(())) if !buf.filled().is_empty() => {}
-                _ => return Poll::Ready(()),
-            }
-        }
-    })
-    .await;
-    let sent = future::poll_fn(|cx| std::pin::Pin::new(&mut io).poll_send_fatal_alert(cx, alert));
+    use tokio::io::AsyncReadExt;
+
+    let sent = async {
+        future::poll_fn(|cx| std::pin::Pin::new(&mut io).poll_send_fatal_alert(cx, alert)).await?;
+        io.socket()
+            .ok_or(std::io::ErrorKind::Unsupported)?
+            .shutdown(std::net::Shutdown::Write)?;
+        let mut unread = [0; 4096];
+        while io.read(&mut unread).await? != 0 {}
+        std::io::Result::Ok(())
+    };
     match future::select(std::pin::pin!(sent), timer.sleep(SCOPED_CLOSE_TIMEOUT)).await {
         Either::Left((Ok(()), _)) => {}
         Either::Left((Err(_e), _)) => debug!("alerting a scoped connection failed: {}", _e),
