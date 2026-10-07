@@ -657,10 +657,10 @@ where
                 future::select(Oneshot::new(connector, descriptor), abandoned)
                     .map(|raced| match raced {
                         Either::Left((connected, _)) => connected.map_err(Into::into),
-                        Either::Right(_) => Err(BoxError::from(std::io::Error::new(
+                        Either::Right(_) => Err(Box::new(ScopeEnded(Box::new(std::io::Error::new(
                             std::io::ErrorKind::ConnectionAborted,
                             "the connection's scope ended before it was set up",
-                        ))),
+                        )))) as BoxError),
                     })
                     .map_err(|src| Error::new(ErrorKind::Connect, src))
                     .and_then(move |io| {
