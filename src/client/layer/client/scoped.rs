@@ -27,9 +27,10 @@ const SCOPE_END_WAIT: Duration = Duration::from_secs(2);
 
 /// A connection's transport. Once its scope ends otherwise than [`ConnectionEnd::Graceful`]
 /// every read and write of it fails, so the connection sends nothing more, and it closes so
-/// once dropped, the alert of [`ConnectionEnd::Alert`] sent as far as its socket has room;
-/// once its scope is closed it reads nothing more. Dropped, it goes to the receiver
-/// [`ScopedIo::new`] returned, if that is still there.
+/// once dropped; once its scope is closed it reads nothing more. Dropped, it goes to the
+/// receiver [`ScopedIo::new`] returned, if that is still there, with the alert of
+/// [`ConnectionEnd::Alert`] it owes its origin, which the receiver sends; without one, the
+/// alert goes as far as its socket has room.
 ///
 /// An HTTP/1 one is counted open in its scope from its connect on (see
 /// [`ConnectionScope::http1_origin_closed`](crate::ConnectionScope::http1_origin_closed)).
@@ -45,7 +46,7 @@ pub(super) struct ScopedIo<T: Connection + Unpin> {
     io: Option<T>,
     scope: Option<ScopeRef>,
     http1: Option<Http1Open>,
-    dropped: Option<oneshot::Sender<(T, Option<Http1Open>)>>,
+    dropped: Option<oneshot::Sender<Dropped<T>>>,
     http2: bool,
     /// Whether its origin ended its side: a read ended, or failed, or a write failed with
     /// its reset.
@@ -54,6 +55,10 @@ pub(super) struct ScopedIo<T: Connection + Unpin> {
     /// Bounds its wait for its scope's end, once it started.
     scope_end_wait: Option<Pin<Box<dyn Sleep>>>,
 }
+
+/// A dropped [`ScopedIo`]'s transport, still counted open in its scope if it is, and the
+/// fatal alert it owes its origin, if any.
+pub(super) type Dropped<T> = (T, Option<Http1Open>, Option<u8>);
 
 impl<T: Connection + Unpin> ScopedIo<T> {
     /// Wraps `io`, the transport of a connection confined to `scope`, if any, speaking
@@ -65,7 +70,7 @@ impl<T: Connection + Unpin> ScopedIo<T> {
         http1: Option<Http1Open>,
         http2: bool,
         timer: Timer,
-    ) -> (Self, oneshot::Receiver<(T, Option<Http1Open>)>) {
+    ) -> (Self, oneshot::Receiver<Dropped<T>>) {
         static NEXT_ID: AtomicU64 = AtomicU64::new(0);
         let (dropped, dropped_rx) = oneshot::channel();
         let scoped = ScopedIo {
@@ -181,10 +186,10 @@ impl<T: Connection + Unpin> Drop for ScopedIo<T> {
         if let Some(scope) = &self.scope {
             scope.forget(self.id);
         }
-        let Some(mut io) = self.io.take() else {
+        let Some(io) = self.io.take() else {
             return;
         };
-        match self.scope.as_ref().map(ScopeRef::end) {
+        let alert = match self.scope.as_ref().map(ScopeRef::end) {
             Some(ConnectionEnd::Reset) => {
                 let linger = io
                     .socket()
@@ -196,26 +201,29 @@ impl<T: Connection + Unpin> Drop for ScopedIo<T> {
                         debug!("a scoped connection over no TCP socket closes rather than resets")
                     }
                 }
+                None
             }
-            // Its origin ended its side already; dropped, it can't wait for room to send it.
-            Some(ConnectionEnd::Alert(alert)) if !self.origin_ended => {
-                let mut cx = Context::from_waker(Waker::noop());
-                match Pin::new(&mut io).poll_send_fatal_alert(&mut cx, alert) {
-                    Poll::Ready(Ok(())) => {}
-                    Poll::Ready(Err(_e)) => debug!("alerting a scoped connection failed: {}", _e),
-                    Poll::Pending => debug!("a scoped connection had no room for its alert"),
-                }
-            }
-            _ => {}
-        }
+            // Unless its origin ended its side already.
+            Some(ConnectionEnd::Alert(alert)) if !self.origin_ended => Some(alert),
+            _ => None,
+        };
         let origin_to_end = !self.origin_ended
             && self.scope.as_ref().is_some_and(|scope| {
                 scope.ends_with_http1_origin() && scope.end() == ConnectionEnd::Graceful
             });
         let http1 = self.http1.take_if(|_| origin_to_end);
-        if let Some(dropped) = self.dropped.take() {
-            // Refused when nothing waits to close it, so it just closes.
-            let _ = dropped.send((io, http1));
+        let Some(dropped) = self.dropped.take() else {
+            return;
+        };
+        // Refused when nothing waits to close it, so it just closes, its alert sent as far as
+        // its socket has room: dropped, it can't wait for more.
+        if let Err((mut io, _, Some(alert))) = dropped.send((io, http1, alert)) {
+            let mut cx = Context::from_waker(Waker::noop());
+            match Pin::new(&mut io).poll_send_fatal_alert(&mut cx, alert) {
+                Poll::Ready(Ok(())) => {}
+                Poll::Ready(Err(_e)) => debug!("alerting a scoped connection failed: {}", _e),
+                Poll::Pending => debug!("a scoped connection had no room for its alert"),
+            }
         }
     }
 }

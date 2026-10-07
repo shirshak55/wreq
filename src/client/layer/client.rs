@@ -41,7 +41,7 @@ use {
 
 use self::{
     lazy::{Started as Lazy, lazy},
-    scoped::ScopedIo,
+    scoped::{Dropped, ScopedIo},
 };
 use crate::{
     client::{
@@ -1243,13 +1243,14 @@ const ORIGIN_END_WAIT: Duration = Duration::from_secs(2);
 /// Drives a connection until it ends or, for a scoped connection, its scope does. An HTTP/1
 /// connection whose scope ends gracefully (see [`ConnectionEnd`]) then closes its transport,
 /// back once the connection dropped it (`dropped`), as a client done with it does, within
-/// [`SCOPED_CLOSE_TIMEOUT`] by `timer`; an HTTP/2 one (`http2`) closes so itself. An HTTP/1
-/// one done first, back still counted open in its scope (see [`ScopedIo`]), is counted closed
-/// as its origin then ends it, or, past [`ORIGIN_END_WAIT`], as closed by the client.
+/// [`SCOPED_CLOSE_TIMEOUT`] by `timer`; an HTTP/2 one (`http2`) closes so itself. One back
+/// owing its origin its scope's alert sends it (see [`send_alert`]). An HTTP/1 one done
+/// first, back still counted open in its scope (see [`ScopedIo`]), is counted closed as its
+/// origin then ends it, or, past [`ORIGIN_END_WAIT`], as closed by the client.
 async fn scoped<T: AsyncRead + AsyncWrite + Connection + Unpin>(
     conn: impl Future<Output = ()>,
     scope: Option<ScopeRef>,
-    mut dropped: tokio::sync::oneshot::Receiver<(T, Option<Http1Open>)>,
+    mut dropped: tokio::sync::oneshot::Receiver<Dropped<T>>,
     http2: bool,
     timer: Timer,
 ) {
@@ -1262,16 +1263,23 @@ async fn scoped<T: AsyncRead + AsyncWrite + Connection + Unpin>(
         matches!(future::select(conn, closed).await, Either::Left(_))
     };
     if ended {
-        if let Ok((io, Some(open))) = dropped.try_recv() {
-            let end = std::pin::pin!(origin_end(io, open));
-            future::select(end, timer.sleep(ORIGIN_END_WAIT)).await;
+        match dropped.try_recv() {
+            Ok((io, _, Some(alert))) => send_alert(io, alert, &timer).await,
+            Ok((io, Some(open), None)) => {
+                let end = std::pin::pin!(origin_end(io, open));
+                future::select(end, timer.sleep(ORIGIN_END_WAIT)).await;
+            }
+            _ => {}
         }
         return;
     }
     if http2 || scope.end() != ConnectionEnd::Graceful {
+        if let Ok((io, _, Some(alert))) = dropped.try_recv() {
+            send_alert(io, alert, &timer).await;
+        }
         return;
     }
-    let Ok((mut io, _)) = dropped.await else {
+    let Ok((mut io, _, _)) = dropped.await else {
         return;
     };
     let shutdown = std::pin::pin!(io.shutdown());
@@ -1279,6 +1287,17 @@ async fn scoped<T: AsyncRead + AsyncWrite + Connection + Unpin>(
         Either::Left((Ok(()), _)) => {}
         Either::Left((Err(_e), _)) => debug!("closing a scoped connection failed: {}", _e),
         Either::Right(_) => debug!("closing a scoped connection timed out"),
+    }
+}
+
+/// Sends `alert`, the fatal alert a scoped connection over `io` owes its origin, as its
+/// origin reads what was sent before it, within [`SCOPED_CLOSE_TIMEOUT`] by `timer`.
+async fn send_alert<T: Connection + Unpin>(mut io: T, alert: u8, timer: &Timer) {
+    let sent = future::poll_fn(|cx| std::pin::Pin::new(&mut io).poll_send_fatal_alert(cx, alert));
+    match future::select(std::pin::pin!(sent), timer.sleep(SCOPED_CLOSE_TIMEOUT)).await {
+        Either::Left((Ok(()), _)) => {}
+        Either::Left((Err(_e), _)) => debug!("alerting a scoped connection failed: {}", _e),
+        Either::Right(_) => debug!("alerting a scoped connection timed out"),
     }
 }
 
