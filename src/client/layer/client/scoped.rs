@@ -12,6 +12,7 @@ use std::{
     time::Duration,
 };
 
+use futures_util::task::AtomicWaker;
 use tokio::{
     io::{AsyncRead, AsyncWrite, ReadBuf},
     sync::oneshot,
@@ -39,7 +40,9 @@ const SCOPE_END_WAIT: Duration = Duration::from_secs(2);
 /// [`ScopedIo::draining`]). Dropped, it goes to the
 /// receiver [`ScopedIo::new`] returned, if that is still there, with the alert of
 /// [`ConnectionEnd::Alert`] it owes its origin, which the receiver sends, and whether it was
-/// shut down; without one, the alert goes as far as its socket has room.
+/// shut down; without one, the alert goes as far as its socket has room. Aborted (see
+/// [`Abort`]), it waits for no read or write more, and resets once dropped should one have
+/// waited.
 ///
 /// An HTTP/1 one is counted open in its scope from its connect on (see
 /// [`ConnectionScope::http1_origin_closed`](crate::ConnectionScope::http1_origin_closed)).
@@ -79,6 +82,24 @@ pub(super) struct ScopedIo<T: Connection + Unpin> {
     /// The request bodies its HTTP/2 connection still has to send (see
     /// [`Self::sending_bodies`]).
     sending_bodies: Arc<SendingBodies>,
+    abort: Arc<Abort>,
+    /// Whether its abort failed a read or write that would have waited.
+    aborted: bool,
+}
+
+/// Has a [`ScopedIo`] fail each read and write that would wait from now on, waking the task
+/// waiting, for a connection still holding it past its scope's close by the bound of its end.
+#[derive(Default)]
+pub(super) struct Abort {
+    aborted: AtomicBool,
+    task: AtomicWaker,
+}
+
+impl Abort {
+    pub(super) fn abort(&self) {
+        self.aborted.store(true, Ordering::Release);
+        self.task.wake();
+    }
 }
 
 /// A dropped [`ScopedIo`]'s transport, still counted open in its scope if it is, the fatal
@@ -115,6 +136,8 @@ impl<T: Connection + Unpin> ScopedIo<T> {
             shut: false,
             sending_body: Arc::default(),
             sending_bodies: Arc::default(),
+            abort: Arc::default(),
+            aborted: false,
         };
         (scoped, dropped_rx)
     }
@@ -136,6 +159,32 @@ impl<T: Connection + Unpin> ScopedIo<T> {
             Arc::clone(&self.sending_bodies),
             Arc::new(move || scope.as_ref().is_some_and(ScopeRef::finishes)),
         )
+    }
+
+    /// The [`Abort`] of it.
+    pub(super) fn abort(&self) -> Arc<Abort> {
+        Arc::clone(&self.abort)
+    }
+
+    /// `polled`, unless it waits once it was aborted (see [`Abort`]): it then fails, its
+    /// task woken as it is aborted.
+    fn unless_aborted<R>(
+        &mut self,
+        cx: &mut Context<'_>,
+        polled: Poll<io::Result<R>>,
+    ) -> Poll<io::Result<R>> {
+        if polled.is_ready() || self.scope.is_none() {
+            return polled;
+        }
+        self.abort.task.register(cx.waker());
+        if self.abort.aborted.load(Ordering::Acquire) {
+            self.aborted = true;
+            return Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::ConnectionAborted,
+                "the connection outlived its scope's deadline",
+            )));
+        }
+        Poll::Pending
     }
 
     fn io(&mut self) -> io::Result<Pin<&mut T>> {
@@ -283,7 +332,8 @@ impl<T: Connection + Unpin> Drop for ScopedIo<T> {
             return;
         };
         let alert = match self.scope.as_ref().map(ScopeRef::end) {
-            Some(ConnectionEnd::Reset) => {
+            // Aborted waiting, it couldn't close in time.
+            Some(end) if end == ConnectionEnd::Reset || self.aborted => {
                 let linger = io
                     .socket()
                     .map(|socket| socket.set_linger(Some(Duration::ZERO)));
@@ -329,10 +379,14 @@ impl<T: AsyncRead + Connection + Unpin> AsyncRead for ScopedIo<T> {
     ) -> Poll<io::Result<()>> {
         // Its scope closed: it reads nothing more, its connection ending as at the origin's
         // close, without a frame more, unless it drains. Seen first, as its scope ended before.
-        let closed = self
-            .scope
-            .as_ref()
-            .is_some_and(|scope| scope.poll_closed(self.id, cx.waker()));
+        // An HTTP/1 one, idle or awaiting its response, is woken at its scope's end too, to
+        // drain (see `poll_flush`) at once rather than at its next read.
+        let closed = self.scope.as_ref().is_some_and(|scope| {
+            if !self.http2 {
+                scope.wake_on_end(self.id, cx.waker());
+            }
+            scope.poll_closed(self.id, cx.waker())
+        });
         if self.draining(cx) {
             if !self.http2 {
                 return Poll::Pending;
@@ -342,7 +396,7 @@ impl<T: AsyncRead + Connection + Unpin> AsyncRead for ScopedIo<T> {
                 Pin::new(self.io.as_mut().expect("taken only once dropped")).poll_read(cx, buf);
             let empty = buf.filled().len() == filled && buf.remaining() > 0;
             self.note_read(&read, empty);
-            return read;
+            return self.unless_aborted(cx, read);
         }
         if closed {
             return Poll::Ready(Ok(()));
@@ -351,7 +405,7 @@ impl<T: AsyncRead + Connection + Unpin> AsyncRead for ScopedIo<T> {
         let read = self.io()?.poll_read(cx, buf);
         let empty = buf.filled().len() == filled && buf.remaining() > 0;
         self.note_read(&read, empty);
-        read
+        self.unless_aborted(cx, read)
     }
 }
 
@@ -364,7 +418,7 @@ impl<T: AsyncWrite + AsyncRead + Connection + Unpin> AsyncWrite for ScopedIo<T> 
         self.wrote = true;
         let written = self.writer(cx)?.poll_write(cx, buf);
         self.note_write(&written);
-        written
+        self.unless_aborted(cx, written)
     }
 
     fn poll_write_vectored(
@@ -375,7 +429,7 @@ impl<T: AsyncWrite + AsyncRead + Connection + Unpin> AsyncWrite for ScopedIo<T> 
         self.wrote = true;
         let written = self.writer(cx)?.poll_write_vectored(cx, bufs);
         self.note_write(&written);
-        written
+        self.unless_aborted(cx, written)
     }
 
     fn is_write_vectored(&self) -> bool {
@@ -401,7 +455,7 @@ impl<T: AsyncWrite + AsyncRead + Connection + Unpin> AsyncWrite for ScopedIo<T> 
                 }
             } else if !std::mem::replace(&mut self.drain_turn, true) {
                 cx.waker().wake_by_ref();
-                return Poll::Pending;
+                return self.unless_aborted(cx, Poll::Pending);
             } else {
                 self.drained = true;
                 if self.http2 {
@@ -411,13 +465,14 @@ impl<T: AsyncWrite + AsyncRead + Connection + Unpin> AsyncWrite for ScopedIo<T> 
         }
         let flushed = self.writer(cx)?.poll_flush(cx);
         self.note_write(&flushed);
-        flushed
+        self.unless_aborted(cx, flushed)
     }
 
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         self.drained = true;
         if let (true, Some(scope)) = (self.http2, self.scope.clone()) {
-            let ended = std::task::ready!(self.poll_scope_end(cx, &scope));
+            let ended = self.poll_scope_end(cx, &scope).map(Ok);
+            let ended = std::task::ready!(self.unless_aborted(cx, ended))?;
             if !ended && self.origin_ended {
                 return Poll::Ready(Err(io::Error::new(
                     io::ErrorKind::ConnectionAborted,
@@ -437,7 +492,8 @@ impl<T: AsyncWrite + AsyncRead + Connection + Unpin> AsyncWrite for ScopedIo<T> 
                 return Poll::Ready(shut);
             }
         }
-        let shut = std::task::ready!(self.io()?.poll_shutdown(cx));
+        let shut = self.io()?.poll_shutdown(cx);
+        let shut = std::task::ready!(self.unless_aborted(cx, shut));
         self.shut = shut.is_ok();
         Poll::Ready(shut)
     }

@@ -42,7 +42,7 @@ use {
 
 use self::{
     lazy::{Started as Lazy, lazy},
-    scoped::{Dropped, ScopedIo},
+    scoped::{Abort, Dropped, ScopedIo},
 };
 use crate::{
     client::{
@@ -681,6 +681,7 @@ where
                             let in_scope = scope.is_some();
                             let (io, dropped) =
                                 ScopedIo::new(io, scope.clone(), http1, is_h2, timer.clone());
+                            let abort = io.abort();
                             let tx = if is_h2 {
                                {
                                     let (sending, finishes) = io.sending_bodies();
@@ -701,6 +702,7 @@ where
                                             .map(move |_| drop(registration)),
                                         scope,
                                         dropped,
+                                        abort,
                                         true,
                                         timer,
                                     ));
@@ -752,6 +754,7 @@ where
                                             .map(|_| ()),
                                         scope,
                                         dropped,
+                                        abort,
                                         false,
                                         timer,
                                     ));
@@ -1264,52 +1267,78 @@ const ORIGIN_END_WAIT: Duration = Duration::from_secs(2);
 /// [`crate::ConnectionScope::drain_until`]), to send what it holds, an HTTP/2
 /// one its request bodies, should they finish (see [`ScopedIo`]). An HTTP/1 connection whose scope
 /// ends gracefully (see [`ConnectionEnd`]) then closes its transport, back once the connection
-/// dropped it (`dropped`), as a client done with it does, within [`SCOPED_CLOSE_TIMEOUT`] by
-/// `timer`; an HTTP/2 one (`http2`) closes so itself. One whose scope ended with a FIN or
+/// dropped it (`dropped`), as a client done with it does; an HTTP/2 one (`http2`) closes so
+/// itself, aborted (`abort`) should it still hold its transport past its scope's close by that
+/// bound. One whose scope ended with a FIN or
 /// gracefully then reads until its origin closes too (see [`close`]). One back owing its origin
 /// its scope's alert sends it (see [`send_alert`]), an upgraded one once its transport is
-/// dropped. An HTTP/1 one done
+/// dropped. They do so by that bound too, an upgraded one, which outlived its scope's end,
+/// within [`SCOPED_CLOSE_TIMEOUT`] by `timer`. An HTTP/1 one done
 /// first, back still counted open in its scope (see [`ScopedIo`]), is counted closed as its
 /// origin then ends it, or, past [`ORIGIN_END_WAIT`], as closed by the client.
 async fn scoped<T: AsyncRead + AsyncWrite + Connection + Unpin>(
     conn: impl Future<Output = ()>,
     scope: Option<ScopeRef>,
     mut dropped: tokio::sync::oneshot::Receiver<Dropped<T>>,
+    abort: std::sync::Arc<Abort>,
     http2: bool,
     timer: Timer,
 ) {
     let Some(scope) = scope else {
         return conn.await;
     };
+    let mut bound = None;
     let ended = {
         let mut conn = std::pin::pin!(conn);
         let closed = std::pin::pin!(scope.clone().closed());
         match future::select(conn.as_mut(), closed).await {
             Either::Left(_) => true,
             Either::Right(_) => {
+                let bound = bound.insert(drain_bound(&timer, scope.drain_deadline()));
                 if scope.drains() && (!http2 || scope.finishes()) {
-                    future::select(conn, drain_bound(&timer, scope.drain_deadline())).await;
+                    future::select(conn, bound.as_mut()).await;
                 }
                 false
             }
         }
     };
-    // Upgraded, its transport lives on, as an HTTP/2 one's may a while: back once dropped.
+    // Upgraded, its transport lives on, as an HTTP/2 one's may a while: back once dropped,
+    // an HTTP/2 one's aborted past its scope's close by the bound of its end.
     let (upgraded, dropped) = match dropped.try_recv() {
-        Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {
-            (ended && !http2, dropped.await.ok())
+        Err(tokio::sync::oneshot::error::TryRecvError::Empty) if http2 => {
+            let aborts = std::pin::pin!(async {
+                scope.clone().closed().await;
+                let deadline = scope.drain_deadline();
+                bound
+                    .get_or_insert_with(|| drain_bound(&timer, deadline))
+                    .await;
+            });
+            let back = match future::select(&mut dropped, aborts).await {
+                Either::Left((back, _)) => back,
+                Either::Right(_) => {
+                    abort.abort();
+                    dropped.await
+                }
+            };
+            (false, back.ok())
         }
+        Err(tokio::sync::oneshot::error::TryRecvError::Empty) => (ended, dropped.await.ok()),
         dropped => (false, dropped.ok()),
     };
     let Some((io, open, alert, shut)) = dropped else {
         return;
     };
+    let bound = || match bound {
+        Some(bound) => bound,
+        None if upgraded => timer.sleep(SCOPED_CLOSE_TIMEOUT),
+        None => drain_bound(&timer, scope.drain_deadline()),
+    };
     match (alert, open) {
-        (Some(alert), _) => send_alert(io, alert, &timer).await,
+        (Some(alert), _) => send_alert(io, alert, bound()).await,
         // Its relay done, it closes as its client did, which half-closed with a FIN alone.
         (None, _) if upgraded => {
             if scope.half_closes_with_fin() {
-                close(io, shut, ConnectionEnd::Fin, &timer).await;
+                close(io, shut, ConnectionEnd::Fin, bound()).await;
             }
         }
         (None, Some(open)) if ended => {
@@ -1317,7 +1346,7 @@ async fn scoped<T: AsyncRead + AsyncWrite + Connection + Unpin>(
             future::select(end, timer.sleep(ORIGIN_END_WAIT)).await;
         }
         (None, _) if shut || !ended || scope.ended().is_some() => {
-            close(io, shut, scope.end(), &timer).await
+            close(io, shut, scope.end(), bound()).await
         }
         _ => {}
     }
@@ -1325,14 +1354,14 @@ async fn scoped<T: AsyncRead + AsyncWrite + Connection + Unpin>(
 
 /// Closes `io`, the transport of a scoped connection whose scope ended as `end` says, unless
 /// it was (`shut`), then reads what its origin still sends, dropping it, until the origin
-/// closes too, within [`SCOPED_CLOSE_TIMEOUT`] by `timer`, as a client half-closing its own
+/// closes too, within `bound`, as a client half-closing its own
 /// connection does: dropped at once, it would answer what the origin still sends, the
 /// response to a request it sent last say, with a reset. One ending otherwise just closes.
 async fn close<T: AsyncRead + AsyncWrite + Connection + Unpin>(
     mut io: T,
     shut: bool,
     end: ConnectionEnd,
-    timer: &Timer,
+    bound: Pin<Box<dyn Sleep>>,
 ) {
     use tokio::io::AsyncReadExt;
 
@@ -1353,7 +1382,7 @@ async fn close<T: AsyncRead + AsyncWrite + Connection + Unpin>(
         while io.read(&mut unread).await? != 0 {}
         std::io::Result::Ok(())
     };
-    match future::select(std::pin::pin!(closed), timer.sleep(SCOPED_CLOSE_TIMEOUT)).await {
+    match future::select(std::pin::pin!(closed), bound).await {
         Either::Left((Ok(()), _)) => {}
         Either::Left((Err(_e), _)) => debug!("closing a scoped connection failed: {}", _e),
         Either::Right(_) => debug!("closing a scoped connection timed out"),
@@ -1362,11 +1391,15 @@ async fn close<T: AsyncRead + AsyncWrite + Connection + Unpin>(
 
 /// Sends `alert`, the fatal alert a scoped connection over `io` owes its origin, as its
 /// origin reads what was sent before it, then its FIN, then reads what its origin still sends,
-/// dropping it, until the origin closes too, within [`SCOPED_CLOSE_TIMEOUT`] by `timer`, as
-/// [`close`] does: dropped at once, it would answer what the origin still sends, the session
-/// tickets and SETTINGS of a connection it just opened say, with a reset, which may cost the
-/// origin the alert, or the request sent before it.
-async fn send_alert<T: AsyncRead + Connection + Unpin>(mut io: T, alert: u8, timer: &Timer) {
+/// dropping it, until the origin closes too, within `bound`, as [`close`] does: dropped at
+/// once, it would answer what the origin still sends, the session tickets and SETTINGS of a
+/// connection it just opened say, with a reset, which may cost the origin the alert, or the
+/// request sent before it.
+async fn send_alert<T: AsyncRead + Connection + Unpin>(
+    mut io: T,
+    alert: u8,
+    bound: Pin<Box<dyn Sleep>>,
+) {
     use tokio::io::AsyncReadExt;
 
     let sent = async {
@@ -1378,7 +1411,7 @@ async fn send_alert<T: AsyncRead + Connection + Unpin>(mut io: T, alert: u8, tim
         while io.read(&mut unread).await? != 0 {}
         std::io::Result::Ok(())
     };
-    match future::select(std::pin::pin!(sent), timer.sleep(SCOPED_CLOSE_TIMEOUT)).await {
+    match future::select(std::pin::pin!(sent), bound).await {
         Either::Left((Ok(()), _)) => {}
         Either::Left((Err(_e), _)) => debug!("alerting a scoped connection failed: {}", _e),
         Either::Right(_) => debug!("alerting a scoped connection timed out"),
