@@ -42,7 +42,7 @@ use {
 
 use self::{
     lazy::{Started as Lazy, lazy},
-    scoped::{Abort, Dropped, ScopedIo},
+    scoped::{Abort, Dropped, EndedFirst, ScopedIo},
 };
 use crate::{
     client::{
@@ -56,7 +56,7 @@ use crate::{
         proxy,
     },
     error::ProxyConnect,
-    group::{ConnectionEnd, Http1Open, OnQueued, OriginEnd, ScopeRef},
+    group::{ConnectionEnd, Http1Open, OnQueued, OriginEnd, ScopeEnded, ScopeRef},
     rt::{Executor, Timer},
 };
 
@@ -422,12 +422,14 @@ where
                     Err(TrySendError::Retryable {
                         connection_reused: pooled.is_reused(),
                         error: Error::new(ErrorKind::Canceled, err.into_error())
+                            .ended_by(&pooled.ended_first)
                             .with_connect_info(pooled.conn_info.clone()),
                         req,
                     })
                 } else {
                     Err(TrySendError::Nope(
                         Error::new(ErrorKind::SendRequest, err.into_error())
+                            .ended_by(&pooled.ended_first)
                             .with_connect_info(pooled.conn_info.clone()),
                     ))
                 };
@@ -682,6 +684,7 @@ where
                             let (io, dropped) =
                                 ScopedIo::new(io, scope.clone(), http1, is_h2, timer.clone());
                             let abort = io.abort();
+                            let ended_first = io.ended_first();
                             let tx = if is_h2 {
                                {
                                     let (sending, finishes) = io.sending_bodies();
@@ -703,6 +706,7 @@ where
                                         scope,
                                         dropped,
                                         abort,
+                                        std::sync::Arc::clone(&ended_first),
                                         true,
                                         timer,
                                     ));
@@ -755,6 +759,7 @@ where
                                         scope,
                                         dropped,
                                         abort,
+                                        std::sync::Arc::clone(&ended_first),
                                         false,
                                         timer,
                                     ));
@@ -820,6 +825,7 @@ where
                                     conn_info: connected,
                                     tx,
                                     scoped: in_scope,
+                                    ended_first,
                                 },
                             ))
                         }))
@@ -874,6 +880,7 @@ struct PoolClient<B> {
     tx: PoolTx<B>,
     /// Whether it is confined to a scope, which closes it.
     scoped: bool,
+    ended_first: std::sync::Arc<EndedFirst>,
 }
 
 enum PoolTx<B> {
@@ -973,6 +980,7 @@ where
                 conn_info: self.conn_info,
                 tx: PoolTx::Http1(tx),
                 scoped: self.scoped,
+                ended_first: self.ended_first,
             }),
 
             PoolTx::Http2(tx) => {
@@ -980,11 +988,13 @@ where
                     conn_info: self.conn_info.clone(),
                     tx: PoolTx::Http2(tx.clone()),
                     scoped: self.scoped,
+                    ended_first: std::sync::Arc::clone(&self.ended_first),
                 };
                 let a = PoolClient {
                     conn_info: self.conn_info,
                     tx: PoolTx::Http2(tx),
                     scoped: self.scoped,
+                    ended_first: self.ended_first,
                 };
                 pool::Reservation::Shared(a, b)
             }
@@ -1234,6 +1244,17 @@ impl Error {
         matches!(self.kind, ErrorKind::Canceled)
     }
 
+    /// It, its source a [`ScopeEnded`] should its connection's scope have ended that
+    /// connection before its origin did (see [`EndedFirst`]).
+    fn ended_by(mut self, ended_first: &EndedFirst) -> Self {
+        if ended_first.by_scope() {
+            self.source = self
+                .source
+                .map(|source| Box::new(ScopeEnded(source)) as BoxError);
+        }
+        self
+    }
+
     #[inline]
     fn tx(src: wreq_proto::Error) -> Self {
         Self::new(ErrorKind::SendRequest, src)
@@ -1281,6 +1302,7 @@ async fn scoped<T: AsyncRead + AsyncWrite + Connection + Unpin>(
     scope: Option<ScopeRef>,
     mut dropped: tokio::sync::oneshot::Receiver<Dropped<T>>,
     abort: std::sync::Arc<Abort>,
+    ended_first: std::sync::Arc<EndedFirst>,
     http2: bool,
     timer: Timer,
 ) {
@@ -1295,8 +1317,12 @@ async fn scoped<T: AsyncRead + AsyncWrite + Connection + Unpin>(
             Either::Left(_) => true,
             Either::Right(_) => {
                 let bound = bound.insert(drain_bound(&timer, scope.drain_deadline()));
-                if scope.drains() && (!http2 || scope.finishes()) {
-                    future::select(conn, bound.as_mut()).await;
+                let done = scope.drains()
+                    && (!http2 || scope.finishes())
+                    && matches!(future::select(conn, bound.as_mut()).await, Either::Left(_));
+                // Dropped undone, it fails the requests it still has as its scope ended it.
+                if !done {
+                    ended_first.scope();
                 }
                 false
             }

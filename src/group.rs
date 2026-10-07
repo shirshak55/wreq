@@ -968,6 +968,24 @@ impl std::fmt::Debug for ConnectionScope {
     }
 }
 
+/// What a request failed with that its connection's scope ended (see
+/// [`ConnectionScope::end_with`] and [`ConnectionScope::close`]) before its origin did: the
+/// scope's ending failed it, not its origin. It reads as that failure, its source.
+#[derive(Debug)]
+pub struct ScopeEnded(pub(crate) crate::error::BoxError);
+
+impl std::fmt::Display for ScopeEnded {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+impl std::error::Error for ScopeEnded {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&*self.0)
+    }
+}
+
 /// A [`ConnectionScope`]'s identity and end, held by its requests and connections without
 /// keeping it alive.
 #[derive(Clone)]

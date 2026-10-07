@@ -6,7 +6,7 @@ use std::{
     pin::Pin,
     sync::{
         Arc,
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering},
     },
     task::{Context, Poll, Waker},
     time::Duration,
@@ -85,6 +85,7 @@ pub(super) struct ScopedIo<T: Connection + Unpin> {
     abort: Arc<Abort>,
     /// Whether its abort failed a read or write that would have waited.
     aborted: bool,
+    ended_first: Arc<EndedFirst>,
 }
 
 /// Has a [`ScopedIo`] fail each read and write that would wait from now on, waking the task
@@ -99,6 +100,33 @@ impl Abort {
     pub(super) fn abort(&self) {
         self.aborted.store(true, Ordering::Release);
         self.task.wake();
+    }
+}
+
+/// Which ended a [`ScopedIo`]'s connection first, its origin or its scope, failing the
+/// requests it still had so (see [`EndedFirst::by_scope`]).
+#[derive(Default)]
+pub(super) struct EndedFirst(AtomicU8);
+
+impl EndedFirst {
+    const ORIGIN: u8 = 1;
+    const SCOPE: u8 = 2;
+
+    fn set(&self, by: u8) {
+        let _ = self
+            .0
+            .compare_exchange(0, by, Ordering::AcqRel, Ordering::Acquire);
+    }
+
+    /// Notes that its scope ended it, unless its origin had.
+    pub(super) fn scope(&self) {
+        self.set(Self::SCOPE);
+    }
+
+    /// Whether its scope ended it before its origin did: a request failing on it then failed
+    /// as its scope ended it (see [`ScopeEnded`](crate::ScopeEnded)).
+    pub(super) fn by_scope(&self) -> bool {
+        self.0.load(Ordering::Acquire) == Self::SCOPE
     }
 }
 
@@ -138,6 +166,7 @@ impl<T: Connection + Unpin> ScopedIo<T> {
             sending_bodies: Arc::default(),
             abort: Arc::default(),
             aborted: false,
+            ended_first: Arc::default(),
         };
         (scoped, dropped_rx)
     }
@@ -166,6 +195,11 @@ impl<T: Connection + Unpin> ScopedIo<T> {
         Arc::clone(&self.abort)
     }
 
+    /// The [`EndedFirst`] of it.
+    pub(super) fn ended_first(&self) -> Arc<EndedFirst> {
+        Arc::clone(&self.ended_first)
+    }
+
     /// `polled`, unless it waits once it was aborted (see [`Abort`]): it then fails, its
     /// task woken as it is aborted.
     fn unless_aborted<R>(
@@ -179,6 +213,7 @@ impl<T: Connection + Unpin> ScopedIo<T> {
         self.abort.task.register(cx.waker());
         if self.abort.aborted.load(Ordering::Acquire) {
             self.aborted = true;
+            self.ended_first.scope();
             return Poll::Ready(Err(io::Error::new(
                 io::ErrorKind::ConnectionAborted,
                 "the connection outlived its scope's deadline",
@@ -194,6 +229,7 @@ impl<T: Connection + Unpin> ScopedIo<T> {
             scope.end() != ConnectionEnd::Graceful
                 && (self.drained || self.drain.is_some() || !scope.drains())
         }) {
+            self.ended_first.scope();
             return Err(io::Error::new(
                 io::ErrorKind::ConnectionAborted,
                 "the connection's scope ended it",
@@ -235,6 +271,7 @@ impl<T: Connection + Unpin> ScopedIo<T> {
             return Ok(Pin::new(self.io.as_mut().expect("taken only once dropped")));
         }
         if self.drained && !self.http2 {
+            self.ended_first.scope();
             return Err(io::Error::new(
                 io::ErrorKind::ConnectionAborted,
                 "the connection's scope ended it",
@@ -281,6 +318,7 @@ impl<T: Connection + Unpin> ScopedIo<T> {
         if std::mem::replace(&mut self.origin_ended, true) {
             return;
         }
+        self.ended_first.set(EndedFirst::ORIGIN);
         if let (true, Some(scope)) = (self.http2, &self.scope) {
             scope.origin_closed(end == OriginEnd::CloseNotify, end == OriginEnd::Reset);
         }
@@ -399,6 +437,7 @@ impl<T: AsyncRead + Connection + Unpin> AsyncRead for ScopedIo<T> {
             return self.unless_aborted(cx, read);
         }
         if closed {
+            self.ended_first.scope();
             return Poll::Ready(Ok(()));
         }
         let filled = buf.filled().len();
