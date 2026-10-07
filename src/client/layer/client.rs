@@ -1265,8 +1265,10 @@ const ORIGIN_END_WAIT: Duration = Duration::from_secs(2);
 /// one its request bodies, should they finish (see [`ScopedIo`]). An HTTP/1 connection whose scope
 /// ends gracefully (see [`ConnectionEnd`]) then closes its transport, back once the connection
 /// dropped it (`dropped`), as a client done with it does, within [`SCOPED_CLOSE_TIMEOUT`] by
-/// `timer`; an HTTP/2 one (`http2`) closes so itself. One back owing its origin its scope's alert
-/// sends it (see [`send_alert`]), an upgraded one once its transport is dropped. An HTTP/1 one done
+/// `timer`; an HTTP/2 one (`http2`) closes so itself. One whose scope ended with a FIN or
+/// gracefully then reads until its origin closes too (see [`close`]). One back owing its origin
+/// its scope's alert sends it (see [`send_alert`]), an upgraded one once its transport is
+/// dropped. An HTTP/1 one done
 /// first, back still counted open in its scope (see [`ScopedIo`]), is counted closed as its
 /// origin then ends it, or, past [`ORIGIN_END_WAIT`], as closed by the client.
 async fn scoped<T: AsyncRead + AsyncWrite + Connection + Unpin>(
@@ -1292,35 +1294,66 @@ async fn scoped<T: AsyncRead + AsyncWrite + Connection + Unpin>(
             }
         }
     };
-    if ended {
-        match dropped.try_recv() {
-            Ok((io, _, Some(alert))) => send_alert(io, alert, &timer).await,
-            Ok((io, Some(open), None)) => {
-                let end = std::pin::pin!(origin_end(io, open));
-                future::select(end, timer.sleep(ORIGIN_END_WAIT)).await;
-            }
-            // Upgraded, its transport lives on: back once that is dropped, it sends the alert
-            // it owes then.
-            Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {
-                if let Ok((io, _, Some(alert))) = dropped.await {
-                    send_alert(io, alert, &timer).await;
-                }
-            }
-            _ => {}
+    // Upgraded, its transport lives on, as an HTTP/2 one's may a while: back once dropped.
+    let (upgraded, dropped) = match dropped.try_recv() {
+        Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {
+            (ended && !http2, dropped.await.ok())
         }
-        return;
-    }
-    if http2 || scope.end() != ConnectionEnd::Graceful {
-        if let Ok((io, _, Some(alert))) = dropped.try_recv() {
-            send_alert(io, alert, &timer).await;
-        }
-        return;
-    }
-    let Ok((mut io, _, _)) = dropped.await else {
+        dropped => (false, dropped.ok()),
+    };
+    let Some((io, open, alert, shut)) = dropped else {
         return;
     };
-    let shutdown = std::pin::pin!(io.shutdown());
-    match future::select(shutdown, timer.sleep(SCOPED_CLOSE_TIMEOUT)).await {
+    match (alert, open) {
+        (Some(alert), _) => send_alert(io, alert, &timer).await,
+        // Its relay done, it closes as its client did, which half-closed with a FIN alone.
+        (None, _) if upgraded => {
+            if scope.half_closes_with_fin() {
+                close(io, shut, ConnectionEnd::Fin, &timer).await;
+            }
+        }
+        (None, Some(open)) if ended => {
+            let end = std::pin::pin!(origin_end(io, open));
+            future::select(end, timer.sleep(ORIGIN_END_WAIT)).await;
+        }
+        (None, _) if shut || !ended || scope.ended().is_some() => {
+            close(io, shut, scope.end(), &timer).await
+        }
+        _ => {}
+    }
+}
+
+/// Closes `io`, the transport of a scoped connection whose scope ended as `end` says, unless
+/// it was (`shut`), then reads what its origin still sends, dropping it, until the origin
+/// closes too, within [`SCOPED_CLOSE_TIMEOUT`] by `timer`, as a client half-closing its own
+/// connection does: dropped at once, it would answer what the origin still sends, the
+/// response to a request it sent last say, with a reset. One ending otherwise just closes.
+async fn close<T: AsyncRead + AsyncWrite + Connection + Unpin>(
+    mut io: T,
+    shut: bool,
+    end: ConnectionEnd,
+    timer: &Timer,
+) {
+    use tokio::io::AsyncReadExt;
+
+    if !matches!(end, ConnectionEnd::Fin | ConnectionEnd::Graceful) {
+        return;
+    }
+    let closed = async {
+        if !shut {
+            if end == ConnectionEnd::Graceful {
+                io.shutdown().await?;
+            } else {
+                io.socket()
+                    .ok_or(std::io::ErrorKind::Unsupported)?
+                    .shutdown(std::net::Shutdown::Write)?;
+            }
+        }
+        let mut unread = [0; 4096];
+        while io.read(&mut unread).await? != 0 {}
+        std::io::Result::Ok(())
+    };
+    match future::select(std::pin::pin!(closed), timer.sleep(SCOPED_CLOSE_TIMEOUT)).await {
         Either::Left((Ok(()), _)) => {}
         Either::Left((Err(_e), _)) => debug!("closing a scoped connection failed: {}", _e),
         Either::Right(_) => debug!("closing a scoped connection timed out"),
@@ -1328,8 +1361,22 @@ async fn scoped<T: AsyncRead + AsyncWrite + Connection + Unpin>(
 }
 
 /// Sends `alert`, the fatal alert a scoped connection over `io` owes its origin, as its
-/// origin reads what was sent before it, within [`SCOPED_CLOSE_TIMEOUT`] by `timer`.
-async fn send_alert<T: Connection + Unpin>(mut io: T, alert: u8, timer: &Timer) {
+/// origin reads what was sent before it, within [`SCOPED_CLOSE_TIMEOUT`] by `timer`. It first
+/// reads what the origin sent that is already there, dropping it: left unread, a session
+/// ticket say, it would have the close that follows answered with a reset, which may cost the
+/// origin the alert.
+async fn send_alert<T: AsyncRead + Connection + Unpin>(mut io: T, alert: u8, timer: &Timer) {
+    let mut unread = [0; 4096];
+    future::poll_fn(|cx| {
+        loop {
+            let mut buf = tokio::io::ReadBuf::new(&mut unread);
+            match std::pin::Pin::new(&mut io).poll_read(cx, &mut buf) {
+                Poll::Ready(Ok(())) if !buf.filled().is_empty() => {}
+                _ => return Poll::Ready(()),
+            }
+        }
+    })
+    .await;
     let sent = future::poll_fn(|cx| std::pin::Pin::new(&mut io).poll_send_fatal_alert(cx, alert));
     match future::select(std::pin::pin!(sent), timer.sleep(SCOPED_CLOSE_TIMEOUT)).await {
         Either::Left((Ok(()), _)) => {}

@@ -38,8 +38,8 @@ const SCOPE_END_WAIT: Duration = Duration::from_secs(2);
 /// what it holds first, an HTTP/2 one the request bodies it still has to send (see
 /// [`ScopedIo::draining`]). Dropped, it goes to the
 /// receiver [`ScopedIo::new`] returned, if that is still there, with the alert of
-/// [`ConnectionEnd::Alert`] it owes its origin, which the receiver sends; without one, the
-/// alert goes as far as its socket has room.
+/// [`ConnectionEnd::Alert`] it owes its origin, which the receiver sends, and whether it was
+/// shut down; without one, the alert goes as far as its socket has room.
 ///
 /// An HTTP/1 one is counted open in its scope from its connect on (see
 /// [`ConnectionScope::http1_origin_closed`](crate::ConnectionScope::http1_origin_closed)).
@@ -71,6 +71,8 @@ pub(super) struct ScopedIo<T: Connection + Unpin> {
     drain_turn: bool,
     /// Whether, draining, it was found to hold nothing more.
     drained: bool,
+    /// Whether its transport was shut down (see `poll_shutdown`).
+    shut: bool,
     /// Set while its HTTP/1 connection has a request body still to send (see
     /// [`Self::sending_body`]).
     sending_body: Arc<AtomicBool>,
@@ -79,9 +81,9 @@ pub(super) struct ScopedIo<T: Connection + Unpin> {
     sending_bodies: Arc<SendingBodies>,
 }
 
-/// A dropped [`ScopedIo`]'s transport, still counted open in its scope if it is, and the
-/// fatal alert it owes its origin, if any.
-pub(super) type Dropped<T> = (T, Option<Http1Open>, Option<u8>);
+/// A dropped [`ScopedIo`]'s transport, still counted open in its scope if it is, the fatal
+/// alert it owes its origin, if any, and whether it was shut down.
+pub(super) type Dropped<T> = (T, Option<Http1Open>, Option<u8>, bool);
 
 impl<T: Connection + Unpin> ScopedIo<T> {
     /// Wraps `io`, the transport of a connection confined to `scope`, if any, speaking
@@ -110,6 +112,7 @@ impl<T: Connection + Unpin> ScopedIo<T> {
             wrote: false,
             drain_turn: false,
             drained: false,
+            shut: false,
             sending_body: Arc::default(),
             sending_bodies: Arc::default(),
         };
@@ -307,7 +310,7 @@ impl<T: Connection + Unpin> Drop for ScopedIo<T> {
         };
         // Refused when nothing waits to close it, so it just closes, its alert sent as far as
         // its socket has room: dropped, it can't wait for more.
-        if let Err((mut io, _, Some(alert))) = dropped.send((io, http1, alert)) {
+        if let Err((mut io, _, Some(alert), _)) = dropped.send((io, http1, alert, self.shut)) {
             let mut cx = Context::from_waker(Waker::noop());
             match Pin::new(&mut io).poll_send_fatal_alert(&mut cx, alert) {
                 Poll::Ready(Ok(())) => {}
@@ -391,8 +394,9 @@ impl<T: AsyncWrite + AsyncRead + Connection + Unpin> AsyncWrite for ScopedIo<T> 
             {
                 self.drain_turn = false;
                 // An HTTP/2 one is polled again only as it has more to write: its request
-                // bodies sent, it gets a turn.
-                if self.http2 && !sending {
+                // bodies sent, it gets a turn, as does an HTTP/1 one sending no body, which
+                // its response, unread, won't wake.
+                if !sending && (self.http2 || !self.sending_body.load(Ordering::Acquire)) {
                     cx.waker().wake_by_ref();
                 }
             } else if !std::mem::replace(&mut self.drain_turn, true) {
@@ -428,9 +432,13 @@ impl<T: AsyncWrite + AsyncRead + Connection + Unpin> AsyncWrite for ScopedIo<T> 
             let mut io = self.io()?;
             std::task::ready!(io.as_mut().poll_flush(cx))?;
             if let Some(socket) = io.socket() {
-                return Poll::Ready(socket.shutdown(std::net::Shutdown::Write));
+                let shut = socket.shutdown(std::net::Shutdown::Write);
+                self.shut = shut.is_ok();
+                return Poll::Ready(shut);
             }
         }
-        self.io()?.poll_shutdown(cx)
+        let shut = std::task::ready!(self.io()?.poll_shutdown(cx));
+        self.shut = shut.is_ok();
+        Poll::Ready(shut)
     }
 }
