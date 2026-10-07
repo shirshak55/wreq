@@ -26,6 +26,7 @@ use std::{
         atomic::{AtomicBool, AtomicU16, AtomicU64, AtomicUsize, Ordering},
     },
     task::{Context, Poll, Waker, ready},
+    time::Instant,
 };
 
 use bytes::Bytes;
@@ -220,8 +221,9 @@ pub struct ConnectionScope(Arc<(u64, watch::Sender<bool>, Arc<Connections>)>);
 /// end the HTTP/2 ones, and how many HTTP/1 ones are open, told once an origin closed the last,
 /// which, in a scope ending with its HTTP/1 origin, leaves it gone for good. Also how the
 /// origin of an HTTP/1 one ended it last, in such a scope, whether an HTTP/1 one's origin is
-/// to close it, whether the HTTP/1 ones half-close with a FIN alone, and whether the HTTP/2
-/// ones' streams end with them (see `ConnectionScope::end_streams_with_connections`).
+/// to close it, whether the HTTP/1 ones half-close with a FIN alone, whether the HTTP/2
+/// ones' streams end with them (see `ConnectionScope::end_streams_with_connections`), and
+/// when they stop draining, if the caller said (see `ConnectionScope::drain_until`).
 #[derive(Default)]
 struct Connections {
     http2: Mutex<Vec<(u64, Control)>>,
@@ -244,6 +246,7 @@ struct Connections {
     http1_origin_closing: AtomicBool,
     http1_half_close_fin: AtomicBool,
     streams_end: AtomicBool,
+    drain_deadline: Mutex<Option<Instant>>,
 }
 
 /// The frames a scope had its HTTP/2 connections send before its first opened, the memory
@@ -895,6 +898,12 @@ impl ConnectionScope {
         }
     }
 
+    /// Has this scope's connections stop draining (see [`Self::end_with`] and
+    /// [`Self::close`]) by `deadline` rather than a while after they start.
+    pub fn drain_until(&self, deadline: Instant) {
+        *self.0.2.drain_deadline.lock() = Some(deadline);
+    }
+
     /// Makes this scope's connections end as `end` says: past any but
     /// [`ConnectionEnd::Graceful`] they send nothing more, and end so once they close, as they
     /// do once the scope is dropped. An HTTP/2 connection whose origin closed it first
@@ -1134,6 +1143,12 @@ impl ScopeRef {
             ConnectionEnd::Graceful => *self.closed.borrow(),
             ConnectionEnd::Reset => false,
         }
+    }
+
+    /// When its connections stop draining, if bounded so (see
+    /// [`ConnectionScope::drain_until`]).
+    pub(crate) fn drain_deadline(&self) -> Option<Instant> {
+        *self.connections.drain_deadline.lock()
     }
 
     /// Whether its HTTP/2 connections' request bodies, canceled, still send what their client

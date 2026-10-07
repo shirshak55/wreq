@@ -21,7 +21,7 @@ use wreq_proto::{
     rt::{Sleep, Timer as _},
 };
 
-use super::SCOPED_CLOSE_TIMEOUT;
+use super::drain_bound;
 use crate::{
     conn::Connection,
     group::{ConnectionEnd, Http1Open, OriginEnd, ScopeRef},
@@ -136,11 +136,12 @@ impl<T: Connection + Unpin> ScopedIo<T> {
     }
 
     fn io(&mut self) -> io::Result<Pin<&mut T>> {
-        if self
-            .scope
-            .as_ref()
-            .is_some_and(|scope| scope.end() != ConnectionEnd::Graceful)
-        {
+        // One whose scope ended as `draining` found it hadn't still goes on, as it would
+        // have just before, until `draining` sees the end.
+        if self.scope.as_ref().is_some_and(|scope| {
+            scope.end() != ConnectionEnd::Graceful
+                && (self.drained || self.drain.is_some() || !scope.drains())
+        }) {
             return Err(io::Error::new(
                 io::ErrorKind::ConnectionAborted,
                 "the connection's scope ended it",
@@ -151,10 +152,10 @@ impl<T: Connection + Unpin> ScopedIo<T> {
 
     /// Whether it still writes what it holds, reading nothing until it holds nothing more (see
     /// `poll_flush`): one does once its scope drains ([`ScopeRef::drains`]), up to
-    /// [`SCOPED_CLOSE_TIMEOUT`], so that its origin gets what the client sent before it ended,
-    /// as it would directly; an HTTP/2 one only while it has request bodies to send then,
-    /// which still send what their client sent, reading on for the WINDOW_UPDATEs they wait
-    /// for.
+    /// [`SCOPED_CLOSE_TIMEOUT`](super::SCOPED_CLOSE_TIMEOUT) or its scope's deadline (see
+    /// [`drain_bound`]), so that its origin gets what the client sent before it ended, as it
+    /// would directly; an HTTP/2 one only while it has request bodies to send then, which
+    /// still send what their client sent, reading on for the WINDOW_UPDATEs they wait for.
     fn draining(&mut self, cx: &mut Context<'_>) -> bool {
         if self.drained || !self.scope.as_ref().is_some_and(ScopeRef::drains) {
             return false;
@@ -167,10 +168,11 @@ impl<T: Connection + Unpin> ScopedIo<T> {
             self.drained = true;
             return false;
         }
+        let deadline = self.scope.as_ref().and_then(ScopeRef::drain_deadline);
         let timer = &self.timer;
         let drain = self
             .drain
-            .get_or_insert_with(|| timer.sleep(SCOPED_CLOSE_TIMEOUT));
+            .get_or_insert_with(|| drain_bound(timer, deadline));
         drain.as_mut().poll(cx).is_pending()
     }
 

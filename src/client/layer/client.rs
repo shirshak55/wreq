@@ -9,8 +9,9 @@ use std::{
     fmt,
     future::Future,
     num::NonZeroUsize,
+    pin::Pin,
     task::{self, Poll},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use bytes::Bytes;
@@ -30,7 +31,7 @@ use wreq_proto::{
     conn::{self, TrySendError as ConnTrySendError},
     http1::Http1Options,
     http2::Http2Options,
-    rt::{Executor as _, Timer as _},
+    rt::{Executor as _, Sleep, Timer as _},
 };
 #[cfg(feature = "cookies")]
 use {
@@ -1244,12 +1245,23 @@ impl Error {
 /// How long an HTTP/1 connection whose scope ended gets to close its transport.
 const SCOPED_CLOSE_TIMEOUT: Duration = Duration::from_secs(1);
 
+/// What bounds, by `timer`, the drain of a scoped connection starting now: its scope's
+/// `deadline`, if any (see [`crate::ConnectionScope::drain_until`]), else
+/// [`SCOPED_CLOSE_TIMEOUT`].
+fn drain_bound(timer: &Timer, deadline: Option<Instant>) -> Pin<Box<dyn Sleep>> {
+    match deadline {
+        Some(deadline) => timer.sleep_until(deadline),
+        None => timer.sleep(SCOPED_CLOSE_TIMEOUT),
+    }
+}
+
 /// How long an HTTP/1 connection done before its origin ended it reads for that end: the
 /// origin of an exchange that said `Connection: close` ends it right after.
 const ORIGIN_END_WAIT: Duration = Duration::from_secs(2);
 
 /// Drives a connection until it ends or, for a scoped connection, its scope does, one whose
-/// scope drains then still getting [`SCOPED_CLOSE_TIMEOUT`] to send what it holds, an HTTP/2
+/// scope drains then still getting [`SCOPED_CLOSE_TIMEOUT`], or until its scope's deadline (see
+/// [`crate::ConnectionScope::drain_until`]), to send what it holds, an HTTP/2
 /// one its request bodies, should they finish (see [`ScopedIo`]). An HTTP/1 connection whose scope
 /// ends gracefully (see [`ConnectionEnd`]) then closes its transport, back once the connection
 /// dropped it (`dropped`), as a client done with it does, within [`SCOPED_CLOSE_TIMEOUT`] by
@@ -1274,7 +1286,7 @@ async fn scoped<T: AsyncRead + AsyncWrite + Connection + Unpin>(
             Either::Left(_) => true,
             Either::Right(_) => {
                 if scope.drains() && (!http2 || scope.finishes()) {
-                    future::select(conn, timer.sleep(SCOPED_CLOSE_TIMEOUT)).await;
+                    future::select(conn, drain_bound(&timer, scope.drain_deadline())).await;
                 }
                 false
             }
