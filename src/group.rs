@@ -1203,6 +1203,18 @@ impl ScopeRef {
         ended
     }
 
+    /// Whether the scope's connections end with a reset (see [`ConnectionScope::end_with`]);
+    /// otherwise wakes `task`, the latest of the connection `id`'s, as the scope is next told
+    /// how they end, an earlier ending upgraded to a reset included, until [`Self::forget`].
+    pub(crate) fn wake_on_reset(&self, id: u64, task: &Waker) -> bool {
+        let mut tasks = self.connections.end_tasks.lock();
+        let reset = self.ended() == Some(ConnectionEnd::Reset);
+        if !reset {
+            wait(&mut tasks, id, task);
+        }
+        reset
+    }
+
     /// Tells the scope, if it ends with its HTTP/1 origin, that the origin of one of its HTTP/1
     /// connections is to close it (see [`ConnectionScope::http1_origin_closing`]).
     pub(crate) fn expect_http1_origin_close(&self) {

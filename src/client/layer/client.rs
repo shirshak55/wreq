@@ -1302,9 +1302,12 @@ async fn abandoned(scope: Option<ScopeRef>, timer: Timer) {
         return future::pending().await;
     };
     let waiting = Waiting(&scope, scoped::next_id());
-    let reset = future::poll_fn(|cx| match scope.wake_on_end(waiting.1, cx.waker()) {
-        Some(ConnectionEnd::Reset) => Poll::Ready(()),
-        _ => Poll::Pending,
+    let reset = future::poll_fn(|cx| {
+        if scope.wake_on_reset(waiting.1, cx.waker()) {
+            Poll::Ready(())
+        } else {
+            Poll::Pending
+        }
     });
     let closed = async {
         scope.clone().closed().await;
@@ -1405,7 +1408,7 @@ async fn scoped<T: AsyncRead + AsyncWrite + Connection + Unpin>(
         }
         (None, Some(open)) if ended => {
             let end = std::pin::pin!(origin_end(io, open));
-            future::select(end, timer.sleep(ORIGIN_END_WAIT)).await;
+            future::select(timer.sleep(ORIGIN_END_WAIT), end).await;
         }
         (None, _) if shut || !ended || scope.ended().is_some() => {
             close(io, shut, scope.end(), bound()).await
@@ -1444,10 +1447,11 @@ async fn close<T: AsyncRead + AsyncWrite + Connection + Unpin>(
         while io.read(&mut unread).await? != 0 {}
         std::io::Result::Ok(())
     };
-    match future::select(std::pin::pin!(closed), bound).await {
-        Either::Left((Ok(()), _)) => {}
-        Either::Left((Err(_e), _)) => debug!("closing a scoped connection failed: {}", _e),
-        Either::Right(_) => debug!("closing a scoped connection timed out"),
+    // The bound first: an origin sending on and on would leave its timer no turn.
+    match future::select(bound, std::pin::pin!(closed)).await {
+        Either::Left(_) => debug!("closing a scoped connection timed out"),
+        Either::Right((Ok(()), _)) => {}
+        Either::Right((Err(_e), _)) => debug!("closing a scoped connection failed: {}", _e),
     }
 }
 
@@ -1473,10 +1477,11 @@ async fn send_alert<T: AsyncRead + Connection + Unpin>(
         while io.read(&mut unread).await? != 0 {}
         std::io::Result::Ok(())
     };
-    match future::select(std::pin::pin!(sent), bound).await {
-        Either::Left((Ok(()), _)) => {}
-        Either::Left((Err(_e), _)) => debug!("alerting a scoped connection failed: {}", _e),
-        Either::Right(_) => debug!("alerting a scoped connection timed out"),
+    // The bound first, as in `close`.
+    match future::select(bound, std::pin::pin!(sent)).await {
+        Either::Left(_) => debug!("alerting a scoped connection timed out"),
+        Either::Right((Ok(()), _)) => {}
+        Either::Right((Err(_e), _)) => debug!("alerting a scoped connection failed: {}", _e),
     }
 }
 
