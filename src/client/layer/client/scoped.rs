@@ -324,6 +324,12 @@ impl<T: AsyncRead + Connection + Unpin> AsyncRead for ScopedIo<T> {
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
+        // Its scope closed: it reads nothing more, its connection ending as at the origin's
+        // close, without a frame more, unless it drains. Seen first, as its scope ended before.
+        let closed = self
+            .scope
+            .as_ref()
+            .is_some_and(|scope| scope.poll_closed(self.id, cx.waker()));
         if self.draining(cx) {
             if !self.http2 {
                 return Poll::Pending;
@@ -335,13 +341,7 @@ impl<T: AsyncRead + Connection + Unpin> AsyncRead for ScopedIo<T> {
             self.note_read(&read, empty);
             return read;
         }
-        // Its scope closed: it reads nothing more, its connection ending as at the origin's
-        // close, without a frame more.
-        if self
-            .scope
-            .as_ref()
-            .is_some_and(|scope| scope.poll_closed(self.id, cx.waker()))
-        {
+        if closed {
             return Poll::Ready(Ok(()));
         }
         let filled = buf.filled().len();
