@@ -1212,3 +1212,48 @@ async fn http1_origin_closing_is_told_after_an_http10_request() {
         assert_eq!(told.load(std::sync::atomic::Ordering::SeqCst), closing);
     }
 }
+
+#[tokio::test]
+async fn a_scope_reset_resets_a_connection_reading_for_its_origin_end() {
+    use tokio::io::AsyncReadExt;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (handed_back, handed_back_rx) = tokio::sync::oneshot::channel();
+    let origin = tokio::spawn(async move {
+        let (mut io, _) = listener.accept().await.unwrap();
+        let (mut read, mut buf) = (Vec::new(), [0; 1024]);
+        while !read.ends_with(b"\r\n\r\n") {
+            let n = io.read(&mut buf).await.unwrap();
+            read.extend_from_slice(&buf[..n]);
+        }
+        io.write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 1\r\nconnection: close\r\n\r\nx")
+            .await
+            .unwrap();
+        // The client closes after the exchange, then reads on for the origin's end.
+        assert_eq!(io.read(&mut buf).await.unwrap(), 0);
+        handed_back.send(()).unwrap();
+        loop {
+            match io.read(&mut buf).await {
+                Ok(0) => tokio::time::sleep(std::time::Duration::from_millis(10)).await,
+                Ok(_) => {}
+                Err(err) => return err,
+            }
+        }
+    });
+    let client = Client::builder().no_proxy().http1_only().build().unwrap();
+    let scope = wreq::ConnectionScope::new();
+    let mut req = client
+        .get(format!("http://{addr}/"))
+        .connection_scope(&scope)
+        .build()
+        .unwrap();
+    req.extensions_mut()
+        .insert(wreq::OnOriginEnd::new(|| {}, |_| {}));
+    client.execute(req).await.unwrap().bytes().await.unwrap();
+    handed_back_rx.await.unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    scope.end_with(wreq::ConnectionEnd::Reset);
+    let reset = tokio::time::timeout(std::time::Duration::from_secs(3), origin).await;
+    assert!(reset.is_ok(), "the origin saw no reset");
+}

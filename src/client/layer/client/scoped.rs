@@ -135,6 +135,18 @@ impl EndedFirst {
 /// alert it owes its origin, if any, and whether it was shut down.
 pub(super) type Dropped<T> = (T, Option<Http1Open>, Option<u8>, bool);
 
+/// Has the TCP connection `io` runs over reset, rather than close, once dropped.
+pub(super) fn reset_when_dropped<T: Connection>(io: &T) {
+    match io
+        .socket()
+        .map(|socket| socket.set_linger(Some(Duration::ZERO)))
+    {
+        Some(Ok(())) => {}
+        Some(Err(_e)) => debug!("resetting a scoped connection failed: {}", _e),
+        None => debug!("a scoped connection over no TCP socket closes rather than resets"),
+    }
+}
+
 /// A new id among a scope's connections, and those being set up, waiting for its end or
 /// close (see [`ScopeRef::wake_on_end`]).
 pub(super) fn next_id() -> u64 {
@@ -388,16 +400,7 @@ impl<T: Connection + Unpin> Drop for ScopedIo<T> {
         let alert = match self.scope.as_ref().map(ScopeRef::end) {
             // Aborted waiting, it couldn't close in time.
             Some(end) if end == ConnectionEnd::Reset || self.aborted => {
-                let linger = io
-                    .socket()
-                    .map(|socket| socket.set_linger(Some(Duration::ZERO)));
-                match linger {
-                    Some(Ok(())) => {}
-                    Some(Err(_e)) => debug!("resetting a scoped connection failed: {}", _e),
-                    None => {
-                        debug!("a scoped connection over no TCP socket closes rather than resets")
-                    }
-                }
+                reset_when_dropped(&io);
                 None
             }
             // Unless its origin ended its side already.

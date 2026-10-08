@@ -1323,30 +1323,35 @@ fn drain_bound(timer: &Timer, deadline: Option<Instant>) -> Pin<Box<dyn Sleep>> 
 /// closed, by the bound of its end (see [`drain_bound`]), its connect (its TLS handshake,
 /// say) dropped then, whether a request still waits for it or the pool's checkout won.
 async fn abandoned(scope: Option<ScopeRef>, timer: Timer) {
-    struct Waiting<'a>(&'a ScopeRef, u64);
-    impl Drop for Waiting<'_> {
-        fn drop(&mut self) {
-            self.0.forget(self.1);
-        }
-    }
     let Some(scope) = scope else {
         return future::pending().await;
     };
-    let waiting = Waiting(&scope, scoped::next_id());
-    let reset = future::poll_fn(|cx| {
-        if scope.wake_on_reset(waiting.1, cx.waker()) {
-            Poll::Ready(())
-        } else {
-            Poll::Pending
-        }
-    });
     let closed = async {
         scope.clone().closed().await;
         if scope.drains() {
             drain_bound(&timer, scope.drain_deadline()).await;
         }
     };
-    future::select(std::pin::pin!(reset), std::pin::pin!(closed)).await;
+    future::select(std::pin::pin!(reset(&scope)), std::pin::pin!(closed)).await;
+}
+
+/// Resolves once `scope` ends with a reset.
+async fn reset(scope: &ScopeRef) {
+    struct Waiting<'a>(&'a ScopeRef, u64);
+    impl Drop for Waiting<'_> {
+        fn drop(&mut self) {
+            self.0.forget(self.1);
+        }
+    }
+    let waiting = Waiting(scope, scoped::next_id());
+    future::poll_fn(|cx| {
+        if scope.wake_on_reset(waiting.1, cx.waker()) {
+            Poll::Ready(())
+        } else {
+            Poll::Pending
+        }
+    })
+    .await
 }
 
 /// How long an HTTP/1 connection done before its origin ended it reads for that end: the
@@ -1421,7 +1426,7 @@ async fn scoped<T: AsyncRead + AsyncWrite + Connection + Unpin>(
         Err(tokio::sync::oneshot::error::TryRecvError::Empty) => (ended, dropped.await.ok()),
         dropped => (false, dropped.ok()),
     };
-    let Some((io, open, alert, shut)) = dropped else {
+    let Some((mut io, open, alert, shut)) = dropped else {
         return;
     };
     let bound = || match bound {
@@ -1429,22 +1434,32 @@ async fn scoped<T: AsyncRead + AsyncWrite + Connection + Unpin>(
         None if upgraded => timer.sleep(SCOPED_CLOSE_TIMEOUT),
         None => drain_bound(&timer, scope.drain_deadline()),
     };
-    match (alert, open) {
-        (Some(alert), _) => send_alert(io, alert, bound()).await,
-        // Its relay done, it closes as its client did, which half-closed with a FIN alone.
-        (None, _) if upgraded => {
-            if scope.half_closes_with_fin() {
-                close(io, shut, ConnectionEnd::Fin, bound()).await;
+    let ending = async {
+        match (alert, open) {
+            (Some(alert), _) => send_alert(&mut io, alert, bound()).await,
+            // Its relay done, it closes as its client did, which half-closed with a FIN alone.
+            (None, _) if upgraded => {
+                if scope.half_closes_with_fin() {
+                    close(&mut io, shut, ConnectionEnd::Fin, bound()).await;
+                }
             }
+            (None, Some(open)) if ended => {
+                let end = std::pin::pin!(origin_end(&mut io, open));
+                future::select(timer.sleep(ORIGIN_END_WAIT), end).await;
+            }
+            (None, _) if shut || !ended || scope.ended().is_some() => {
+                close(&mut io, shut, scope.end(), bound()).await
+            }
+            _ => {}
         }
-        (None, Some(open)) if ended => {
-            let end = std::pin::pin!(origin_end(io, open));
-            future::select(timer.sleep(ORIGIN_END_WAIT), end).await;
-        }
-        (None, _) if shut || !ended || scope.ended().is_some() => {
-            close(io, shut, scope.end(), bound()).await
-        }
-        _ => {}
+    };
+    // Its scope reset meanwhile, it resets at once, as it would have before it was back.
+    let was_reset = matches!(
+        future::select(std::pin::pin!(reset(&scope)), std::pin::pin!(ending)).await,
+        Either::Left(_)
+    );
+    if was_reset {
+        scoped::reset_when_dropped(&io);
     }
 }
 
@@ -1454,7 +1469,7 @@ async fn scoped<T: AsyncRead + AsyncWrite + Connection + Unpin>(
 /// connection does: dropped at once, it would answer what the origin still sends, the
 /// response to a request it sent last say, with a reset. One ending otherwise just closes.
 async fn close<T: AsyncRead + AsyncWrite + Connection + Unpin>(
-    io: T,
+    io: &mut T,
     shut: bool,
     end: ConnectionEnd,
     bound: Pin<Box<dyn Sleep>>,
@@ -1487,7 +1502,7 @@ async fn close<T: AsyncRead + AsyncWrite + Connection + Unpin>(
 /// connection it just opened say, with a reset, which may cost the origin the alert, or the
 /// request sent before it.
 async fn send_alert<T: AsyncRead + Connection + Unpin>(
-    io: T,
+    io: &mut T,
     alert: u8,
     bound: Pin<Box<dyn Sleep>>,
 ) {
@@ -1511,13 +1526,13 @@ async fn send_alert<T: AsyncRead + Connection + Unpin>(
 /// wait for room, then reads what its origin still sends, dropping it, until the origin closes
 /// too, within `bound`: `None` past it.
 async fn end_scoped<T: AsyncRead + Unpin>(
-    mut io: T,
+    io: &mut T,
     mut end: impl FnMut(Pin<&mut T>, &mut task::Context<'_>) -> Poll<std::io::Result<()>>,
     mut bound: Pin<Box<dyn Sleep>>,
 ) -> Option<std::io::Result<()>> {
     use tokio::io::AsyncReadExt;
 
-    let ended = future::poll_fn(|cx| end(Pin::new(&mut io), cx));
+    let ended = future::poll_fn(|cx| end(Pin::new(&mut *io), cx));
     match future::select(std::pin::pin!(ended), bound.as_mut()).await {
         Either::Left((Ok(()), _)) => {}
         Either::Left((Err(e), _)) => return Some(Err(e)),
@@ -1547,7 +1562,7 @@ fn lists(headers: &http::HeaderMap, option: &str) -> bool {
 
 /// Reads what the origin of the HTTP/1 connection over `io` still sends until it ends it,
 /// then counts it closed (`open`) as the origin did.
-async fn origin_end<T: AsyncRead + Connection + Unpin>(mut io: T, mut open: Http1Open) {
+async fn origin_end<T: AsyncRead + Connection + Unpin>(io: &mut T, mut open: Http1Open) {
     use tokio::io::AsyncReadExt;
 
     let mut unread = [0; 4096];
