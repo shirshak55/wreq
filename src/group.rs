@@ -443,18 +443,36 @@ pub enum Http2OriginEnd {
 }
 
 /// Called each time the request carrying it (as an extension) is queued on the connection
-/// sending it, which sends the requests queued on it in that order.
+/// sending it, which sends the requests queued on it in that order: an HTTP/1 one once it
+/// took the request to write (see [`OnTaken`](wreq_proto::ext::OnTaken)).
 #[derive(Clone)]
-pub struct OnQueued(Arc<dyn Fn() + Send + Sync>);
+pub struct OnQueued(
+    Arc<dyn Fn() + Send + Sync>,
+    Option<Arc<dyn Fn() + Send + Sync>>,
+);
 
 impl OnQueued {
     /// Calls `queued` each time the request is queued on its connection.
     pub fn new(queued: impl Fn() + Send + Sync + 'static) -> Self {
-        Self(Arc::new(queued))
+        Self(Arc::new(queued), None)
+    }
+
+    /// Also calls `alone` once the request has an HTTP/1 connection of its own, before its
+    /// body is read ahead (see [`ReadAheadOnHttp1`](crate::ReadAheadOnHttp1)) and it is
+    /// queued there: no request waits for it on that connection.
+    pub fn alone(mut self, alone: impl Fn() + Send + Sync + 'static) -> Self {
+        self.1 = Some(Arc::new(alone));
+        self
     }
 
     pub(crate) fn queued(&self) {
         (self.0)();
+    }
+
+    pub(crate) fn queued_alone(&self) {
+        if let Some(alone) = &self.1 {
+            alone();
+        }
     }
 }
 

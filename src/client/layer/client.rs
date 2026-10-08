@@ -29,6 +29,7 @@ use tower::{BoxError, util::Oneshot};
 use wreq_proto::{
     body::Incoming,
     conn::{self, TrySendError as ConnTrySendError},
+    ext::OnTaken,
     http1::Http1Options,
     http2::Http2Options,
     rt::{Executor as _, Sleep, Timer as _},
@@ -367,10 +368,10 @@ where
         }
 
         if pooled.is_http1() && req.extensions_mut().remove::<ReadAheadOnHttp1>().is_some() {
-            // The connection is the request's alone: it counts as queued before its body is
-            // read ahead.
+            // The connection is the request's alone, which it is told before its body is read
+            // ahead; it is queued once the connection took it.
             if let Some(on_queued) = req.extensions().get::<OnQueued>() {
-                on_queued.queued();
+                on_queued.queued_alone();
             }
             let (mut parts, body) = req.into_parts();
             let body = body.read_ahead(self.timer.sleep(READ_AHEAD_WAIT)).await;
@@ -408,7 +409,15 @@ where
             }
         }
 
-        let on_queued = req.extensions().get::<OnQueued>().cloned();
+        let mut on_queued = req.extensions().get::<OnQueued>().cloned();
+        // An HTTP/1 connection drops a request its sender dropped before it took the request
+        // to write, unwritten: the request is queued on it only once taken.
+        if pooled.is_http1()
+            && let Some(on_queued) = on_queued.take()
+        {
+            req.extensions_mut()
+                .insert(OnTaken::new(move || on_queued.queued()));
+        }
         let _expected = pooled.expect_request(&req);
         let request_close = lists(req.headers(), "close");
         let sent = pooled.try_send_request(req);

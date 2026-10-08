@@ -514,7 +514,11 @@ impl<T: AsyncWrite + AsyncRead + Connection + Unpin> AsyncWrite for ScopedIo<T> 
     }
 
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        self.drained = true;
+        // An HTTP/1 one relaying its client's half-close (see `ReadClosed`) before its scope
+        // ends still flushes, reading its response on.
+        if self.http2 || self.scope.as_ref().is_some_and(ScopeRef::drains) {
+            self.drained = true;
+        }
         if let (true, Some(scope)) = (self.http2, self.scope.clone()) {
             let ended = self.poll_scope_end(cx, &scope).map(Ok);
             let ended = std::task::ready!(self.unless_aborted(cx, ended))?;
