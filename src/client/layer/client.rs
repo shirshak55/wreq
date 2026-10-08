@@ -410,23 +410,28 @@ where
         }
 
         let mut on_queued = req.extensions().get::<OnQueued>().cloned();
-        // An HTTP/1 connection drops a request its sender dropped before it took the request
-        // to write, unwritten: the request is queued on it only once taken.
-        if pooled.is_http1()
-            && let Some(on_queued) = on_queued.take()
-        {
-            req.extensions_mut()
-                .insert(OnTaken::new(move || on_queued.queued()));
-        }
-        let _expected = pooled.expect_request(&req);
-        let request_close = lists(req.headers(), "close");
         let on_origin_end = pooled
             .last
             .as_ref()
             .and(req.extensions().get::<OnOriginEnd>().cloned());
-        if let Some(last) = &pooled.last {
-            last.lock().clone_from(&on_origin_end);
+        // An HTTP/1 connection drops a request its sender dropped before it took the request
+        // to write, unwritten: the request is queued on it, and the last it took, only once
+        // taken.
+        if pooled.is_http1() && (on_queued.is_some() || pooled.last.is_some()) {
+            let (on_queued, last, on_origin_end) =
+                (on_queued.take(), pooled.last.clone(), on_origin_end.clone());
+            req.extensions_mut().insert(OnTaken::new(move || {
+                if let Some(last) = &last {
+                    last.lock().clone_from(&on_origin_end);
+                }
+                if let Some(on_queued) = &on_queued {
+                    on_queued.queued();
+                }
+            }));
         }
+        let _expected = pooled.expect_request(&req);
+        let request_close = lists(req.headers(), "close")
+            || req.version() == Version::HTTP_10 && !lists(req.headers(), "keep-alive");
         let sent = pooled.try_send_request(req);
         if let Some(on_queued) = on_queued {
             on_queued.queued();

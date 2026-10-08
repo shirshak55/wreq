@@ -953,8 +953,14 @@ impl ConnectionScope {
     /// do once the scope is dropped. An HTTP/2 connection whose origin closed it first
     /// waits a moment for it before closing, else ends with a FIN alone; one closing
     /// otherwise before it ends gracefully. Past any but [`ConnectionEnd::Reset`], their
-    /// streams end with them (see [`Self::end_streams_with_connections`]).
+    /// streams end with them (see [`Self::end_streams_with_connections`]). A reset, once
+    /// told, is final: an end told after it, one decided before the reset was seen say,
+    /// leaves it.
     pub fn end_with(&self, end: ConnectionEnd) {
+        let told = &self.0.2.end;
+        if told.load(Ordering::Acquire) == 3 {
+            return;
+        }
         if end != ConnectionEnd::Reset {
             self.end_streams_with_connections();
         }
@@ -964,8 +970,12 @@ impl ConnectionScope {
             ConnectionEnd::Reset => 3,
             ConnectionEnd::Alert(alert) => 0x100 | u16::from(alert),
         };
-        self.0.2.end.store(end, Ordering::Release);
-        for (_, task) in self.0.2.end_tasks.lock().drain(..) {
+        let mut tasks = self.0.2.end_tasks.lock();
+        if told.load(Ordering::Acquire) == 3 {
+            return;
+        }
+        told.store(end, Ordering::Release);
+        for (_, task) in tasks.drain(..) {
             task.wake();
         }
     }
@@ -1429,5 +1439,15 @@ mod tests {
             h2.finish(),
             "Request groups must maintain identical hashes regardless of criteria insertion order"
         );
+    }
+
+    #[test]
+    fn test_scope_reset_is_final() {
+        let scope = ConnectionScope::new();
+        scope.end_with(ConnectionEnd::Graceful);
+        scope.end_with(ConnectionEnd::Reset);
+        scope.end_with(ConnectionEnd::Fin);
+        scope.end_with(ConnectionEnd::Graceful);
+        assert_eq!(scope.handle().ended(), Some(ConnectionEnd::Reset));
     }
 }

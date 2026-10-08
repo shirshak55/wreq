@@ -1114,3 +1114,101 @@ async fn dns_resolution_failure_is_dns_error() {
     assert!(err.is_dns(), "expected a DNS error, got: {err:?}");
     assert!(err.is_connect(), "expected is_connect() to also be true");
 }
+
+/// An origin of one HTTP/1 connection answering each request head it reads with `response`,
+/// which closes once its client did, returning what it read.
+async fn http1_origin(
+    response: &'static [u8],
+) -> (std::net::SocketAddr, tokio::task::JoinHandle<Vec<u8>>) {
+    use tokio::io::AsyncReadExt;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let origin = tokio::spawn(async move {
+        let (mut io, _) = listener.accept().await.unwrap();
+        let (mut read, mut answered, mut buf) = (Vec::new(), 0, [0; 1024]);
+        loop {
+            let Ok(n @ 1..) = io.read(&mut buf).await else {
+                return read;
+            };
+            read.extend_from_slice(&buf[..n]);
+            while answered < read.windows(4).filter(|w| w == b"\r\n\r\n").count() {
+                io.write_all(response).await.unwrap();
+                answered += 1;
+            }
+        }
+    });
+    (addr, origin)
+}
+
+#[tokio::test]
+async fn http1_origin_end_is_told_to_the_last_request_taken() {
+    let (addr, origin) = http1_origin(b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\n\r\n").await;
+    let client = Client::builder().no_proxy().http1_only().build().unwrap();
+    let scope = wreq::ConnectionScope::new();
+    let told = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let request = |path: &'static str| {
+        let told = told.clone();
+        let mut req = client
+            .get(format!("http://{addr}{path}"))
+            .connection_scope(&scope)
+            .build()
+            .unwrap();
+        req.extensions_mut().insert(wreq::OnOriginEnd::new(
+            || {},
+            move |end| told.lock().unwrap().push((path, end)),
+        ));
+        req
+    };
+    client
+        .execute(request("/a"))
+        .await
+        .unwrap()
+        .bytes()
+        .await
+        .unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    // Queued on the connection, then dropped before it took it to write.
+    let mut b = Box::pin(client.execute(request("/b")));
+    let polled = std::future::poll_fn(|cx| std::task::Poll::Ready(b.as_mut().poll(cx))).await;
+    assert!(polled.is_pending());
+    drop(b);
+    drop(scope);
+
+    let read = origin.await.unwrap();
+    assert!(!String::from_utf8_lossy(&read).contains("/b"));
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while told.lock().unwrap().is_empty() {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(*told.lock().unwrap(), [("/a", wreq::OriginEnd::Fin)]);
+}
+
+#[tokio::test]
+async fn http1_origin_closing_is_told_after_an_http10_request() {
+    for (keep_alive, closing) in [(false, true), (true, false)] {
+        let (addr, _origin) = http1_origin(b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\n\r\n").await;
+        let client = Client::builder().no_proxy().http1_only().build().unwrap();
+        let scope = wreq::ConnectionScope::new();
+        let mut req = client
+            .get(format!("http://{addr}/"))
+            .connection_scope(&scope);
+        if keep_alive {
+            req = req.header(header::CONNECTION, "keep-alive");
+        }
+        let mut req: http::Request<wreq::Body> = req.build().unwrap().into();
+        *req.version_mut() = Version::HTTP_10;
+        let mut req = wreq::Request::from(req);
+        let told = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let closed = told.clone();
+        req.extensions_mut().insert(wreq::OnOriginEnd::new(
+            move || closed.store(true, std::sync::atomic::Ordering::SeqCst),
+            |_| {},
+        ));
+        client.execute(req).await.unwrap().bytes().await.unwrap();
+        assert_eq!(told.load(std::sync::atomic::Ordering::SeqCst), closing);
+    }
+}
