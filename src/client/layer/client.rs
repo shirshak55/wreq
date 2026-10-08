@@ -57,7 +57,7 @@ use crate::{
         proxy,
     },
     error::ProxyConnect,
-    group::{ConnectionEnd, Http1Open, OnQueued, OriginEnd, ScopeEnded, ScopeRef},
+    group::{ConnectionEnd, Http1Open, OnOriginEnd, OnQueued, OriginEnd, ScopeEnded, ScopeRef},
     rt::{Executor, Timer},
 };
 
@@ -420,6 +420,13 @@ where
         }
         let _expected = pooled.expect_request(&req);
         let request_close = lists(req.headers(), "close");
+        let on_origin_end = pooled
+            .last
+            .as_ref()
+            .and(req.extensions().get::<OnOriginEnd>().cloned());
+        if let Some(last) = &pooled.last {
+            last.lock().clone_from(&on_origin_end);
+        }
         let sent = pooled.try_send_request(req);
         if let Some(on_queued) = on_queued {
             on_queued.queued();
@@ -453,6 +460,9 @@ where
                 || res.version() == Version::HTTP_10 && !lists(res.headers(), "keep-alive"))
         {
             scope.expect_http1_origin_close();
+            if let Some(on_origin_end) = &on_origin_end {
+                on_origin_end.closing();
+            }
         }
 
         #[cfg(feature = "cookies")]
@@ -698,6 +708,7 @@ where
 
                         Either::Left(Box::pin(async move {
                             let in_scope = scope.is_some();
+                            let last = http1.as_ref().filter(|_| !is_h2).map(Http1Open::last);
                             let (io, dropped) =
                                 ScopedIo::new(io, scope.clone(), http1, is_h2, timer.clone());
                             let abort = io.abort();
@@ -843,6 +854,7 @@ where
                                     tx,
                                     scoped: in_scope,
                                     ended_first,
+                                    last,
                                 },
                             ))
                         }))
@@ -898,6 +910,8 @@ struct PoolClient<B> {
     /// Whether it is confined to a scope, which closes it.
     scoped: bool,
     ended_first: std::sync::Arc<EndedFirst>,
+    /// Where a scoped HTTP/1 one keeps the [`OnOriginEnd`] of the request it took last.
+    last: Option<std::sync::Arc<crate::sync::Mutex<Option<OnOriginEnd>>>>,
 }
 
 enum PoolTx<B> {
@@ -998,6 +1012,7 @@ where
                 tx: PoolTx::Http1(tx),
                 scoped: self.scoped,
                 ended_first: self.ended_first,
+                last: self.last,
             }),
 
             PoolTx::Http2(tx) => {
@@ -1006,12 +1021,14 @@ where
                     tx: PoolTx::Http2(tx.clone()),
                     scoped: self.scoped,
                     ended_first: std::sync::Arc::clone(&self.ended_first),
+                    last: None,
                 };
                 let a = PoolClient {
                     conn_info: self.conn_info,
                     tx: PoolTx::Http2(tx),
                     scoped: self.scoped,
                     ended_first: self.ended_first,
+                    last: None,
                 };
                 pool::Reservation::Shared(a, b)
             }

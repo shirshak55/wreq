@@ -338,8 +338,8 @@ pub use self::{
     error::{Error, Result},
     ext::{ResponseBuilderExt, ResponseExt},
     group::{
-        ConnectionEnd, ConnectionScope, Group, Http2OriginEnd, Http2OriginEnds, OnQueued,
-        OriginEnd, ScopeEnded,
+        ConnectionEnd, ConnectionScope, Group, Http2OriginEnd, Http2OriginEnds, OnOriginEnd,
+        OnQueued, OriginEnd, ScopeEnded,
     },
     into_uri::IntoUri,
     proxy::{NoProxy, Proxy},

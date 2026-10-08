@@ -476,6 +476,32 @@ impl OnQueued {
     }
 }
 
+/// A request extension called with how the origin of the scoped HTTP/1 connection it went
+/// on ended that connection, should it be the last request the connection took: one shut
+/// down after it reads on for that end, up to its connection's wait for it, as one of a
+/// scope ending with its HTTP/1 origin does (see [`ConnectionScope::end_with_http1_origin`]).
+/// Also called should their exchange say its origin closes the connection after it.
+#[derive(Clone)]
+pub struct OnOriginEnd(
+    Arc<dyn Fn() + Send + Sync>,
+    Arc<dyn Fn(OriginEnd) + Send + Sync>,
+);
+
+impl OnOriginEnd {
+    /// Calls `closing` should the request's exchange say its origin closes the connection
+    /// after it (`Connection: close`), and `ended` once with how the origin ended it.
+    pub fn new(
+        closing: impl Fn() + Send + Sync + 'static,
+        ended: impl Fn(OriginEnd) + Send + Sync + 'static,
+    ) -> Self {
+        Self(Arc::new(closing), Arc::new(ended))
+    }
+
+    pub(crate) fn closing(&self) {
+        (self.0)();
+    }
+}
+
 /// How a [`ConnectionScope`]'s connections end (see [`ConnectionScope::end_with`]). An
 /// HTTP/2 one sends no GOAWAY of its own: only those
 /// [`ConnectionScope::send_http2_go_away`] sends.
@@ -1046,15 +1072,16 @@ impl Drop for Http2Registration {
 }
 
 /// An HTTP/1 connection counted open in its scope until dropped, closed by its origin when
-/// `by_origin`.
+/// `by_origin`, and the [`OnOriginEnd`] of the request it took last, if it had one.
 pub(crate) struct Http1Open {
     connections: Arc<Connections>,
     by_origin: bool,
+    last: Arc<Mutex<Option<OnOriginEnd>>>,
 }
 
 impl Http1Open {
     /// Notes that its origin ended it so (`end`), telling its scope if it ends with its
-    /// HTTP/1 origin.
+    /// HTTP/1 origin, and the request it took last.
     pub(crate) fn ended(&mut self, end: OriginEnd) {
         self.by_origin = true;
         if self
@@ -1064,6 +1091,20 @@ impl Http1Open {
         {
             *self.connections.http1_origin_end.lock() = Some(end);
         }
+        let last = self.last.lock().take();
+        if let Some(OnOriginEnd(_, ended)) = last {
+            ended(end);
+        }
+    }
+
+    /// Where the request it takes puts its [`OnOriginEnd`], or none.
+    pub(crate) fn last(&self) -> Arc<Mutex<Option<OnOriginEnd>>> {
+        Arc::clone(&self.last)
+    }
+
+    /// Whether the request it took last waits for its origin's end (see [`OnOriginEnd`]).
+    pub(crate) fn awaited(&self) -> bool {
+        self.last.lock().is_some()
     }
 }
 
@@ -1264,6 +1305,7 @@ impl ScopeRef {
         Http1Open {
             connections: self.connections.clone(),
             by_origin: false,
+            last: Arc::default(),
         }
     }
 

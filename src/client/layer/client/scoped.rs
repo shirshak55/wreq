@@ -46,9 +46,10 @@ const SCOPE_END_WAIT: Duration = Duration::from_secs(2);
 ///
 /// An HTTP/1 one is counted open in its scope from its connect on (see
 /// [`ConnectionScope::http1_origin_closed`](crate::ConnectionScope::http1_origin_closed)).
-/// Dropped before its origin ended it, in a scope ending with its HTTP/1 origin that hasn't
-/// ended otherwise, it goes to that receiver still counted open, to learn how its origin
-/// ends it.
+/// Dropped before its origin ended it, in a scope ending with its HTTP/1 origin, or shut
+/// down with its last request waiting for that (see [`OnOriginEnd`](crate::OnOriginEnd)),
+/// that hasn't ended otherwise, it goes to that receiver still counted open, to learn how
+/// its origin ends it.
 /// An HTTP/2 one tells its scope how its origin closed it, and closes as its scope ends,
 /// waiting up to [`SCOPE_END_WAIT`] for that, as the origin's close ends the scope's
 /// client soon after; past it, after its origin's close, it closes with a FIN alone.
@@ -405,7 +406,9 @@ impl<T: Connection + Unpin> Drop for ScopedIo<T> {
         };
         let origin_to_end = !self.origin_ended
             && self.scope.as_ref().is_some_and(|scope| {
-                scope.ends_with_http1_origin() && scope.end() == ConnectionEnd::Graceful
+                (scope.ends_with_http1_origin()
+                    || self.shut && self.http1.as_ref().is_some_and(Http1Open::awaited))
+                    && scope.end() == ConnectionEnd::Graceful
             });
         let http1 = self.http1.take_if(|_| origin_to_end);
         let Some(dropped) = self.dropped.take() else {
