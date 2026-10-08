@@ -24,7 +24,7 @@ use http::{
 use http_body::Body;
 use http2::ext::{HeadersFrameOptions, RecordedStream};
 use pool::Ver;
-use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncWrite};
 use tower::{BoxError, util::Oneshot};
 use wreq_proto::{
     body::Incoming,
@@ -1432,35 +1432,29 @@ async fn scoped<T: AsyncRead + AsyncWrite + Connection + Unpin>(
 /// connection does: dropped at once, it would answer what the origin still sends, the
 /// response to a request it sent last say, with a reset. One ending otherwise just closes.
 async fn close<T: AsyncRead + AsyncWrite + Connection + Unpin>(
-    mut io: T,
+    io: T,
     shut: bool,
     end: ConnectionEnd,
     bound: Pin<Box<dyn Sleep>>,
 ) {
-    use tokio::io::AsyncReadExt;
-
     if !matches!(end, ConnectionEnd::Fin | ConnectionEnd::Graceful) {
         return;
     }
-    let closed = async {
-        if !shut {
-            if end == ConnectionEnd::Graceful {
-                io.shutdown().await?;
-            } else {
+    let ending = |io: Pin<&mut T>, cx: &mut task::Context<'_>| -> Poll<std::io::Result<()>> {
+        match end {
+            _ if shut => Poll::Ready(Ok(())),
+            ConnectionEnd::Graceful => io.poll_shutdown(cx),
+            _ => Poll::Ready(
                 io.socket()
                     .ok_or(std::io::ErrorKind::Unsupported)?
-                    .shutdown(std::net::Shutdown::Write)?;
-            }
+                    .shutdown(std::net::Shutdown::Write),
+            ),
         }
-        let mut unread = [0; 4096];
-        while io.read(&mut unread).await? != 0 {}
-        std::io::Result::Ok(())
     };
-    // The bound first: an origin sending on and on would leave its timer no turn.
-    match future::select(bound, std::pin::pin!(closed)).await {
-        Either::Left(_) => debug!("closing a scoped connection timed out"),
-        Either::Right((Ok(()), _)) => {}
-        Either::Right((Err(_e), _)) => debug!("closing a scoped connection failed: {}", _e),
+    match end_scoped(io, ending, bound).await {
+        None => debug!("closing a scoped connection timed out"),
+        Some(Ok(())) => {}
+        Some(Err(_e)) => debug!("closing a scoped connection failed: {}", _e),
     }
 }
 
@@ -1471,26 +1465,51 @@ async fn close<T: AsyncRead + AsyncWrite + Connection + Unpin>(
 /// connection it just opened say, with a reset, which may cost the origin the alert, or the
 /// request sent before it.
 async fn send_alert<T: AsyncRead + Connection + Unpin>(
-    mut io: T,
+    io: T,
     alert: u8,
     bound: Pin<Box<dyn Sleep>>,
 ) {
+    let ending = |mut io: Pin<&mut T>, cx: &mut task::Context<'_>| -> Poll<std::io::Result<()>> {
+        std::task::ready!(io.as_mut().poll_send_fatal_alert(cx, alert))?;
+        Poll::Ready(
+            io.socket()
+                .ok_or(std::io::ErrorKind::Unsupported)?
+                .shutdown(std::net::Shutdown::Write),
+        )
+    };
+    match end_scoped(io, ending, bound).await {
+        None => debug!("alerting a scoped connection timed out"),
+        Some(Ok(())) => {}
+        Some(Err(_e)) => debug!("alerting a scoped connection failed: {}", _e),
+    }
+}
+
+/// Ends `io`, the transport of a scoped connection, with what it owes its origin (`end`: its
+/// alert, close_notify or FIN), written even past `bound`, which gives it up only should it
+/// wait for room, then reads what its origin still sends, dropping it, until the origin closes
+/// too, within `bound`: `None` past it.
+async fn end_scoped<T: AsyncRead + Unpin>(
+    mut io: T,
+    mut end: impl FnMut(Pin<&mut T>, &mut task::Context<'_>) -> Poll<std::io::Result<()>>,
+    mut bound: Pin<Box<dyn Sleep>>,
+) -> Option<std::io::Result<()>> {
     use tokio::io::AsyncReadExt;
 
-    let sent = async {
-        future::poll_fn(|cx| std::pin::Pin::new(&mut io).poll_send_fatal_alert(cx, alert)).await?;
-        io.socket()
-            .ok_or(std::io::ErrorKind::Unsupported)?
-            .shutdown(std::net::Shutdown::Write)?;
+    let ended = future::poll_fn(|cx| end(Pin::new(&mut io), cx));
+    match future::select(std::pin::pin!(ended), bound.as_mut()).await {
+        Either::Left((Ok(()), _)) => {}
+        Either::Left((Err(e), _)) => return Some(Err(e)),
+        Either::Right(_) => return None,
+    }
+    let drained = async {
         let mut unread = [0; 4096];
         while io.read(&mut unread).await? != 0 {}
-        std::io::Result::Ok(())
+        Ok(())
     };
-    // The bound first, as in `close`.
-    match future::select(bound, std::pin::pin!(sent)).await {
-        Either::Left(_) => debug!("alerting a scoped connection timed out"),
-        Either::Right((Ok(()), _)) => {}
-        Either::Right((Err(_e), _)) => debug!("alerting a scoped connection failed: {}", _e),
+    // The bound first: an origin sending on and on would leave its timer no turn.
+    match future::select(bound, std::pin::pin!(drained)).await {
+        Either::Left(_) => None,
+        Either::Right((drained, _)) => Some(drained),
     }
 }
 

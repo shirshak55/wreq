@@ -251,7 +251,12 @@ impl<T: Connection + Unpin> ScopedIo<T> {
     /// would directly; an HTTP/2 one only while it has request bodies to send then, which
     /// still send what their client sent, reading on for the WINDOW_UPDATEs they wait for.
     fn draining(&mut self, cx: &mut Context<'_>) -> bool {
-        if self.drained || !self.scope.as_ref().is_some_and(ScopeRef::drains) {
+        // Woken, drained or not, as its scope's end is upgraded to a reset, ending it at once.
+        let drains = self
+            .scope
+            .as_ref()
+            .is_some_and(|scope| scope.drains() && !scope.wake_on_reset(self.id, cx.waker()));
+        if self.drained || !drains {
             return false;
         }
         if self.http2
@@ -338,12 +343,21 @@ impl<T: AsyncRead + Connection + Unpin> ScopedIo<T> {
     /// Waits for the scope's end, up to [`SCOPE_END_WAIT`], reading what the origin still
     /// sends to learn how it closes. Whether the scope ended.
     fn poll_scope_end(&mut self, cx: &mut Context<'_>, scope: &ScopeRef) -> Poll<bool> {
+        let timer = &self.timer;
+        let wait = self
+            .scope_end_wait
+            .get_or_insert_with(|| timer.sleep(SCOPE_END_WAIT));
+        // Before the reads: an origin sending on and on would leave its timer no turn.
+        let waited = wait.as_mut().poll(cx).is_ready();
         loop {
             if scope.wake_on_end(self.id, cx.waker()).is_some() {
                 return Poll::Ready(true);
             }
+            if waited {
+                return Poll::Ready(false);
+            }
             if self.origin_ended {
-                break;
+                return Poll::Pending;
             }
             let mut unread = [0; 4096];
             let mut buf = ReadBuf::new(&mut unread);
@@ -352,18 +366,13 @@ impl<T: AsyncRead + Connection + Unpin> ScopedIo<T> {
                 Err(_) => return Poll::Ready(true),
             };
             if read.is_pending() {
-                break;
+                return Poll::Pending;
             }
             self.note_read(&read, buf.filled().is_empty());
             if matches!(read, Poll::Ready(Err(_))) {
                 self.origin_ended = true;
             }
         }
-        let timer = &self.timer;
-        let wait = self
-            .scope_end_wait
-            .get_or_insert_with(|| timer.sleep(SCOPE_END_WAIT));
-        wait.as_mut().poll(cx).map(|()| false)
     }
 }
 
@@ -424,10 +433,11 @@ impl<T: AsyncRead + Connection + Unpin> AsyncRead for ScopedIo<T> {
         // Its scope closed: it reads nothing more, its connection ending as at the origin's
         // close, without a frame more, unless it drains. Seen first, as its scope ended before.
         // An HTTP/1 one, idle or awaiting its response, is woken at its scope's end too, to
-        // drain (see `poll_flush`) at once rather than at its next read.
+        // drain (see `poll_flush`) at once rather than at its next read, and again as a reset
+        // upgrades that end.
         let closed = self.scope.as_ref().is_some_and(|scope| {
             if !self.http2 {
-                scope.wake_on_end(self.id, cx.waker());
+                scope.wake_on_reset(self.id, cx.waker());
             }
             scope.poll_closed(self.id, cx.waker())
         });
