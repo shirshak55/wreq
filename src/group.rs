@@ -1008,6 +1008,11 @@ impl ConnectionScope {
     pub fn is_closed(&self) -> bool {
         *self.0.1.borrow()
     }
+
+    /// Whether this scope's connections end with a reset (see [`Self::end_with`]).
+    pub fn is_reset(&self) -> bool {
+        self.0.2.end.load(Ordering::Acquire) == 3
+    }
 }
 
 impl Default for ConnectionScope {
